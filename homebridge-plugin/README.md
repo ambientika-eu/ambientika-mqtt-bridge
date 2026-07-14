@@ -1,3 +1,10 @@
+<p align="center">
+  <img src="neuracell-x-logo.png" alt="NeuraCell-X® — AI Neural Control System (patented)" width="440">
+</p>
+
+> **Powered by NeuraCell-X® — the patented AI Neural Control System.**
+> Active radon protection and intelligent dew-point (Taupunkt) ventilation control.
+
 # homebridge-ambientika
 
 **Apple Home, Google Home & Amazon Alexa integration for Ambientika ventilation units**
@@ -107,3 +114,25 @@ Homebridge  ->  Apple HomeKit / Google Home / Amazon Alexa
 ## License
 
 MIT
+
+---
+
+## NeuraCell-X® — patented radon & dew-point protection
+
+![NeuraCell-X®](neuracell-x-logo.png)
+
+This component surfaces the live status of **NeuraCell-X®**, the *patented* AI Neural
+Control System built into the Ambientika MQTT Bridge:
+
+- **Radon protection (highest priority):** when the radon meter alarms, every unit
+  switches to supply / Intake mode at fan **Stufe 1** — a gentle fresh-air overpressure
+  that actively slows radon ingress.
+- **Dew-point control (Taupunktsteuerung):** when ventilating would raise indoor
+  humidity, the units switch **off**; when conditions are favourable again, ventilation
+  is released.
+- Radon **overrides** the dew-point block, and every device is restored to the **exact**
+  mode it had before once all protections clear.
+
+**Exposed as a `NeuraCell-X` accessory** with two occupancy sensors: *Radon Protection* (detected = active) and *Dew-Point Block* (detected = ventilation blocked).
+
+*NeuraCell-X® and PhaseCell-X® are registered trademarks of Südwind / Ambientika. Patent pending.*
