@@ -37,7 +37,7 @@
     "id": "comment-intro",
     "type": "comment",
     "z": "ambientika-tab",
-    "name": "Ambientika MQTT Bridge - Node-RED Flow",
+    "name": "Ambientika MQTT Bridge (powered by NeuraCell-X) - Node-RED Flow",
     "info": "This flow connects to the Ambientika MQTT Bridge.\n\nPrerequisites:\n1. ambientika-mqtt-bridge is running (see README)\n2. MQTT broker is configured (default: localhost:1883)\n3. Update DEVICE_SERIAL below with your device serial number\n\nTopics:\n- Status: ambientika/{serial}/state\n- Commands: ambientika/{serial}/set/{property}\n\nEdit the mqtt-broker node to point to your broker.",
     "x": 150,
     "y": 40,
@@ -58,7 +58,12 @@
     "inputs": 0,
     "x": 130,
     "y": 120,
-    "wires": [["parse-state", "debug-state"]]
+    "wires": [
+      [
+        "parse-state",
+        "debug-state"
+      ]
+    ]
   },
   {
     "id": "parse-state",
@@ -74,7 +79,12 @@
     "libs": [],
     "x": 330,
     "y": 120,
-    "wires": [["set-context", "dashboard-update"]]
+    "wires": [
+      [
+        "set-context",
+        "dashboard-update"
+      ]
+    ]
   },
   {
     "id": "set-context",
@@ -82,8 +92,20 @@
     "z": "ambientika-tab",
     "name": "Store in Context",
     "rules": [
-      {"t": "set", "p": "ambientika_state", "pt": "flow", "to": "payload", "tot": "msg"},
-      {"t": "set", "p": "ambientika_serial", "pt": "flow", "to": "serial", "tot": "msg"}
+      {
+        "t": "set",
+        "p": "ambientika_state",
+        "pt": "flow",
+        "to": "payload",
+        "tot": "msg"
+      },
+      {
+        "t": "set",
+        "p": "ambientika_serial",
+        "pt": "flow",
+        "to": "serial",
+        "tot": "msg"
+      }
     ],
     "action": "",
     "property": "",
@@ -92,7 +114,9 @@
     "reg": false,
     "x": 530,
     "y": 100,
-    "wires": [[]]
+    "wires": [
+      []
+    ]
   },
   {
     "id": "dashboard-update",
@@ -151,7 +175,15 @@
     "type": "inject",
     "z": "ambientika-tab",
     "name": "Set Mode: Auto",
-    "props": [{"p": "payload"}, {"p": "topic", "vt": "str"}],
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
     "repeat": "",
     "crontab": "",
     "once": false,
@@ -161,14 +193,26 @@
     "payloadType": "str",
     "x": 140,
     "y": 280,
-    "wires": [["set-mode"]]
+    "wires": [
+      [
+        "set-mode"
+      ]
+    ]
   },
   {
     "id": "inject-mode-manual",
     "type": "inject",
     "z": "ambientika-tab",
     "name": "Set Mode: Manual",
-    "props": [{"p": "payload"}, {"p": "topic", "vt": "str"}],
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
     "repeat": "",
     "crontab": "",
     "once": false,
@@ -178,14 +222,26 @@
     "payloadType": "str",
     "x": 150,
     "y": 320,
-    "wires": [["set-mode"]]
+    "wires": [
+      [
+        "set-mode"
+      ]
+    ]
   },
   {
     "id": "inject-mode-night",
     "type": "inject",
     "z": "ambientika-tab",
     "name": "Set Mode: Night",
-    "props": [{"p": "payload"}, {"p": "topic", "vt": "str"}],
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
     "repeat": "",
     "crontab": "",
     "once": false,
@@ -195,14 +251,26 @@
     "payloadType": "str",
     "x": 140,
     "y": 360,
-    "wires": [["set-mode"]]
+    "wires": [
+      [
+        "set-mode"
+      ]
+    ]
   },
   {
     "id": "inject-mode-off",
     "type": "inject",
     "z": "ambientika-tab",
     "name": "Set Mode: Off",
-    "props": [{"p": "payload"}, {"p": "topic", "vt": "str"}],
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
     "repeat": "",
     "crontab": "",
     "once": false,
@@ -212,7 +280,11 @@
     "payloadType": "str",
     "x": 130,
     "y": 400,
-    "wires": [["set-mode"]]
+    "wires": [
+      [
+        "set-mode"
+      ]
+    ]
   },
   {
     "id": "set-mode",
@@ -228,7 +300,12 @@
     "libs": [],
     "x": 360,
     "y": 340,
-    "wires": [["mqtt-cmd-out", "debug-cmd"]]
+    "wires": [
+      [
+        "mqtt-cmd-out",
+        "debug-cmd"
+      ]
+    ]
   },
   {
     "id": "comment-fan",
@@ -245,7 +322,11 @@
     "type": "inject",
     "z": "ambientika-tab",
     "name": "Fan Speed: Low",
-    "props": [{"p": "payload"}],
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
     "repeat": "",
     "crontab": "",
     "once": false,
@@ -255,14 +336,22 @@
     "payloadType": "str",
     "x": 140,
     "y": 490,
-    "wires": [["set-fan-speed"]]
+    "wires": [
+      [
+        "set-fan-speed"
+      ]
+    ]
   },
   {
     "id": "inject-fan-medium",
     "type": "inject",
     "z": "ambientika-tab",
     "name": "Fan Speed: Medium",
-    "props": [{"p": "payload"}],
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
     "repeat": "",
     "crontab": "",
     "once": false,
@@ -272,14 +361,22 @@
     "payloadType": "str",
     "x": 155,
     "y": 530,
-    "wires": [["set-fan-speed"]]
+    "wires": [
+      [
+        "set-fan-speed"
+      ]
+    ]
   },
   {
     "id": "inject-fan-high",
     "type": "inject",
     "z": "ambientika-tab",
     "name": "Fan Speed: High",
-    "props": [{"p": "payload"}],
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
     "repeat": "",
     "crontab": "",
     "once": false,
@@ -289,7 +386,11 @@
     "payloadType": "str",
     "x": 140,
     "y": 570,
-    "wires": [["set-fan-speed"]]
+    "wires": [
+      [
+        "set-fan-speed"
+      ]
+    ]
   },
   {
     "id": "set-fan-speed",
@@ -305,7 +406,12 @@
     "libs": [],
     "x": 360,
     "y": 530,
-    "wires": [["mqtt-cmd-out", "debug-cmd"]]
+    "wires": [
+      [
+        "mqtt-cmd-out",
+        "debug-cmd"
+      ]
+    ]
   },
   {
     "id": "comment-humidity",
@@ -322,7 +428,11 @@
     "type": "inject",
     "z": "ambientika-tab",
     "name": "Humidity: 60%",
-    "props": [{"p": "payload"}],
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
     "repeat": "",
     "crontab": "",
     "once": false,
@@ -332,14 +442,22 @@
     "payloadType": "num",
     "x": 130,
     "y": 660,
-    "wires": [["set-humidity"]]
+    "wires": [
+      [
+        "set-humidity"
+      ]
+    ]
   },
   {
     "id": "inject-humidity-70",
     "type": "inject",
     "z": "ambientika-tab",
     "name": "Humidity: 70%",
-    "props": [{"p": "payload"}],
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
     "repeat": "",
     "crontab": "",
     "once": false,
@@ -349,7 +467,11 @@
     "payloadType": "num",
     "x": 130,
     "y": 700,
-    "wires": [["set-humidity"]]
+    "wires": [
+      [
+        "set-humidity"
+      ]
+    ]
   },
   {
     "id": "set-humidity",
@@ -365,7 +487,12 @@
     "libs": [],
     "x": 360,
     "y": 680,
-    "wires": [["mqtt-cmd-out", "debug-cmd"]]
+    "wires": [
+      [
+        "mqtt-cmd-out",
+        "debug-cmd"
+      ]
+    ]
   },
   {
     "id": "mqtt-cmd-out",
@@ -426,7 +553,11 @@
     "inputs": 0,
     "x": 130,
     "y": 820,
-    "wires": [["humidity-auto-logic"]]
+    "wires": [
+      [
+        "humidity-auto-logic"
+      ]
+    ]
   },
   {
     "id": "humidity-auto-logic",
@@ -442,7 +573,12 @@
     "libs": [],
     "x": 360,
     "y": 820,
-    "wires": [["mqtt-cmd-out-auto", "debug-auto"]]
+    "wires": [
+      [
+        "mqtt-cmd-out-auto",
+        "debug-auto"
+      ]
+    ]
   },
   {
     "id": "mqtt-cmd-out-auto",
@@ -483,7 +619,11 @@
     "type": "inject",
     "z": "ambientika-tab",
     "name": "Night Mode at 22:00",
-    "props": [{"p": "payload"}],
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
     "repeat": "",
     "crontab": "0 22 * * *",
     "once": false,
@@ -493,14 +633,22 @@
     "payloadType": "str",
     "x": 155,
     "y": 900,
-    "wires": [["set-mode-schedule"]]
+    "wires": [
+      [
+        "set-mode-schedule"
+      ]
+    ]
   },
   {
     "id": "day-mode-schedule",
     "type": "inject",
     "z": "ambientika-tab",
     "name": "Auto Mode at 07:00",
-    "props": [{"p": "payload"}],
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
     "repeat": "",
     "crontab": "0 7 * * *",
     "once": false,
@@ -510,7 +658,11 @@
     "payloadType": "str",
     "x": 150,
     "y": 940,
-    "wires": [["set-mode-schedule"]]
+    "wires": [
+      [
+        "set-mode-schedule"
+      ]
+    ]
   },
   {
     "id": "set-mode-schedule",
@@ -526,7 +678,11 @@
     "libs": [],
     "x": 390,
     "y": 920,
-    "wires": [["mqtt-cmd-out-schedule"]]
+    "wires": [
+      [
+        "mqtt-cmd-out-schedule"
+      ]
+    ]
   },
   {
     "id": "mqtt-cmd-out-schedule",
@@ -571,7 +727,11 @@
     "inputs": 0,
     "x": 140,
     "y": 1020,
-    "wires": [["filter-alarm-check"]]
+    "wires": [
+      [
+        "filter-alarm-check"
+      ]
+    ]
   },
   {
     "id": "filter-alarm-check",
@@ -581,15 +741,30 @@
     "property": "payload",
     "propertyType": "msg",
     "rules": [
-      {"t": "eq", "v": "true", "vt": "str"},
-      {"t": "eq", "v": true, "vt": "bool"}
+      {
+        "t": "eq",
+        "v": "true",
+        "vt": "str"
+      },
+      {
+        "t": "eq",
+        "v": true,
+        "vt": "bool"
+      }
     ],
     "checkall": "false",
     "repair": false,
     "outputs": 2,
     "x": 350,
     "y": 1020,
-    "wires": [["notify-filter-alarm"], ["notify-filter-alarm"]]
+    "wires": [
+      [
+        "notify-filter-alarm"
+      ],
+      [
+        "notify-filter-alarm"
+      ]
+    ]
   },
   {
     "id": "notify-filter-alarm",
@@ -605,7 +780,11 @@
     "libs": [],
     "x": 570,
     "y": 1020,
-    "wires": [["debug-filter-notify"]]
+    "wires": [
+      [
+        "debug-filter-notify"
+      ]
+    ]
   },
   {
     "id": "debug-filter-notify",
@@ -621,6 +800,92 @@
     "statusType": "auto",
     "x": 570,
     "y": 1060,
+    "wires": []
+  },
+  {
+    "id": "comment-neuracell",
+    "type": "comment",
+    "z": "ambientika-tab",
+    "name": "-- NEURACELL-X (RADON + DEW POINT) --",
+    "info": "NeuraCell-X status from the bridge (ambientika/neuracell/state).",
+    "x": 180,
+    "y": 1120,
+    "wires": []
+  },
+  {
+    "id": "mqtt-neuracell-in",
+    "type": "mqtt in",
+    "z": "ambientika-tab",
+    "name": "NeuraCell-X Status",
+    "topic": "ambientika/neuracell/state",
+    "qos": "1",
+    "datatype": "json",
+    "broker": "mqtt-broker",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 140,
+    "y": 1160,
+    "wires": [
+      [
+        "neuracell-logic"
+      ]
+    ]
+  },
+  {
+    "id": "neuracell-logic",
+    "type": "function",
+    "z": "ambientika-tab",
+    "name": "NeuraCell-X Logic",
+    "func": "// NeuraCell-X radon + dew-point status\nconst s = msg.payload || {};\nmsg.summary = {\n    radon_protection: !!s.radon_protection,\n    radon: s.radon,\n    dewpoint_block: !!s.dewpoint_block,\n    indoor_dew_point: s.indoor_dew_point,\n    outdoor_dew_point: s.outdoor_dew_point,\n    override_active: !!s.override_active\n};\nflow.set('neuracell', s);\n\n// Alert on radon protection or dew-point block (2nd output)\nlet alert = null;\nif (s.radon_protection) {\n    alert = { payload: { title: 'NeuraCell-X Radon Protection', message: 'Radon ' + (s.radon != null ? s.radon + ' Bq/m3' : '') + ' - all units in fresh-air overpressure (Zuluft, Stufe 1).', priority: 'high' } };\n} else if (s.dewpoint_block) {\n    alert = { payload: { title: 'NeuraCell-X Dew-Point Control', message: 'Ventilation paused - outside air too humid.', priority: 'normal' } };\n}\nreturn [msg, alert];",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 360,
+    "y": 1160,
+    "wires": [
+      [
+        "debug-neuracell"
+      ],
+      [
+        "neuracell-notify"
+      ]
+    ]
+  },
+  {
+    "id": "debug-neuracell",
+    "type": "debug",
+    "z": "ambientika-tab",
+    "name": "NeuraCell-X Status",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "summary",
+    "targetType": "msg",
+    "statusType": "auto",
+    "x": 590,
+    "y": 1140,
+    "wires": []
+  },
+  {
+    "id": "neuracell-notify",
+    "type": "debug",
+    "z": "ambientika-tab",
+    "name": "NeuraCell-X Alert",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusType": "auto",
+    "x": 590,
+    "y": 1180,
     "wires": []
   }
 ]
