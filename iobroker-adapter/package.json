@@ -36,7 +36,7 @@
     "adminTab": false,
     "schedule": null,
     "mode": "daemon",
-    "readme": "https://github.com/martinsaxalber-oss/ambientika-mqtt-bridge/blob/main/iobroker-adapter/README.md",
+    "readme": "https://github.com/ambientika-eu/ambientika-mqtt-bridge/blob/main/iobroker-adapter/README.md",
     "loglevel": "info",
     "messagebox": false,
     "compact": false,
@@ -44,6 +44,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/martinsaxalber-oss/ambientika-mqtt-bridge.git"
+    "url": "https://github.com/ambientika-eu/ambientika-mqtt-bridge.git"
   }
 }

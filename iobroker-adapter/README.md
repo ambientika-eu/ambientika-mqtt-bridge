@@ -50,7 +50,7 @@ Ambientika Device
 ## Prerequisites
 
 1. ioBroker installed and running
-2. [Ambientika MQTT Bridge](https://github.com/martinsaxalber-oss/ambientika-mqtt-bridge) running
+2. [Ambientika MQTT Bridge](https://github.com/ambientika-eu/ambientika-mqtt-bridge) running
 3. MQTT broker accessible from ioBroker (e.g. `ioBroker.mqtt` adapter)
 
 ## Installation
@@ -62,11 +62,11 @@ Ambientika Device
 cd /opt/iobroker
 
 # Install adapter
-npm install github:martinsaxalber-oss/ambientika-mqtt-bridge#main --prefix node_modules/iobroker.ambientika
+npm install github:ambientika-eu/ambientika-mqtt-bridge#main --prefix node_modules/iobroker.ambientika
 
 # Or clone and install locally
 cd /opt/iobroker/node_modules
-git clone https://github.com/martinsaxalber-oss/ambientika-mqtt-bridge.git
+git clone https://github.com/ambientika-eu/ambientika-mqtt-bridge.git
 cp -r ambientika-mqtt-bridge/iobroker-adapter ./iobroker.ambientika
 cd iobroker.ambientika
 npm install
@@ -159,7 +159,7 @@ Example widgets:
 
 ## Related
 
-- [Main Repository](https://github.com/martinsaxalber-oss/ambientika-mqtt-bridge)
+- [Main Repository](https://github.com/ambientika-eu/ambientika-mqtt-bridge)
 - [Home Assistant Add-on](../ha-addon/)
 - [Matter Bridge](../matter-bridge/) – Apple Home, Google Home, Alexa
 - [Homebridge Plugin](../homebridge-plugin/)
