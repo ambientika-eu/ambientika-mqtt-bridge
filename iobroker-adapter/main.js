@@ -1,15 +1,21 @@
 'use strict';
 
 /**
- * ioBroker Adapter for Ambientika Ventilation Units
+ * ioBroker Adapter for Ambientika Ventilation Units  —  powered by NeuraCell-X(R)
  *
  * Subscribes to MQTT topics published by the Ambientika MQTT Bridge and
  * exposes each device as ioBroker objects with states for:
  *   - mode, fanSpeed, temperature, humidity, airQuality, filterAlarm, online
  *
+ * It also surfaces the status of NeuraCell-X(R) — the patented AI Neural Control
+ * System — which provides active radon protection and dew-point ventilation
+ * control (radon alarm -> supply/Intake at Stufe 1; dew point "not ideal" -> Off,
+ * radon has priority). These appear under the "neuracell" channel.
+ *
  * Commands from ioBroker are forwarded back to the device via MQTT.
  *
- * GitHub: https://github.com/martinsaxalber-oss/ambientika-mqtt-bridge
+ * NeuraCell-X(R) and PhaseCell-X(R) are registered trademarks. Patent pending.
+ * GitHub: https://github.com/ambientika-eu/ambientika-mqtt-bridge
  */
 
 const utils = require('@iobroker/adapter-core');
@@ -85,6 +91,40 @@ const STATE_DEFS = {
 };
 
 // ---------------------------------------------------------------------------
+// NeuraCell-X(R) status state definitions (channel "neuracell")
+// ---------------------------------------------------------------------------
+const NEURACELL_STATE_DEFS = {
+    radon_protection: {
+        name: 'NeuraCell-X Radon Protection Active',
+        type: 'boolean', role: 'indicator.alarm', read: true, write: false
+    },
+    radon: {
+        name: 'Radon Level',
+        type: 'number', role: 'value', unit: 'Bq/m³', read: true, write: false
+    },
+    radon_threshold: {
+        name: 'Radon Threshold',
+        type: 'number', role: 'value', unit: 'Bq/m³', read: true, write: false
+    },
+    dewpoint_block: {
+        name: 'Dew-Point Ventilation Block',
+        type: 'boolean', role: 'indicator', read: true, write: false
+    },
+    indoor_dew_point: {
+        name: 'Dew Point Indoor',
+        type: 'number', role: 'value.temperature', unit: '°C', read: true, write: false
+    },
+    outdoor_dew_point: {
+        name: 'Dew Point Outdoor',
+        type: 'number', role: 'value.temperature', unit: '°C', read: true, write: false
+    },
+    override_active: {
+        name: 'NeuraCell-X Override Active',
+        type: 'boolean', role: 'indicator', read: true, write: false
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Adapter class
 // ---------------------------------------------------------------------------
 
@@ -93,6 +133,7 @@ class AmbientikaAdapter extends utils.Adapter {
         super({ ...options, name: 'ambientika' });
         this.mqttClient = null;
         this.knownDevices = new Set();
+        this.neuraCellCreated = false;
         this.on('ready', this.onReady.bind(this));
         this.on('stateChange', this.onStateChange.bind(this));
         this.on('unload', this.onUnload.bind(this));
@@ -100,10 +141,9 @@ class AmbientikaAdapter extends utils.Adapter {
 
     // -----------------------------------------------------------------------
     async onReady() {
-        this.log.info('Ambientika adapter starting...');
+        this.log.info('Ambientika adapter starting — powered by NeuraCell-X® (patented)...');
 
         const cfg = this.config;
-        const brokerHost = cfg.mqttBroker || this.getForeignObject;
 
         const url = [
             (cfg.mqttTls ? 'mqtts' : 'mqtt'),
@@ -134,6 +174,12 @@ class AmbientikaAdapter extends utils.Adapter {
                 if (err) this.log.error('Subscribe error: ' + err.message);
                 else     this.log.info('Subscribed to ' + topic);
             });
+            // NeuraCell-X® radon + dew-point status published by the main bridge.
+            const ncxTopic = prefix + '/neuracell/state';
+            this.mqttClient.subscribe(ncxTopic, (err) => {
+                if (err) this.log.error('Subscribe error: ' + err.message);
+                else     this.log.info('Subscribed to ' + ncxTopic + ' (NeuraCell-X status)');
+            });
         });
 
         this.mqttClient.on('error', (err) => {
@@ -159,9 +205,16 @@ class AmbientikaAdapter extends utils.Adapter {
             return;
         }
 
-        // topic format: ambientika/<deviceId>/status
         const parts = topic.split('/');
         if (parts.length < 3) return;
+
+        // NeuraCell-X® status: <prefix>/neuracell/state
+        if (parts[1] === 'neuracell' && parts[2] === 'state') {
+            await this.handleNeuraCell(payload);
+            return;
+        }
+
+        // topic format: ambientika/<deviceId>/status
         const deviceId = parts[1];
 
         // Create device objects on first sight
@@ -192,6 +245,46 @@ class AmbientikaAdapter extends utils.Adapter {
 
         // Always mark as online
         await this.setStateAsync(deviceId + '.online', { val: true, ack: true });
+    }
+
+    // -----------------------------------------------------------------------
+    async handleNeuraCell(payload) {
+        if (!this.neuraCellCreated) {
+            await this.createNeuraCellObjects();
+            this.neuraCellCreated = true;
+        }
+        for (const key of Object.keys(NEURACELL_STATE_DEFS)) {
+            if (payload[key] !== undefined) {
+                await this.setStateAsync('neuracell.' + key, { val: payload[key], ack: true });
+            }
+        }
+        this.log.debug('NeuraCell-X update: radon_protection=' + payload.radon_protection +
+                       ' dewpoint_block=' + payload.dewpoint_block +
+                       ' override=' + payload.override_active);
+    }
+
+    // -----------------------------------------------------------------------
+    async createNeuraCellObjects() {
+        this.log.info('Creating NeuraCell-X® status objects');
+        await this.setObjectNotExistsAsync('neuracell', {
+            type: 'device',
+            common: { name: 'NeuraCell-X® (patented) — Radon & Dew-Point Protection' },
+            native: {}
+        });
+        for (const [key, def] of Object.entries(NEURACELL_STATE_DEFS)) {
+            await this.setObjectNotExistsAsync('neuracell.' + key, {
+                type: 'state',
+                common: {
+                    name:  def.name,
+                    type:  def.type,
+                    role:  def.role,
+                    unit:  def.unit || undefined,
+                    read:  def.read,
+                    write: def.write
+                },
+                native: {}
+            });
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -250,6 +343,9 @@ class AmbientikaAdapter extends utils.Adapter {
         if (parts.length < 4) return;
         const deviceId  = parts[2];
         const stateName = parts[3];
+
+        // NeuraCell-X states are read-only; never forward them as commands.
+        if (deviceId === 'neuracell') return;
 
         const writableStates = ['mode', 'fanSpeed'];
         if (!writableStates.includes(stateName)) return;
