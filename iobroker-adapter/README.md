@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="neuracell-x-logo.png" alt="NeuraCell-X® — AI Neural Control System (patented)" width="440">
+  <img src="neuracell-x-logo.png" alt="NeuraCell-X® — AI Neural Control System (patent-pending)" width="440">
 </p>
 
-> **Powered by NeuraCell-X® — the patented AI Neural Control System.**
+> **Powered by NeuraCell-X® — the patent-pending AI Neural Control System.**
 > Active radon protection and intelligent dew-point (Taupunkt) ventilation control.
 
 # ioBroker Adapter: Ambientika
@@ -171,11 +171,11 @@ MIT License
 
 ---
 
-## NeuraCell-X® — patented radon & dew-point protection
+## NeuraCell-X® — patent-pending radon & dew-point protection
 
 ![NeuraCell-X®](neuracell-x-logo.png)
 
-This component surfaces the live status of **NeuraCell-X®**, the *patented* AI Neural
+This component surfaces the live status of **NeuraCell-X®**, the *patent-pending* AI Neural
 Control System built into the Ambientika MQTT Bridge:
 
 - **Radon protection (highest priority):** when the radon meter alarms, every unit
