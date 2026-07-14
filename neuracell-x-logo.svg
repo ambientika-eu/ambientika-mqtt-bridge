@@ -1,34 +1,141 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="640" height="220" viewBox="0 0 640 220" role="img" aria-label="NeuraCell-X - AI Neural Control System - Patented">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 500" width="1320" height="500">
   <defs>
-    <linearGradient id="ncx" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#38e1c8"/>
-      <stop offset="0.55" stop-color="#3ac6e6"/>
-      <stop offset="1" stop-color="#6aa9ff"/>
-    </linearGradient>
-    <radialGradient id="glow" cx="0.5" cy="0.4" r="0.7">
-      <stop offset="0" stop-color="#0e3a44"/>
-      <stop offset="1" stop-color="#050a12"/>
+    <!-- Background gradient -->
+    <radialGradient id="bgGlow" cx="50%" cy="40%" r="60%">
+      <stop offset="0%" stop-color="#0d1f3c"/>
+      <stop offset="100%" stop-color="#060d1a"/>
     </radialGradient>
+
+    <!-- Main title gradient: cyan to blue to purple -->
+    <linearGradient id="titleGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00f5c8"/>
+      <stop offset="45%" stop-color="#00bfff"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+
+    <!-- Triangle fill gradient -->
+    <linearGradient id="triGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#00e5ff" stop-opacity="0.9"/>
+      <stop offset="50%" stop-color="#0077aa" stop-opacity="0.7"/>
+      <stop offset="100%" stop-color="#003355" stop-opacity="0.5"/>
+    </linearGradient>
+
+    <!-- Glow filter for triangle -->
+    <filter id="triGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Glow filter for title text -->
+    <filter id="textGlow" x="-5%" y="-20%" width="110%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Subtle glow for subtitle -->
+    <filter id="subGlow" x="-5%" y="-30%" width="110%" height="160%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Separator line gradient -->
+    <linearGradient id="lineGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00bfff" stop-opacity="0"/>
+      <stop offset="30%" stop-color="#00bfff" stop-opacity="0.6"/>
+      <stop offset="70%" stop-color="#a78bfa" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#a78bfa" stop-opacity="0"/>
+    </linearGradient>
   </defs>
 
-  <rect x="0" y="0" width="640" height="220" rx="18" fill="url(#glow)"/>
+  <!-- Background -->
+  <rect width="1320" height="500" fill="url(#bgGlow)"/>
 
-  <g fill="none" stroke="url(#ncx)" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round">
-    <polygon points="120,44 168,150 72,150"/>
-    <circle cx="120" cy="44" r="5.2" fill="url(#ncx)" stroke="none"/>
-    <circle cx="168" cy="150" r="5.2" fill="url(#ncx)" stroke="none"/>
-    <circle cx="72" cy="150" r="5.2" fill="url(#ncx)" stroke="none"/>
-    <circle cx="120" cy="112" r="4" fill="url(#ncx)" stroke="none"/>
-    <line x1="120" y1="44" x2="120" y2="112"/>
-    <line x1="72" y1="150" x2="120" y2="112"/>
-    <line x1="168" y1="150" x2="120" y2="112"/>
-  </g>
+  <!-- ===== TRIANGLE ICON ===== -->
+  <!-- Outer triangle outline -->
+  <polygon
+    points="660,28 740,165 580,165"
+    fill="none"
+    stroke="#00e5ff"
+    stroke-width="2.2"
+    opacity="0.85"
+    filter="url(#triGlow)"
+  />
+  <!-- Inner triangle filled -->
+  <polygon
+    points="660,48 728,158 592,158"
+    fill="url(#triGrad)"
+    opacity="0.75"
+  />
+  <!-- Horizontal scan lines inside triangle for layered effect -->
+  <line x1="620" y1="108" x2="700" y2="108" stroke="#00e5ff" stroke-width="1" opacity="0.5"/>
+  <line x1="610" y1="125" x2="710" y2="125" stroke="#00e5ff" stroke-width="1" opacity="0.35"/>
+  <line x1="600" y1="143" x2="720" y2="143" stroke="#00e5ff" stroke-width="0.8" opacity="0.25"/>
+  <!-- Top glow dot -->
+  <circle cx="660" cy="25" r="4" fill="#00f5c8" opacity="0.9" filter="url(#triGlow)"/>
+  <!-- Bottom wave / tilde decoration -->
+  <path d="M630,178 Q645,172 660,178 Q675,184 690,178" fill="none" stroke="#00bfff" stroke-width="1.5" opacity="0.6"/>
 
-  <text x="212" y="104" font-family="Segoe UI, Arial, sans-serif" font-size="52" font-weight="700" letter-spacing="1.5" fill="url(#ncx)">NeuraCell-X<tspan font-size="24" dy="-22">&#174;</tspan></text>
-  <text x="214" y="140" font-family="Segoe UI, Arial, sans-serif" font-size="17" font-weight="500" letter-spacing="7" fill="#8fb4c9">AI NEURAL CONTROL SYSTEM</text>
-  <g>
-    <rect x="214" y="158" width="96" height="26" rx="13" fill="none" stroke="#38e1c8" stroke-width="1.4"/>
-    <text x="262" y="176" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="600" letter-spacing="3" text-anchor="middle" fill="#38e1c8">PATENTED</text>
-  </g>
-  <text x="326" y="176" font-family="Segoe UI, Arial, sans-serif" font-size="13" letter-spacing="1" fill="#5f7d8c">Ambientika &#183; S&#252;dwind</text>
+  <!-- ===== MAIN TITLE: NeuraCell-X ===== -->
+  <text
+    x="660"
+    y="330"
+    text-anchor="middle"
+    font-family="'Orbitron', 'Rajdhani', 'Exo 2', 'Courier New', monospace"
+    font-size="148"
+    font-weight="800"
+    letter-spacing="-2"
+    fill="url(#titleGrad)"
+    filter="url(#textGlow)"
+  >NeuraCell-X</text>
+
+  <!-- Registered trademark ® -->
+  <text
+    x="1222"
+    y="255"
+    font-family="'Orbitron', monospace"
+    font-size="42"
+    font-weight="400"
+    fill="#a78bfa"
+    opacity="0.9"
+  >®</text>
+
+  <!-- ===== SEPARATOR LINE ===== -->
+  <line x1="200" y1="355" x2="1120" y2="355" stroke="url(#lineGrad)" stroke-width="1.2"/>
+
+  <!-- ===== SUBTITLE: AI NEURAL CONTROL SYSTEM ===== -->
+  <text
+    x="660"
+    y="404"
+    text-anchor="middle"
+    font-family="'Orbitron', 'Share Tech Mono', 'Courier New', monospace"
+    font-size="28"
+    font-weight="500"
+    letter-spacing="14"
+    fill="#00c8a0"
+    filter="url(#subGlow)"
+    opacity="0.95"
+  >AI NEURAL CONTROL SYSTEM</text>
+
+  <!-- ===== PATENTED SYSTEM ===== -->
+  <!-- Green dot -->
+  <circle cx="535" cy="443" r="5" fill="#00f5c8" opacity="0.9"/>
+  <text
+    x="547"
+    y="448"
+    font-family="'Orbitron', 'Share Tech Mono', monospace"
+    font-size="14"
+    font-weight="400"
+    letter-spacing="6"
+    fill="#4da8a0"
+    opacity="0.75"
+  >PATENTED SYSTEM</text>
 </svg>
