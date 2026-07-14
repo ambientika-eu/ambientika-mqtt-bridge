@@ -6,6 +6,27 @@
 
 ---
 
+<p align="center">
+  <img src="neuracell-x-logo.png" alt="NeuraCell-X - AI Neural Control System (patented)" width="480">
+</p>
+
+<h3 align="center">Powered by NeuraCell-X&reg; &mdash; the patented AI Neural Control System</h3>
+
+<p align="center">
+  <b>Active radon protection</b> &nbsp;&middot;&nbsp; <b>Intelligent dew-point ventilation</b> &nbsp;&middot;&nbsp; <b>Whole-home, fully automatic</b>
+</p>
+
+<p align="center">
+  <img alt="Radon" src="https://img.shields.io/badge/Radon-active%20protection-38e1c8">
+  <img alt="Dew point" src="https://img.shields.io/badge/Taupunkt-dew--point%20control-3ac6e6">
+  <img alt="Patented" src="https://img.shields.io/badge/NeuraCell--X-patent%20pending-6aa9ff">
+  <img alt="TUV" src="https://img.shields.io/badge/hardware-T%C3%9CV%20gepr%C3%BCft-4caf50">
+</p>
+
+> **When radon rises**, every unit shifts to a gentle fresh-air overpressure (Zuluft, Stufe 1) that slows radon ingress. **When the outside air is too humid to ventilate**, the units pause so no moisture is drawn in. **When conditions are safe again**, normal operation is restored &mdash; automatically, with radon protection always taking priority.
+
+---
+
 ## Supported Platforms
 
 | Platform | Integration | Folder | Status |
@@ -16,9 +37,10 @@
 | **Google Home** | Homebridge plugin / Matter | `homebridge-plugin/` · `matter-bridge/` | ✅ Ready |
 | **Amazon Alexa** | Homebridge plugin / Matter | `homebridge-plugin/` · `matter-bridge/` | ✅ Ready |
 | **Node-RED** | Example flow | `examples/node-red/` | ✅ Ready |
-| **Loxone** | MQTT Virtual I/O guide | `examples/loxone/` | ✅ Ready |h
+| **Loxone** | MQTT Virtual I/O guide | `examples/loxone/` | ✅ Ready |
 | **ioBroker** | Native adapter | `iobroker-adapter/` | ✅ Ready |
 | **SmartThings** | Matter Bridge | `matter-bridge/` | ✅ Ready |
+| **NeuraCell-X®** | Radon + dew-point protection (all platforms) | *built-in* | ✅ Ready |
 | **openHAB** | MQTT Binding (generic) | See README | 📖 Guide |
 | **KNX / BACnet** | Via MQTT-KNX gateway | See README | 📖 Guide |
 
@@ -57,6 +79,34 @@ Ambientika Device (WiFi)
 
 ---
 
+## NeuraCell-X&reg; &mdash; patented radon & dew-point protection
+
+![NeuraCell-X](neuracell-x-logo.png)
+
+**NeuraCell-X&reg;** is the AI Neural Control System built into the bridge. It couples the
+Ambientika radon meter and dew-point control (Taupunktsteuerung) with your ventilation units:
+
+- **Radon protection (highest priority):** radon alarm &rarr; all units to Intake (Zuluft / supply air) at fan **Stufe 1** &mdash; a gentle fresh-air overpressure that actively slows radon ingress.
+- **Dew-point control:** ventilating would raise indoor humidity &rarr; units switch **off**; conditions favourable again &rarr; ventilation released.
+- **Exact restore:** when all protections clear, every unit returns to the exact mode it had before.
+
+The live status is published to `ambientika/neuracell/state` and surfaced natively on every platform:
+
+| Platform | NeuraCell-X&reg; surface |
+|---|---|
+| **Home Assistant** | Auto-discovered *Radon Protection Active*, *Radon Level*, *Ventilation Blocked (Dew Point)*, *Dew Point Indoor / Outdoor* |
+| **ioBroker** | `ambientika.0.neuracell.*` states |
+| **Apple / Google / Alexa** (Homebridge) | *NeuraCell-X* accessory: Radon Protection + Dew-Point Block occupancy sensors |
+| **Matter** (SmartThings, ...) | *NeuraCell-X Radon Protection* contact sensor |
+| **Node-RED / Loxone** | `ambientika/neuracell/state` inputs (see the examples) |
+
+Configure it in the add-on options / `config.yaml`: `radon_threshold`, `radon_protection_fan`,
+`dewpoint_source` (`signal` or `computed`), `dewpoint_margin`, and more.
+
+*NeuraCell-X&reg; and PhaseCell-X&reg; are registered trademarks of S&uuml;dwind / Ambientika. Patent pending.*
+
+---
+
 ## Integration Guides
 
 ### Home Assistant Add-on
@@ -86,6 +136,7 @@ See [`iobroker-adapter/README.md`](iobroker-adapter/README.md)
 | `ambientika/<deviceId>/status` | Bridge → Broker | Full device state (JSON) |
 | `ambientika/<deviceId>/set` | Broker → Bridge | Set mode/fanSpeed (JSON) |
 | `ambientika/<deviceId>/availability` | Bridge → Broker | `online` / `offline` |
+| `ambientika/neuracell/state` | Bridge → Broker | NeuraCell-X® radon + dew-point status (JSON) |
 
 ### Status Payload Example
 
