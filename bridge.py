@@ -7,11 +7,36 @@ Supports Home Assistant Auto-Discovery as well as ioBroker, openHAB,
 Loxone and Node-RED (any MQTT-capable system).
 
 Built on top of the community library 'ambientika_py' by wingertge.
+
+========================================================================
+NeuraCell-X(R) intelligent control  (v1.4.0)
+========================================================================
+Two coupled protections with a strict priority order:
+
+  1. RADON PROTECTION (highest priority)
+     Radon alarm  ->  all devices to INTAKE (Zuluft / supply air) at fan
+     LOW (Stufe 1). Creates a gentle fresh-air overpressure that slows
+     radon ingress.
+
+  2. DEW-POINT CONTROL (Taupunktsteuerung)
+     "Not ideal to ventilate" (ventilating would raise indoor humidity)
+     ->  all devices OFF, so no moist air is drawn in.
+     "Ideal conditions"  ->  ventilation released, devices restored.
+
+Priority: radon overrides dew point. While a radon alarm is active the
+dew-point block is ignored (radon protection needs the fans running in
+supply mode). When all protections clear, every device is returned to
+the exact mode it had BEFORE any protection kicked in.
+
+Both signals are consumed from MQTT, so this works with the Ambientika
+radon meter and dew-point control as well as with third-party sensors
+(RadonEye, AirQ, any temperature/humidity sensors).
 """
 
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -39,6 +64,37 @@ except ImportError as exc:
     sys.exit(1)
 
 log = logging.getLogger("ambientika_bridge")
+
+# ---------------------------------------------------------------------------
+# Protection constants
+# ---------------------------------------------------------------------------
+
+# "Zuluftmodus" (supply air / fresh-air overpressure) == OperatingMode.Intake.
+RADON_PROTECTION_MODE = OperatingMode.Intake
+# "Stufe 1" == FanSpeed.Low.
+RADON_PROTECTION_FAN_DEFAULT = FanSpeed.Low
+# Dew-point "do not ventilate" == switch the unit off.
+DEWPOINT_BLOCK_MODE = OperatingMode.Off
+
+
+def _truthy(value: str) -> bool:
+    """Interpret a free-form MQTT payload as a boolean."""
+    return value.strip().lower() in ("on", "true", "1", "yes", "alarm", "active", "block", "blocked")
+
+
+def _to_float(raw: str) -> Optional[float]:
+    try:
+        return float(str(raw).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+def dew_point_c(temp_c: float, rh_pct: float) -> float:
+    """Dew point in °C from temperature (°C) and relative humidity (%) - Magnus formula."""
+    a, b = 17.625, 243.04
+    rh = min(max(rh_pct, 0.01), 100.0)
+    gamma = math.log(rh / 100.0) + (a * temp_c) / (b + temp_c)
+    return (b * gamma) / (a - gamma)
 
 
 # ---------------------------------------------------------------------------
@@ -78,49 +134,138 @@ class BridgeConfig:
         self.poll_interval = 30
         self.log_level = "INFO"
 
+        # --- NeuraCell-X radon protection ---
+        self.neuracell_enabled = True
+        self.radon_topic = "ambientika/radon/value"       # numeric Bq/m3
+        self.radon_alarm_topic = "ambientika/radon/alarm"  # explicit ON/OFF
+        self.radon_threshold = 300                          # Bq/m3 (DE reference value)
+        self.radon_hysteresis = 50                          # Bq/m3
+        self.radon_protection_fan = "Low"
+
+        # --- Dew-point control (Taupunktsteuerung) ---
+        self.dewpoint_enabled = True
+        # "signal": consume an external ON/OFF block signal from MQTT.
+        # "computed": compute dew points internally from four sensor topics.
+        self.dewpoint_source = "signal"
+        # signal source:
+        self.dewpoint_block_topic = "ambientika/dewpoint/block"  # truthy = block ventilation
+        # computed source:
+        self.dewpoint_indoor_temp_topic = "ambientika/dewpoint/indoor_temp"
+        self.dewpoint_indoor_humidity_topic = "ambientika/dewpoint/indoor_humidity"
+        self.dewpoint_outdoor_temp_topic = "ambientika/dewpoint/outdoor_temp"
+        self.dewpoint_outdoor_humidity_topic = "ambientika/dewpoint/outdoor_humidity"
+        # Block ventilation when outdoor_dp >= indoor_dp - margin (would add moisture).
+        self.dewpoint_margin = 1.0        # °C
+        self.dewpoint_hysteresis = 0.5    # °C
+
+    # ----- helpers -----
+    @property
+    def radon_protection_fan_speed(self) -> FanSpeed:
+        try:
+            return FanSpeed[self.radon_protection_fan]
+        except KeyError:
+            log.warning("Invalid radon_protection_fan %r, using Low.", self.radon_protection_fan)
+            return RADON_PROTECTION_FAN_DEFAULT
+
+    def _apply_extras(self, get, cast_bool=bool) -> None:
+        """Populate NeuraCell-X + dew-point fields using a getter get(key, default)."""
+        # radon
+        self.neuracell_enabled = cast_bool(get("neuracell_enabled", self.neuracell_enabled))
+        self.radon_topic = get("radon_topic", self.radon_topic) or self.radon_topic
+        self.radon_alarm_topic = get("radon_alarm_topic", self.radon_alarm_topic) or self.radon_alarm_topic
+        try:
+            self.radon_threshold = int(get("radon_threshold", self.radon_threshold))
+        except (TypeError, ValueError):
+            pass
+        try:
+            self.radon_hysteresis = int(get("radon_hysteresis", self.radon_hysteresis))
+        except (TypeError, ValueError):
+            pass
+        self.radon_protection_fan = get("radon_protection_fan", self.radon_protection_fan) or self.radon_protection_fan
+        # dew point
+        self.dewpoint_enabled = cast_bool(get("dewpoint_enabled", self.dewpoint_enabled))
+        self.dewpoint_source = get("dewpoint_source", self.dewpoint_source) or self.dewpoint_source
+        self.dewpoint_block_topic = get("dewpoint_block_topic", self.dewpoint_block_topic) or self.dewpoint_block_topic
+        self.dewpoint_indoor_temp_topic = get("dewpoint_indoor_temp_topic", self.dewpoint_indoor_temp_topic) or self.dewpoint_indoor_temp_topic
+        self.dewpoint_indoor_humidity_topic = get("dewpoint_indoor_humidity_topic", self.dewpoint_indoor_humidity_topic) or self.dewpoint_indoor_humidity_topic
+        self.dewpoint_outdoor_temp_topic = get("dewpoint_outdoor_temp_topic", self.dewpoint_outdoor_temp_topic) or self.dewpoint_outdoor_temp_topic
+        self.dewpoint_outdoor_humidity_topic = get("dewpoint_outdoor_humidity_topic", self.dewpoint_outdoor_humidity_topic) or self.dewpoint_outdoor_humidity_topic
+        try:
+            self.dewpoint_margin = float(get("dewpoint_margin", self.dewpoint_margin))
+        except (TypeError, ValueError):
+            pass
+        try:
+            self.dewpoint_hysteresis = float(get("dewpoint_hysteresis", self.dewpoint_hysteresis))
+        except (TypeError, ValueError):
+            pass
+        if self.dewpoint_source not in ("signal", "computed"):
+            log.warning("Invalid dewpoint_source %r, using 'signal'.", self.dewpoint_source)
+            self.dewpoint_source = "signal"
+
     def apply_env_overrides(self) -> None:
         """Override any field with matching env vars (HA add-on uses these)."""
-        u = _env("AMBIENTIKA_USERNAME", "AMBIENTIKA_USER")
-        if u:
-            self.username = u
-        p = _env("AMBIENTIKA_PASSWORD", "AMBIENTIKA_PASS")
-        if p:
-            self.password = p
-        h = _env("AMBIENTIKA_HOST")
-        if h:
-            self.host = h
+        for attr, names in (
+            ("username", ("AMBIENTIKA_USERNAME", "AMBIENTIKA_USER")),
+            ("password", ("AMBIENTIKA_PASSWORD", "AMBIENTIKA_PASS")),
+            ("host", ("AMBIENTIKA_HOST",)),
+            ("mqtt_host", ("MQTT_HOST",)),
+            ("mqtt_user", ("MQTT_USERNAME", "MQTT_USER")),
+            ("mqtt_pass", ("MQTT_PASSWORD", "MQTT_PASS")),
+            ("topic_prefix", ("MQTT_TOPIC_PREFIX", "TOPIC_PREFIX")),
+            ("discovery_prefix", ("DISCOVERY_PREFIX",)),
+            ("log_level", ("LOG_LEVEL",)),
+            ("radon_topic", ("RADON_TOPIC",)),
+            ("radon_alarm_topic", ("RADON_ALARM_TOPIC",)),
+            ("radon_protection_fan", ("RADON_PROTECTION_FAN",)),
+            ("dewpoint_source", ("DEWPOINT_SOURCE",)),
+            ("dewpoint_block_topic", ("DEWPOINT_BLOCK_TOPIC",)),
+        ):
+            v = _env(*names)
+            if v:
+                setattr(self, attr, v)
 
-        mh = _env("MQTT_HOST")
-        if mh:
-            self.mqtt_host = mh
         mp = _env("MQTT_PORT")
         if mp:
             try:
                 self.mqtt_port = int(mp)
             except ValueError:
                 pass
-        mu = _env("MQTT_USERNAME", "MQTT_USER")
-        if mu:
-            self.mqtt_user = mu
-        mpw = _env("MQTT_PASSWORD", "MQTT_PASS")
-        if mpw:
-            self.mqtt_pass = mpw
-
-        tp = _env("MQTT_TOPIC_PREFIX", "TOPIC_PREFIX")
-        if tp:
-            self.topic_prefix = tp
-        dp = _env("DISCOVERY_PREFIX")
-        if dp:
-            self.discovery_prefix = dp
         pi = _env("POLL_INTERVAL")
         if pi:
             try:
                 self.poll_interval = int(pi)
             except ValueError:
                 pass
-        ll = _env("LOG_LEVEL")
-        if ll:
-            self.log_level = ll
+        rth = _env("RADON_THRESHOLD")
+        if rth:
+            try:
+                self.radon_threshold = int(rth)
+            except ValueError:
+                pass
+        rhy = _env("RADON_HYSTERESIS")
+        if rhy:
+            try:
+                self.radon_hysteresis = int(rhy)
+            except ValueError:
+                pass
+        dm = _env("DEWPOINT_MARGIN")
+        if dm:
+            try:
+                self.dewpoint_margin = float(dm)
+            except ValueError:
+                pass
+        dh = _env("DEWPOINT_HYSTERESIS")
+        if dh:
+            try:
+                self.dewpoint_hysteresis = float(dh)
+            except ValueError:
+                pass
+        ne = _env("NEURACELL_ENABLED")
+        if ne:
+            self.neuracell_enabled = ne.lower() not in ("false", "0", "no", "off")
+        de = _env("DEWPOINT_ENABLED")
+        if de:
+            self.dewpoint_enabled = de.lower() not in ("false", "0", "no", "off")
 
     @classmethod
     def from_yaml(cls, path: str) -> "BridgeConfig":
@@ -147,6 +292,11 @@ class BridgeConfig:
         cfg.poll_interval = int(br.get("poll_interval", cfg.poll_interval))
         cfg.log_level = br.get("log_level", cfg.log_level)
 
+        extras = {}
+        extras.update(raw.get("neuracell", {}) or {})
+        extras.update(raw.get("dewpoint", {}) or {})
+        cfg._apply_extras(extras.get)
+
         cfg.apply_env_overrides()
         return cfg
 
@@ -169,6 +319,7 @@ class BridgeConfig:
         cfg.enable_discovery = bool(raw.get("enable_discovery", True))
         cfg.poll_interval = int(raw.get("poll_interval", cfg.poll_interval))
         cfg.log_level = raw.get("log_level", cfg.log_level)
+        cfg._apply_extras(raw.get)
         cfg.apply_env_overrides()
         return cfg
 
@@ -186,14 +337,14 @@ class BridgeConfig:
 def state_topic(prefix: str, serial: str) -> str:
     return f"{prefix}/{serial}/state"
 
-
 def avail_topic(prefix: str, serial: str) -> str:
     return f"{prefix}/{serial}/availability"
-
 
 def cmd_topic(prefix: str, serial: str, attr: str) -> str:
     return f"{prefix}/{serial}/set/{attr}"
 
+def neuracell_state_topic(prefix: str) -> str:
+    return f"{prefix}/neuracell/state"
 
 # ---------------------------------------------------------------------------
 # Home Assistant Auto-Discovery
@@ -214,7 +365,7 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
     entities = []
 
     sensor_defs = [
-        ("temperature", "Temperature", "\u00b0C", "temperature", None),
+        ("temperature", "Temperature", "°C", "temperature", None),
         ("humidity", "Humidity", "%", "humidity", None),
         ("air_quality", "Air Quality", None, None, "mdi:air-filter"),
         ("filters_status", "Filter Status", None, None, "mdi:air-filter"),
@@ -282,6 +433,238 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
     return entities
 
 
+def build_neuracell_discovery(cfg: BridgeConfig):
+    """Discovery configs for the NeuraCell-X protection status."""
+    base = cfg.discovery_prefix
+    state = neuracell_state_topic(cfg.topic_prefix)
+    device_info = {
+        "identifiers": ["neuracell_x"],
+        "name": "NeuraCell-X",
+        "manufacturer": "Ambientika / SUEDWIND",
+        "model": "NeuraCell-X AI Neural Control System",
+    }
+    entities = [
+        (f"{base}/binary_sensor/neuracell_radon_protection/config", {
+            "name": "Radon Protection Active",
+            "unique_id": "neuracell_radon_protection_active",
+            "state_topic": state,
+            "value_template": "{{ value_json.radon_protection }}",
+            "payload_on": "True", "payload_off": "False",
+            "device_class": "safety", "icon": "mdi:shield-home",
+            "device": device_info,
+        }),
+        (f"{base}/sensor/neuracell_radon_level/config", {
+            "name": "Radon Level",
+            "unique_id": "neuracell_radon_level",
+            "state_topic": state,
+            "value_template": "{{ value_json.radon }}",
+            "unit_of_measurement": "Bq/m³", "icon": "mdi:radioactive",
+            "device": device_info,
+        }),
+        (f"{base}/binary_sensor/neuracell_dewpoint_block/config", {
+            "name": "Ventilation Blocked (Dew Point)",
+            "unique_id": "neuracell_dewpoint_block",
+            "state_topic": state,
+            "value_template": "{{ value_json.dewpoint_block }}",
+            "payload_on": "True", "payload_off": "False",
+            "device_class": "moisture", "icon": "mdi:water-off",
+            "device": device_info,
+        }),
+        (f"{base}/sensor/neuracell_dewpoint_indoor/config", {
+            "name": "Dew Point Indoor",
+            "unique_id": "neuracell_dewpoint_indoor",
+            "state_topic": state,
+            "value_template": "{{ value_json.indoor_dew_point }}",
+            "unit_of_measurement": "°C", "icon": "mdi:thermometer-water",
+            "device": device_info,
+        }),
+        (f"{base}/sensor/neuracell_dewpoint_outdoor/config", {
+            "name": "Dew Point Outdoor",
+            "unique_id": "neuracell_dewpoint_outdoor",
+            "state_topic": state,
+            "value_template": "{{ value_json.outdoor_dew_point }}",
+            "unit_of_measurement": "°C", "icon": "mdi:thermometer-water",
+            "device": device_info,
+        }),
+    ]
+    return entities
+
+
+# ---------------------------------------------------------------------------
+# NeuraCell-X controller  (radon + dew point with priority arbitration)
+# ---------------------------------------------------------------------------
+
+class NeuraCellXController:
+    """Radon protection (priority) + dew-point control, with baseline restore.
+
+    Desired override per device:
+        radon_active     -> Intake / protection fan          (priority 1)
+        dewpoint_block   -> Off (keep fan/humidity)          (priority 2)
+        neither          -> restore pre-protection baseline
+    """
+
+    def __init__(self, bridge: "AmbientikaBridge", cfg: BridgeConfig) -> None:
+        self.bridge = bridge
+        self.cfg = cfg
+
+        self.radon_active = False
+        self.dewpoint_block = False
+        self.last_radon: Optional[float] = None
+
+        self.indoor_dew_point: Optional[float] = None
+        self.outdoor_dew_point: Optional[float] = None
+        self._dp_inputs: dict = {}  # indoor_t, indoor_rh, outdoor_t, outdoor_rh
+
+        self._saved_modes: dict = {}  # serial -> {operating_mode, fan_speed, humidity_level}
+        self._pending_manual: dict = {}  # serial -> partial baseline from manual cmds while offline
+        self._lock = asyncio.Lock()
+
+    # ----- convenience -----
+    @property
+    def override_active(self) -> bool:
+        return self.radon_active or self.dewpoint_block
+
+    # ----- radon signals -----
+    async def on_radon_value(self, raw: str) -> None:
+        if not self.cfg.neuracell_enabled:
+            return
+        value = _to_float(raw)
+        if value is None:
+            log.warning("NeuraCell-X: could not parse radon value %r", raw)
+            return
+        self.last_radon = value
+        changed = False
+        if not self.radon_active and value >= self.cfg.radon_threshold:
+            log.warning("NeuraCell-X: radon %.0f >= %d Bq/m3 -> radon protection ON.",
+                        value, self.cfg.radon_threshold)
+            self.radon_active = True
+            changed = True
+        elif self.radon_active and value <= (self.cfg.radon_threshold - self.cfg.radon_hysteresis):
+            log.warning("NeuraCell-X: radon %.0f Bq/m3 back to safe -> radon protection OFF.", value)
+            self.radon_active = False
+            changed = True
+        if changed:
+            await self.reconcile(force=True)
+        else:
+            self.bridge.publish_neuracell_state()
+
+    async def on_radon_alarm(self, raw: str) -> None:
+        if not self.cfg.neuracell_enabled:
+            return
+        on = _truthy(raw)
+        if on != self.radon_active:
+            self.radon_active = on
+            log.warning("NeuraCell-X: explicit radon alarm %s.", "ON" if on else "OFF")
+            await self.reconcile(force=True)
+
+    # ----- dew-point signals -----
+    async def on_dewpoint_block(self, raw: str) -> None:
+        """External ON/OFF block signal (source='signal')."""
+        if not self.cfg.dewpoint_enabled:
+            return
+        block = _truthy(raw)
+        await self._set_dewpoint_block(block)
+
+    async def on_dewpoint_sensor(self, which: str, raw: str) -> None:
+        """One of the four sensor inputs (source='computed')."""
+        if not self.cfg.dewpoint_enabled:
+            return
+        val = _to_float(raw)
+        if val is None:
+            log.warning("NeuraCell-X: could not parse dew-point sensor %s=%r", which, raw)
+            return
+        self._dp_inputs[which] = val
+        needed = ("indoor_t", "indoor_rh", "outdoor_t", "outdoor_rh")
+        if not all(k in self._dp_inputs for k in needed):
+            return
+        self.indoor_dew_point = dew_point_c(self._dp_inputs["indoor_t"], self._dp_inputs["indoor_rh"])
+        self.outdoor_dew_point = dew_point_c(self._dp_inputs["outdoor_t"], self._dp_inputs["outdoor_rh"])
+        # Ventilating brings outdoor air in. If the outdoor dew point is at/above
+        # (indoor dew point - margin), ventilating would add moisture -> block.
+        margin = self.cfg.dewpoint_margin
+        hyst = self.cfg.dewpoint_hysteresis
+        if not self.dewpoint_block and self.outdoor_dew_point >= (self.indoor_dew_point - margin):
+            await self._set_dewpoint_block(True)
+        elif self.dewpoint_block and self.outdoor_dew_point <= (self.indoor_dew_point - margin - hyst):
+            await self._set_dewpoint_block(False)
+        else:
+            self.bridge.publish_neuracell_state()
+
+    async def _set_dewpoint_block(self, block: bool) -> None:
+        if block == self.dewpoint_block:
+            self.bridge.publish_neuracell_state()
+            return
+        self.dewpoint_block = block
+        log.warning("NeuraCell-X: dew-point ventilation %s.",
+                    "BLOCKED (fans off)" if block else "released")
+        await self.reconcile(force=True)
+
+    # ----- desired state -----
+    def _desired(self, status: dict):
+        """Return (operating_mode, fan_speed, humidity_level) or None to restore."""
+        if self.radon_active:
+            return (RADON_PROTECTION_MODE, self.cfg.radon_protection_fan_speed, status["humidity_level"])
+        if self.dewpoint_block:
+            return (DEWPOINT_BLOCK_MODE, status["fan_speed"], status["humidity_level"])
+        return None
+
+    # ----- reconciliation -----
+    async def reconcile(self, force: bool = False) -> None:
+        """Bring every device in line with the current protection state.
+
+        Serialised with a lock so signal-triggered and poll-triggered
+        reconciles can never interleave and corrupt the saved baseline.
+        """
+        async with self._lock:
+            if self.override_active:
+                for serial, device in list(self.bridge.devices.items()):
+                    status = await self.bridge.read_status(device)
+                    if status is None:
+                        log.warning("NeuraCell-X: %s unreachable; will retry on next poll.", serial)
+                        continue
+                    # Capture the pre-protection baseline exactly once per device,
+                    # honouring any manual change made while it was overridden.
+                    if serial not in self._saved_modes:
+                        base = {
+                            "operating_mode": status["operating_mode"],
+                            "fan_speed": status["fan_speed"],
+                            "humidity_level": status["humidity_level"],
+                        }
+                        base.update(self._pending_manual.pop(serial, {}))
+                        self._saved_modes[serial] = base
+                    desired = self._desired(status)
+                    if desired is None:
+                        continue
+                    mode, fan, hum = desired
+                    if (force or status["operating_mode"] != mode
+                            or status["fan_speed"] != fan
+                            or status["humidity_level"] != hum):
+                        await self.bridge.set_device_mode(device, mode, fan, hum)
+            elif self._saved_modes:
+                # All protections cleared: restore each device, retry-safe.
+                # Keep a device's baseline until its restore actually succeeds,
+                # so an offline device is not left stuck in protection mode.
+                for serial in list(self._saved_modes.keys()):
+                    device = self.bridge.devices.get(serial)
+                    if device is None:
+                        del self._saved_modes[serial]
+                        continue
+                    saved = self._saved_modes[serial]
+                    ok = await self.bridge.set_device_mode(
+                        device, saved["operating_mode"], saved["fan_speed"], saved["humidity_level"]
+                    )
+                    if ok:
+                        del self._saved_modes[serial]
+                if not self._saved_modes:
+                    log.warning("NeuraCell-X: all protections cleared -> devices restored.")
+            self.bridge.publish_neuracell_state()
+
+    async def enforce(self) -> None:
+        """Called every poll: re-assert an active override, or finish a pending restore."""
+        if self.override_active or self._saved_modes:
+            await self.reconcile(force=False)
+
+
 # ---------------------------------------------------------------------------
 # Bridge
 # ---------------------------------------------------------------------------
@@ -294,6 +677,36 @@ class AmbientikaBridge:
         self.devices: dict = {}
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop_event: Optional[asyncio.Event] = None
+        self.neuracell = NeuraCellXController(self, cfg)
+
+    # ----- device helpers -----
+    async def read_status(self, device: Device) -> Optional[dict]:
+        try:
+            res = await device.status()
+        except Exception as e:
+            log.exception("status() raised for %s: %s", device.serial_number, e)
+            return None
+        if isinstance(res, Failure):
+            log.warning("status() failed for %s: %s", device.serial_number, res)
+            return None
+        return res.unwrap()
+
+    async def set_device_mode(self, device, operating_mode, fan_speed, humidity_level) -> bool:
+        mode = {
+            "operating_mode": operating_mode,
+            "fan_speed": fan_speed,
+            "humidity_level": humidity_level,
+        }
+        try:
+            res = await device.change_mode(mode)
+        except Exception as e:
+            log.exception("change_mode raised for %s: %s", device.serial_number, e)
+            return False
+        if isinstance(res, Failure):
+            log.error("change_mode failed for %s: %s", device.serial_number, res)
+            return False
+        log.info("Device %s set to %s / %s.", device.serial_number, operating_mode.name, fan_speed.name)
+        return True
 
     # ----- MQTT -----
     def _mqtt_connect(self) -> None:
@@ -308,31 +721,88 @@ class AmbientikaBridge:
         self.client.connect(self.cfg.mqtt_host, self.cfg.mqtt_port, keepalive=60)
         self.client.loop_start()
 
+    def _dewpoint_sensor_map(self) -> dict:
+        return {
+            self.cfg.dewpoint_indoor_temp_topic: "indoor_t",
+            self.cfg.dewpoint_indoor_humidity_topic: "indoor_rh",
+            self.cfg.dewpoint_outdoor_temp_topic: "outdoor_t",
+            self.cfg.dewpoint_outdoor_humidity_topic: "outdoor_rh",
+        }
+
+    def _subscribe_all(self, client) -> None:
+        for serial in self.devices:
+            client.subscribe(f"{self.cfg.topic_prefix}/{serial}/set/+")
+        if self.cfg.neuracell_enabled:
+            if self.cfg.radon_topic:
+                client.subscribe(self.cfg.radon_topic)
+            if self.cfg.radon_alarm_topic:
+                client.subscribe(self.cfg.radon_alarm_topic)
+            log.info("NeuraCell-X: radon topics subscribed (%s / %s).",
+                     self.cfg.radon_topic, self.cfg.radon_alarm_topic)
+        if self.cfg.dewpoint_enabled:
+            if self.cfg.dewpoint_source == "computed":
+                for topic in self._dewpoint_sensor_map():
+                    if topic:
+                        client.subscribe(topic)
+                log.info("NeuraCell-X: dew-point computed from sensor topics.")
+            else:
+                if self.cfg.dewpoint_block_topic:
+                    client.subscribe(self.cfg.dewpoint_block_topic)
+                log.info("NeuraCell-X: dew-point block topic subscribed (%s).",
+                         self.cfg.dewpoint_block_topic)
+
     def _on_mqtt_connect(self, client, userdata, flags, rc) -> None:
         if rc == 0:
             log.info("Connected to MQTT broker.")
-            for serial in self.devices:
-                topic = f"{self.cfg.topic_prefix}/{serial}/set/+"
-                client.subscribe(topic)
-                log.debug("Subscribed to %s", topic)
+            self._subscribe_all(client)
+            # Publish discovery + NeuraCell-X status here (after CONNACK) so the
+            # retained messages are never lost to a not-yet-connected socket.
+            # Re-runs on every reconnect, which also refreshes HA auto-discovery.
+            self._publish_discovery()
+            self.publish_neuracell_state()
         else:
             log.error("MQTT connection failed (rc=%s).", rc)
 
+    def _dispatch(self, coro) -> None:
+        if self.loop is not None:
+            asyncio.run_coroutine_threadsafe(coro, self.loop)
+
     def _on_mqtt_message(self, client, userdata, msg) -> None:
         try:
-            parts = msg.topic.split("/")
+            payload = msg.payload.decode("utf-8", errors="replace").strip()
+            topic = msg.topic
+
+            if self.cfg.neuracell_enabled:
+                if topic == self.cfg.radon_topic:
+                    self._dispatch(self.neuracell.on_radon_value(payload)); return
+                if topic == self.cfg.radon_alarm_topic:
+                    self._dispatch(self.neuracell.on_radon_alarm(payload)); return
+
+            if self.cfg.dewpoint_enabled:
+                if self.cfg.dewpoint_source == "signal" and topic == self.cfg.dewpoint_block_topic:
+                    self._dispatch(self.neuracell.on_dewpoint_block(payload)); return
+                if self.cfg.dewpoint_source == "computed":
+                    which = self._dewpoint_sensor_map().get(topic)
+                    if which:
+                        self._dispatch(self.neuracell.on_dewpoint_sensor(which, payload)); return
+
+            # Device command topics: <prefix>/<serial>/set/<attr>
+            parts = topic.split("/")
             if len(parts) < 4 or parts[-2] != "set":
                 return
             serial = parts[-3]
             attr = parts[-1]
-            payload = msg.payload.decode("utf-8", errors="replace").strip()
             log.info("Command received: serial=%s attr=%s value=%s", serial, attr, payload)
-            if self.loop is not None:
-                asyncio.run_coroutine_threadsafe(
-                    self._handle_command(serial, attr, payload), self.loop
-                )
+            self._dispatch(self._handle_command(serial, attr, payload))
         except Exception as e:
             log.exception("Error handling MQTT message: %s", e)
+
+    # Which attrs form the restore baseline, and how to parse their value.
+    _BASELINE_ATTRS = {
+        "operating_mode": OperatingMode,
+        "fan_speed": FanSpeed,
+        "humidity_level": HumidityLevel,
+    }
 
     async def _handle_command(self, serial: str, attr: str, value: str) -> None:
         device = self.devices.get(serial)
@@ -340,44 +810,83 @@ class AmbientikaBridge:
             log.warning("Unknown device serial: %s", serial)
             return
 
-        status_res = await device.status()
-        if isinstance(status_res, Failure):
-            log.error("Cannot read current status of %s: %s", serial, status_res)
+        # Parse the target attribute first - this needs no live status, so a
+        # baseline change can be deferred even while the device is offline.
+        enum_cls = self._BASELINE_ATTRS.get(attr)
+        if enum_cls is None and attr != "light_sensor_level":
+            log.warning("Unsupported attribute: %s", attr)
             return
-        status = status_res.unwrap()
-
-        op = status["operating_mode"]
-        fan = status["fan_speed"]
-        hum = status["humidity_level"]
-        light = status["light_sensor_level"]
-
         try:
-            if attr == "operating_mode":
-                op = OperatingMode[value]
-            elif attr == "fan_speed":
-                fan = FanSpeed[value]
-            elif attr == "humidity_level":
-                hum = HumidityLevel[value]
-            elif attr == "light_sensor_level":
-                light = LightSensorLevel[value]
-            else:
-                log.warning("Unsupported attribute: %s", attr)
-                return
+            parsed = (enum_cls[value] if enum_cls is not None
+                      else LightSensorLevel[value])
         except KeyError:
             log.error("Invalid value %r for %s", value, attr)
             return
 
+        # While a protection override is active, manual changes to baseline
+        # attributes (mode/fan/humidity) must not fight the controller. Record
+        # them as the new baseline (applied once protections clear) instead of
+        # applying them now. Non-baseline attrs (light sensor) pass through.
+        if self.neuracell.override_active and attr in self._BASELINE_ATTRS:
+            nc = self.neuracell
+            if serial in nc._saved_modes:
+                nc._saved_modes[serial][attr] = parsed
+            else:
+                nc._pending_manual.setdefault(serial, {})[attr] = parsed
+            log.warning(
+                "NeuraCell-X active: deferring manual %s change on %s until protection clears.",
+                attr, serial,
+            )
+            return
+
+        # Live change: read current status to fill the unchanged attributes.
+        status = await self.read_status(device)
+        if status is None:
+            log.error("Cannot read current status of %s", serial)
+            return
+        op = status["operating_mode"]
+        fan = status["fan_speed"]
+        hum = status["humidity_level"]
+        light = status["light_sensor_level"]
+        if attr == "operating_mode":
+            op = parsed
+        elif attr == "fan_speed":
+            fan = parsed
+        elif attr == "humidity_level":
+            hum = parsed
+        elif attr == "light_sensor_level":
+            light = parsed
+
         mode = {
-            "operating_mode": op,
-            "fan_speed": fan,
-            "humidity_level": hum,
-            "light_sensor_level": light,
+            "operating_mode": op, "fan_speed": fan,
+            "humidity_level": hum, "light_sensor_level": light,
         }
-        res = await device.change_mode(mode)
+        try:
+            res = await device.change_mode(mode)
+        except Exception as e:
+            log.exception("change_mode raised for %s: %s", serial, e)
+            return
         if isinstance(res, Failure):
             log.error("change_mode failed for %s: %s", serial, res)
         else:
             log.info("change_mode OK for %s", serial)
+
+
+    def publish_neuracell_state(self) -> None:
+        if self.client is None or not (self.cfg.neuracell_enabled or self.cfg.dewpoint_enabled):
+            return
+        nc = self.neuracell
+        payload = {
+            "radon_protection": nc.radon_active,
+            "radon": nc.last_radon,
+            "radon_threshold": self.cfg.radon_threshold,
+            "dewpoint_block": nc.dewpoint_block,
+            "indoor_dew_point": round(nc.indoor_dew_point, 1) if nc.indoor_dew_point is not None else None,
+            "outdoor_dew_point": round(nc.outdoor_dew_point, 1) if nc.outdoor_dew_point is not None else None,
+            "override_active": nc.override_active,
+        }
+        self.client.publish(neuracell_state_topic(self.cfg.topic_prefix),
+                            json.dumps(payload), qos=0, retain=True)
 
     # ----- Ambientika -----
     async def _login(self) -> None:
@@ -402,8 +911,7 @@ class AmbientikaBridge:
             for room in house.rooms:
                 for device in room.devices:
                     self.devices[device.serial_number] = device
-                    log.info("  Device: %s (serial: %s)", device.name, device.serial_number)
-
+                    log.info("  Device: %s  (serial: %s)", device.name, device.serial_number)
         log.info("Found %d device(s).", len(self.devices))
 
     def _publish_discovery(self) -> None:
@@ -411,6 +919,9 @@ class AmbientikaBridge:
             return
         for serial, device in self.devices.items():
             for topic, payload in build_discovery_configs(self.cfg, serial, device.name):
+                self.client.publish(topic, json.dumps(payload), qos=0, retain=True)
+        if self.cfg.neuracell_enabled or self.cfg.dewpoint_enabled:
+            for topic, payload in build_neuracell_discovery(self.cfg):
                 self.client.publish(topic, json.dumps(payload), qos=0, retain=True)
         log.info("HA Auto-Discovery published for all devices.")
 
@@ -423,12 +934,8 @@ class AmbientikaBridge:
                     if isinstance(res, Failure):
                         log.warning("status() failed for %s: %s", serial, res)
                         if self.client is not None:
-                            self.client.publish(
-                                avail_topic(self.cfg.topic_prefix, serial),
-                                "offline",
-                                qos=0,
-                                retain=True,
-                            )
+                            self.client.publish(avail_topic(self.cfg.topic_prefix, serial),
+                                                "offline", qos=0, retain=True)
                         continue
                     s = res.unwrap()
                     payload = {
@@ -445,25 +952,21 @@ class AmbientikaBridge:
                         "device_role": s["device_role"],
                     }
                     if self.client is not None:
-                        self.client.publish(
-                            state_topic(self.cfg.topic_prefix, serial),
-                            json.dumps(payload),
-                            qos=0,
-                            retain=True,
-                        )
-                        self.client.publish(
-                            avail_topic(self.cfg.topic_prefix, serial),
-                            "online",
-                            qos=0,
-                            retain=True,
-                        )
+                        self.client.publish(state_topic(self.cfg.topic_prefix, serial),
+                                            json.dumps(payload), qos=0, retain=True)
+                        self.client.publish(avail_topic(self.cfg.topic_prefix, serial),
+                                            "online", qos=0, retain=True)
                 except Exception as e:
                     log.exception("Error polling %s: %s", serial, e)
 
+            # Keep asserting the active protection state.
             try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(), timeout=self.cfg.poll_interval
-                )
+                await self.neuracell.enforce()
+            except Exception as e:
+                log.exception("NeuraCell-X enforce error: %s", e)
+
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self.cfg.poll_interval)
             except asyncio.TimeoutError:
                 pass
 
@@ -474,12 +977,16 @@ class AmbientikaBridge:
         await self._login()
         await self._discover_devices()
         self._mqtt_connect()
-        if self.client is not None:
-            for serial in self.devices:
-                self.client.subscribe(f"{self.cfg.topic_prefix}/{serial}/set/+")
-        self._publish_discovery()
+        # Subscriptions, discovery and NeuraCell-X status are (re)published from
+        # the on_connect callback once the CONNACK is received (see _on_mqtt_connect).
 
         log.info("Starting poll loop (every %ss) ...", self.cfg.poll_interval)
+        if self.cfg.neuracell_enabled:
+            log.info("NeuraCell-X radon: threshold=%d Bq/m3 -> Intake/%s",
+                     self.cfg.radon_threshold, self.cfg.radon_protection_fan)
+        if self.cfg.dewpoint_enabled:
+            log.info("NeuraCell-X dew point: source=%s -> block => Off (radon has priority).",
+                     self.cfg.dewpoint_source)
         await self._poll_loop()
 
     def stop(self) -> None:
@@ -499,7 +1006,6 @@ class AmbientikaBridge:
 # ---------------------------------------------------------------------------
 
 def load_config() -> BridgeConfig:
-    """Load configuration from Home Assistant options, YAML or environment."""
     ha_options = "/data/options.json"
     yaml_path = os.environ.get("CONFIG_YAML", "config.yaml")
     if os.path.exists(ha_options):
@@ -511,12 +1017,11 @@ def load_config() -> BridgeConfig:
 
 def main() -> None:
     cfg = load_config()
-
     logging.basicConfig(
         level=getattr(logging, str(cfg.log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)-7s %(message)s",
     )
-    log.info("=== Ambientika MQTT Bridge v1.2.0 starting ===")
+    log.info("=== Ambientika MQTT Bridge  v1.4.0 (NeuraCell-X: radon + dew point)  starting ===")
     log.info("API host      : %s", cfg.host)
     log.info("MQTT broker   : %s:%s", cfg.mqtt_host, cfg.mqtt_port)
     log.info("Topic prefix  : %s", cfg.topic_prefix)
