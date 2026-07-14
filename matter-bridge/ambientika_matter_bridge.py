@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Ambientika Matter Bridge
+Ambientika Matter Bridge  —  powered by NeuraCell-X(R)
 Exposes Ambientika ventilation units as Matter-compatible Air Quality sensors
 and Fan devices via the python-matter-server SDK.
+
+NeuraCell-X(R) — the patented AI Neural Control System — provides active radon
+protection and dew-point ventilation control. This bridge surfaces the
+NeuraCell-X status (radon protection active, radon level, dew-point block,
+indoor/outdoor dew point) as Matter sensors so any Matter ecosystem can see it.
 
 Compatible with: Apple Home, Google Home, Amazon Alexa, SmartThings
 Requirements: python-matter-server >= 5.0, paho-mqtt
 
-GitHub: https://github.com/martinsaxalber-oss/ambientika-mqtt-bridge
+NeuraCell-X(R) and PhaseCell-X(R) are registered trademarks. Patent pending.
+GitHub: https://github.com/ambientika-eu/ambientika-mqtt-bridge
 """
 
 import asyncio
@@ -68,8 +74,22 @@ class AmbientikaDevice:
     matter_node_id: Optional[int] = None
 
 
-# Global device registry
+@dataclass
+class NeuraCellXState:
+    """NeuraCell-X(R) protection status published by the main MQTT bridge."""
+    radon_protection: bool = False       # radon alarm -> devices in supply/Intake
+    radon: Optional[float] = None        # Bq/m3
+    radon_threshold: Optional[int] = None
+    dewpoint_block: bool = False         # ventilating would add moisture -> Off
+    indoor_dew_point: Optional[float] = None   # °C
+    outdoor_dew_point: Optional[float] = None  # °C
+    override_active: bool = False        # any protection currently overriding
+    matter_node_id: Optional[int] = None
+
+
+# Global registries
 devices: Dict[str, AmbientikaDevice] = {}
+neuracell = NeuraCellXState()
 
 # ---------------------------------------------------------------------------
 # MQTT helpers
@@ -81,13 +101,17 @@ def on_connect(client, userdata, flags, rc):
         topic = f"{MQTT_PREFIX}/+/status"
         client.subscribe(topic)
         logger.info(f"Subscribed to {topic}")
+        # NeuraCell-X(R) status published by the main bridge.
+        ncx_topic = f"{MQTT_PREFIX}/neuracell/state"
+        client.subscribe(ncx_topic)
+        logger.info(f"Subscribed to {ncx_topic}  (NeuraCell-X radon + dew-point status)")
     else:
         logger.error(f"MQTT connect failed, rc={rc}")
 
 
 def on_message(client, userdata, msg):
     """Handle incoming MQTT messages from the Ambientika MQTT bridge."""
-    topic = msg.topic  # e.g. ambientika/DEV001/status
+    topic = msg.topic  # e.g. ambientika/DEV001/status  or  ambientika/neuracell/state
     try:
         payload = json.loads(msg.payload.decode())
     except json.JSONDecodeError:
@@ -97,6 +121,12 @@ def on_message(client, userdata, msg):
     parts = topic.split("/")
     if len(parts) < 3:
         return
+
+    # ---- NeuraCell-X(R) status ----
+    if parts[1] == "neuracell" and parts[2] == "state":
+        handle_neuracell(payload)
+        return
+
     device_id = parts[1]
 
     if device_id not in devices:
@@ -127,6 +157,46 @@ def on_message(client, userdata, msg):
         asyncio.get_event_loop().call_soon_threadsafe(
             lambda: asyncio.ensure_future(update_matter_node(dev))
         )
+
+
+# ---------------------------------------------------------------------------
+# NeuraCell-X(R) status handling
+# ---------------------------------------------------------------------------
+
+def handle_neuracell(payload: dict):
+    """Update the NeuraCell-X state from the bridge and reflect it into Matter."""
+    def _num(v):
+        return None if v is None else float(v)
+
+    if "radon_protection" in payload: neuracell.radon_protection = bool(payload["radon_protection"])
+    if "radon"            in payload: neuracell.radon            = _num(payload["radon"])
+    if "radon_threshold"  in payload: neuracell.radon_threshold  = payload["radon_threshold"]
+    if "dewpoint_block"   in payload: neuracell.dewpoint_block   = bool(payload["dewpoint_block"])
+    if "indoor_dew_point" in payload: neuracell.indoor_dew_point = _num(payload["indoor_dew_point"])
+    if "outdoor_dew_point" in payload: neuracell.outdoor_dew_point = _num(payload["outdoor_dew_point"])
+    if "override_active"  in payload: neuracell.override_active  = bool(payload["override_active"])
+
+    logger.info(
+        "NeuraCell-X: radon_protection=%s radon=%s dewpoint_block=%s override=%s",
+        neuracell.radon_protection, neuracell.radon,
+        neuracell.dewpoint_block, neuracell.override_active,
+    )
+
+    # Commission the NeuraCell-X virtual sensor once, then push updates.
+    if neuracell.matter_node_id is None:
+        try:
+            asyncio.get_event_loop().call_soon_threadsafe(
+                lambda: asyncio.ensure_future(commission_neuracell())
+            )
+        except RuntimeError:
+            pass
+    else:
+        try:
+            asyncio.get_event_loop().call_soon_threadsafe(
+                lambda: asyncio.ensure_future(update_neuracell_node())
+            )
+        except RuntimeError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +231,31 @@ async def commission_device(dev: AmbientikaDevice):
         logger.error(f"Commission error for {dev.device_id}: {exc}")
 
 
+async def commission_neuracell():
+    """Commission the NeuraCell-X(R) radon-protection status as a Matter sensor node."""
+    import aiohttp
+    url = f"http://{MATTER_SERVER_HOST}:{MATTER_SERVER_PORT}/commission"
+    payload = {
+        "device_type": "contact_sensor",   # ON = radon protection active
+        "vendor_id": 0xFFF1,
+        "product_id": 0x8002,
+        "node_label": "NeuraCell-X Radon Protection",
+        "serial_number": "neuracell-x",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    neuracell.matter_node_id = data.get("node_id")
+                    logger.info(f"Commissioned NeuraCell-X as Matter node {neuracell.matter_node_id}")
+                    await update_neuracell_node()
+                else:
+                    logger.error(f"NeuraCell-X commission failed: HTTP {resp.status}")
+    except Exception as exc:
+        logger.error(f"NeuraCell-X commission error: {exc}")
+
+
 async def update_matter_node(dev: AmbientikaDevice):
     """Push current Ambientika state to the corresponding Matter node attributes."""
     import aiohttp
@@ -188,6 +283,31 @@ async def update_matter_node(dev: AmbientikaDevice):
                     logger.warning(f"set_attributes HTTP {resp.status} for node {dev.matter_node_id}")
     except Exception as exc:
         logger.debug(f"set_attributes error: {exc}")
+
+
+async def update_neuracell_node():
+    """Push NeuraCell-X(R) status to its Matter sensor node."""
+    import aiohttp
+    if neuracell.matter_node_id is None:
+        return
+    attributes = {
+        "node_id": neuracell.matter_node_id,
+        # Contact "open" (True) when any radon/dew-point protection is active.
+        "contact": bool(neuracell.override_active),
+        "radon_protection": bool(neuracell.radon_protection),
+        "dewpoint_block": bool(neuracell.dewpoint_block),
+        "radon": neuracell.radon,
+        "indoor_dew_point": neuracell.indoor_dew_point,
+        "outdoor_dew_point": neuracell.outdoor_dew_point,
+    }
+    url = f"http://{MATTER_SERVER_HOST}:{MATTER_SERVER_PORT}/set_attributes"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=attributes, timeout=5) as resp:
+                if resp.status != 200:
+                    logger.warning(f"NeuraCell-X set_attributes HTTP {resp.status}")
+    except Exception as exc:
+        logger.debug(f"NeuraCell-X set_attributes error: {exc}")
 
 
 def _map_air_quality(aqi: int) -> int:
@@ -280,7 +400,7 @@ mqtt_client: mqtt.Client = None
 async def main():
     global mqtt_client
 
-    logger.info("=== Ambientika Matter Bridge starting ===")
+    logger.info("=== Ambientika Matter Bridge starting  —  powered by NeuraCell-X(R) (patented) ===")
     logger.info(f"MQTT broker : {MQTT_BROKER}:{MQTT_PORT}")
     logger.info(f"Matter server: {MATTER_SERVER_HOST}:{MATTER_SERVER_PORT}")
 
