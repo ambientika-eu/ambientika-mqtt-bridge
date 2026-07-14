@@ -1,3 +1,9 @@
+<p align="center">
+  <img src="neuracell-x-logo.png" alt="NeuraCell-X (patented)" width="420">
+</p>
+
+> **Powered by NeuraCell-X&reg;** &mdash; the patented AI Neural Control System (active radon protection + dew-point ventilation control).
+
 # Ambientika – Loxone Integration Guide
 
 This guide explains how to integrate Ambientika ventilation units into a **Loxone Miniserver** using the [Ambientika MQTT Bridge](../../README.md) and the Loxone MQTT extension.
@@ -103,6 +109,27 @@ Virtual Inputs receive data published by the bridge.
 | MQTT Topic | ambientika/YOUR_SERIAL/filter_alarm |
 | ON Payload | true |
 | OFF Payload | false |
+
+
+### 2.8 - NeuraCell-X&reg; Radon Protection (patented)
+
+NeuraCell-X&reg; publishes its status as JSON to `ambientika/neuracell/state`.
+Create MQTT subscriptions in the Loxone MQTT extension and extract the JSON fields:
+
+| Field | Loxone Virtual Input | JSON field | Notes |
+|-------|----------------------|-----------|-------|
+| Radon Protection Active | Digital | `radon_protection` | ON = units in fresh-air overpressure (Zuluft, Stufe 1) |
+| Dew-Point Block | Digital | `dewpoint_block` | ON = ventilation paused (air too humid) |
+| Radon Level | Number (Bq/m3) | `radon` | current radon concentration |
+| Dew Point Indoor | Number (C) | `indoor_dew_point` | |
+| Dew Point Outdoor | Number (C) | `outdoor_dew_point` | |
+| Override Active | Digital | `override_active` | any NeuraCell-X protection active |
+
+In Loxone Config, add an **MQTT Subscription** with topic `ambientika/neuracell/state`
+and map each JSON key above to a Virtual Input. Use *Radon Protection Active* to drive a
+warning indicator + push notification, and *Dew-Point Block* to show ventilation status.
+
+*NeuraCell-X&reg; is a registered trademark of S&uuml;dwind / Ambientika. Patent pending.*
 
 ---
 

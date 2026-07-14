@@ -1,3 +1,9 @@
+<p align="center">
+  <img src="neuracell-x-logo.png" alt="NeuraCell-X (patented)" width="420">
+</p>
+
+> **Powered by NeuraCell-X&reg;** &mdash; the patented AI Neural Control System (active radon protection + dew-point ventilation control).
+
 # Ambientika – Node-RED Flow
 
 This folder contains an importable Node-RED flow for controlling Ambientika ventilation units via the [Ambientika MQTT Bridge](../../README.md).
@@ -92,6 +98,29 @@ To receive filter alarm notifications on your phone:
 
 [MQTT in: filter_alarm] ─→ [Filter Alarm?] ─→ [Build Notification] ─→ [Debug]
 ```
+
+
+
+## NeuraCell-X&reg; (radon + dew point)
+
+![NeuraCell-X](neuracell-x-logo.png)
+
+The flow includes a **NeuraCell-X** section that subscribes to `ambientika/neuracell/state`
+and exposes the patented radon + dew-point protection status:
+
+- `NeuraCell-X Status` (MQTT in) &rarr; `NeuraCell-X Logic` (function)
+- Output 1 &rarr; debug status summary (radon protection, radon level, dew-point block, dew points)
+- Output 2 &rarr; a ready-to-use **alert payload** when radon protection engages or ventilation is paused
+
+Connect output 2 to a Telegram / Pushover / e-mail node to be notified the instant radon
+protection activates. Fields available in `msg.summary`: `radon_protection`, `radon`,
+`dewpoint_block`, `indoor_dew_point`, `outdoor_dew_point`, `override_active`.
+
+| Topic | Direction | Description |
+|-------|-----------|-------------|
+| `ambientika/neuracell/state` | Subscribe | NeuraCell-X&reg; radon + dew-point status (JSON) |
+
+*NeuraCell-X&reg; is a registered trademark of S&uuml;dwind / Ambientika. Patent pending.*
 
 ## License
 
