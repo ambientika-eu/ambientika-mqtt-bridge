@@ -125,7 +125,7 @@
     opacity="0.95"
   >AI NEURAL CONTROL SYSTEM</text>
 
-  <!-- ===== PATENTED SYSTEM ===== -->
+  <!-- ===== PATENT PENDING ===== -->
   <!-- Green dot -->
   <circle cx="535" cy="443" r="5" fill="#00f5c8" opacity="0.9"/>
   <text
@@ -137,5 +137,5 @@
     letter-spacing="6"
     fill="#4da8a0"
     opacity="0.75"
-  >PATENTED SYSTEM</text>
+  >PATENT PENDING</text>
 </svg>
