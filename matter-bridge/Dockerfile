@@ -6,7 +6,7 @@ FROM python:3.11-slim
 
 LABEL org.opencontainers.image.title="Ambientika Matter Bridge"
 LABEL org.opencontainers.image.description="Bridges Ambientika ventilation units to Matter/Apple Home/Google Home"
-LABEL org.opencontainers.image.source="https://github.com/martinsaxalber-oss/ambientika-mqtt-bridge"
+LABEL org.opencontainers.image.source="https://github.com/ambientika-eu/ambientika-mqtt-bridge"
 LABEL org.opencontainers.image.licenses="MIT"
 
 # System dependencies for python-matter-server
