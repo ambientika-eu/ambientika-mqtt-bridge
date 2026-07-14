@@ -1,9 +1,24 @@
 'use strict';
 
+/**
+ * Homebridge plugin for Ambientika Ventilation Units  —  powered by NeuraCell-X(R)
+ *
+ * Exposes each Ambientika unit as a HomeKit Air Purifier (+ humidity, temperature,
+ * air-quality and filter sensors), and surfaces the status of NeuraCell-X(R) — the
+ * patented AI Neural Control System — as a dedicated accessory with occupancy
+ * sensors for "Radon Protection Active" and "Dew-Point Ventilation Block".
+ * (Radon alarm -> supply/Intake at Stufe 1; dew point "not ideal" -> Off; radon
+ * has priority.)
+ *
+ * NeuraCell-X(R) and PhaseCell-X(R) are registered trademarks. Patent pending.
+ * GitHub: https://github.com/ambientika-eu/ambientika-mqtt-bridge
+ */
+
 const mqtt = require('mqtt');
 
 const PLUGIN_NAME = 'homebridge-ambientika';
 const PLATFORM_NAME = 'AmbientikaPlugin';
+const NEURACELL_KEY = '__neuracell__';
 
 module.exports = (api) => {
   api.registerPlatform(PLUGIN_NAME, PLATFORM_NAME, AmbientikaPlugin);
@@ -42,7 +57,9 @@ class AmbientikaPlugin {
     this.mqttClient = mqtt.connect(options);
 
     this.mqttClient.on('connect', () => {
-      this.log.info('Connected to MQTT broker at ' + this.mqttHost + ':' + this.mqttPort);
+      this.log.info('Connected to MQTT broker at ' + this.mqttHost + ':' + this.mqttPort +
+                    ' — powered by NeuraCell-X® (patented)');
+      // '+/state' also matches 'neuracell/state'.
       this.mqttClient.subscribe(this.topicPrefix + '/+/state', { qos: 1 });
       this.log.info('Subscribed to ' + this.topicPrefix + '/+/state');
     });
@@ -50,6 +67,15 @@ class AmbientikaPlugin {
     this.mqttClient.on('message', (topic, message) => {
       const parts = topic.split('/');
       if (parts.length >= 3 && parts[2] === 'state') {
+        // NeuraCell-X® status: <prefix>/neuracell/state
+        if (parts[1] === 'neuracell') {
+          try {
+            this.updateNeuraCell(JSON.parse(message.toString()));
+          } catch (e) {
+            this.log.warn('Failed to parse NeuraCell-X state: ' + e.message);
+          }
+          return;
+        }
         const serial = parts[1];
         try {
           const state = JSON.parse(message.toString());
@@ -87,6 +113,52 @@ class AmbientikaPlugin {
     }
 
     this.updateServices(accessory, state, serial);
+  }
+
+  // -------------------------------------------------------------------------
+  // NeuraCell-X(R) status accessory
+  // -------------------------------------------------------------------------
+  updateNeuraCell(state) {
+    const Characteristic = this.api.hap.Characteristic;
+    const Service = this.api.hap.Service;
+
+    let accessory = this.accessories.get(NEURACELL_KEY);
+    if (!accessory) {
+      this.log.info('Creating NeuraCell-X® status accessory');
+      const uuid = this.api.hap.uuid.generate('ambientika-neuracell-x');
+      accessory = new this.api.platformAccessory(
+        'NeuraCell-X',
+        uuid,
+        this.api.hap.Categories.SENSOR
+      );
+      accessory.context.serial = NEURACELL_KEY;
+
+      accessory.addService(Service.OccupancySensor, 'Radon Protection', 'radon');
+      accessory.addService(Service.OccupancySensor, 'Dew-Point Block', 'dewpoint');
+
+      const info = accessory.getService(Service.AccessoryInformation);
+      info
+        .setCharacteristic(Characteristic.Manufacturer, 'Ambientika / SUEDWIND')
+        .setCharacteristic(Characteristic.Model, 'NeuraCell-X® AI Neural Control System (patented)')
+        .setCharacteristic(Characteristic.SerialNumber, 'neuracell-x');
+
+      this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      this.accessories.set(NEURACELL_KEY, accessory);
+    }
+
+    const radonSvc = accessory.getServiceById(Service.OccupancySensor, 'radon');
+    if (radonSvc && state.radon_protection !== undefined) {
+      radonSvc.updateCharacteristic(
+        Characteristic.OccupancyDetected, state.radon_protection ? 1 : 0);
+    }
+    const dewSvc = accessory.getServiceById(Service.OccupancySensor, 'dewpoint');
+    if (dewSvc && state.dewpoint_block !== undefined) {
+      dewSvc.updateCharacteristic(
+        Characteristic.OccupancyDetected, state.dewpoint_block ? 1 : 0);
+    }
+    this.log.debug('NeuraCell-X update: radon_protection=' + state.radon_protection +
+                   ' dewpoint_block=' + state.dewpoint_block +
+                   ' override=' + state.override_active);
   }
 
   setupServices(accessory, serial) {
