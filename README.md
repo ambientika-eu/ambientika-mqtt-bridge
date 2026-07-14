@@ -202,4 +202,4 @@ MIT License – © Ambientika / SUEDWIND
 ## Links
 
 - 🌐 [ambientika.eu](https://www.ambientika.eu)
-- 📦 [GitHub Repository](https://github.com/martinsaxalber-oss/ambientika-mqtt-bridge)
+- 📦 [GitHub Repository](https://github.com/ambientika-eu/ambientika-mqtt-bridge)
