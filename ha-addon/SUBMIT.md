@@ -33,7 +33,7 @@ Structure:
 
 ```yaml
 name: Ambientika Add-ons
-url: https://github.com/martinsaxalber-oss/ambientika-ha-addon
+url: https://github.com/ambientika-eu/ambientika-ha-addon
 maintainer: Ambientika / SUEDWIND <info@ambientika.eu>
 ```
 
@@ -44,7 +44,7 @@ maintainer: Ambientika / SUEDWIND <info@ambientika.eu>
 3. Edit `appdaemon` or `integration` or `plugin` file – for add-ons: edit `appdaemon`
 4. Add your repository URL:
    ```
-   https://github.com/martinsaxalber-oss/ambientika-ha-addon
+   https://github.com/ambientika-eu/ambientika-ha-addon
    ```
 5. Open a Pull Request
 6. HACS bot runs automated checks
