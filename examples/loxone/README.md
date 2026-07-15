@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="neuracell-x-logo.png" alt="NeuraCell-X (patented)" width="420">
+  <img src="neuracell-x-logo.png" alt="NeuraCell-X (patent-pending)" width="420">
 </p>
 
-> **Powered by NeuraCell-X&reg;** &mdash; the patented AI Neural Control System (active radon protection + dew-point ventilation control).
+> **Powered by NeuraCell-X&reg;** &mdash; the patent-pending AI Neural Control System (active radon protection + dew-point ventilation control).
 
 # Ambientika – Loxone Integration Guide
 
@@ -111,7 +111,7 @@ Virtual Inputs receive data published by the bridge.
 | OFF Payload | false |
 
 
-### 2.8 - NeuraCell-X&reg; Radon Protection (patented)
+### 2.8 - NeuraCell-X&reg; Radon Protection (patent-pending)
 
 NeuraCell-X&reg; publishes its status as JSON to `ambientika/neuracell/state`.
 Create MQTT subscriptions in the Loxone MQTT extension and extract the JSON fields:

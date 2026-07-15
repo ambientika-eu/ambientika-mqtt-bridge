@@ -7,7 +7,7 @@
  * exposes each device as ioBroker objects with states for:
  *   - mode, fanSpeed, temperature, humidity, airQuality, filterAlarm, online
  *
- * It also surfaces the status of NeuraCell-X(R) — the patented AI Neural Control
+ * It also surfaces the status of NeuraCell-X(R) — the patent-pending AI Neural Control
  * System — which provides active radon protection and dew-point ventilation
  * control (radon alarm -> supply/Intake at Stufe 1; dew point "not ideal" -> Off,
  * radon has priority). These appear under the "neuracell" channel.
@@ -141,7 +141,7 @@ class AmbientikaAdapter extends utils.Adapter {
 
     // -----------------------------------------------------------------------
     async onReady() {
-        this.log.info('Ambientika adapter starting — powered by NeuraCell-X® (patented)...');
+        this.log.info('Ambientika adapter starting — powered by NeuraCell-X® (patent-pending)...');
 
         const cfg = this.config;
 
@@ -268,7 +268,7 @@ class AmbientikaAdapter extends utils.Adapter {
         this.log.info('Creating NeuraCell-X® status objects');
         await this.setObjectNotExistsAsync('neuracell', {
             type: 'device',
-            common: { name: 'NeuraCell-X® (patented) — Radon & Dew-Point Protection' },
+            common: { name: 'NeuraCell-X® (patent-pending) — Radon & Dew-Point Protection' },
             native: {}
         });
         for (const [key, def] of Object.entries(NEURACELL_STATE_DEFS)) {

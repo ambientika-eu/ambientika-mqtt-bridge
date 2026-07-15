@@ -5,7 +5,7 @@
  *
  * Exposes each Ambientika unit as a HomeKit Air Purifier (+ humidity, temperature,
  * air-quality and filter sensors), and surfaces the status of NeuraCell-X(R) — the
- * patented AI Neural Control System — as a dedicated accessory with occupancy
+ * patent-pending AI Neural Control System — as a dedicated accessory with occupancy
  * sensors for "Radon Protection Active" and "Dew-Point Ventilation Block".
  * (Radon alarm -> supply/Intake at Stufe 1; dew point "not ideal" -> Off; radon
  * has priority.)
@@ -58,7 +58,7 @@ class AmbientikaPlugin {
 
     this.mqttClient.on('connect', () => {
       this.log.info('Connected to MQTT broker at ' + this.mqttHost + ':' + this.mqttPort +
-                    ' — powered by NeuraCell-X® (patented)');
+                    ' — powered by NeuraCell-X® (patent-pending)');
       // '+/state' also matches 'neuracell/state'.
       this.mqttClient.subscribe(this.topicPrefix + '/+/state', { qos: 1 });
       this.log.info('Subscribed to ' + this.topicPrefix + '/+/state');
@@ -139,7 +139,7 @@ class AmbientikaPlugin {
       const info = accessory.getService(Service.AccessoryInformation);
       info
         .setCharacteristic(Characteristic.Manufacturer, 'Ambientika / SUEDWIND')
-        .setCharacteristic(Characteristic.Model, 'NeuraCell-X® AI Neural Control System (patented)')
+        .setCharacteristic(Characteristic.Model, 'NeuraCell-X® AI Neural Control System (patent-pending)')
         .setCharacteristic(Characteristic.SerialNumber, 'neuracell-x');
 
       this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);

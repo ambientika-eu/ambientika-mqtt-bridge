@@ -4,7 +4,7 @@ Ambientika Matter Bridge  —  powered by NeuraCell-X(R)
 Exposes Ambientika ventilation units as Matter-compatible Air Quality sensors
 and Fan devices via the python-matter-server SDK.
 
-NeuraCell-X(R) — the patented AI Neural Control System — provides active radon
+NeuraCell-X(R) — the patent-pending AI Neural Control System — provides active radon
 protection and dew-point ventilation control. This bridge surfaces the
 NeuraCell-X status (radon protection active, radon level, dew-point block,
 indoor/outdoor dew point) as Matter sensors so any Matter ecosystem can see it.
@@ -400,7 +400,7 @@ mqtt_client: mqtt.Client = None
 async def main():
     global mqtt_client
 
-    logger.info("=== Ambientika Matter Bridge starting  —  powered by NeuraCell-X(R) (patented) ===")
+    logger.info("=== Ambientika Matter Bridge starting  —  powered by NeuraCell-X(R) (patent-pending) ===")
     logger.info(f"MQTT broker : {MQTT_BROKER}:{MQTT_PORT}")
     logger.info(f"Matter server: {MATTER_SERVER_HOST}:{MATTER_SERVER_PORT}")
 
