@@ -36,6 +36,7 @@ options:
   dewpoint_enabled: true
   dewpoint_source: "signal"
   dewpoint_block_topic: "ambientika/dewpoint/block"
+  dewpoint_block_devices: ""
   dewpoint_indoor_temp_topic: "ambientika/dewpoint/indoor_temp"
   dewpoint_indoor_humidity_topic: "ambientika/dewpoint/indoor_humidity"
   dewpoint_outdoor_temp_topic: "ambientika/dewpoint/outdoor_temp"
@@ -63,6 +64,7 @@ schema:
   dewpoint_enabled: bool
   dewpoint_source: list(signal|computed)
   dewpoint_block_topic: str?
+  dewpoint_block_devices: str?
   dewpoint_indoor_temp_topic: str?
   dewpoint_indoor_humidity_topic: str?
   dewpoint_outdoor_temp_topic: str?
