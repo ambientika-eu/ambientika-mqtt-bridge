@@ -35,12 +35,17 @@ neuracell:
 # "Not ideal to ventilate" -> all devices Off; good conditions -> release/restore.
 dewpoint:
   dewpoint_enabled: true
-  dewpoint_source: "signal"                     # "signal" or "computed"
+  dewpoint_source: "signal"                     # "signal", "computed" or "device"
   # signal source (external ON/OFF; truthy = block ventilation):
   dewpoint_block_topic: "ambientika/dewpoint/block"
   # Limit the block to specific units (device name or serial, comma-separated).
   # Empty = all units. Example for two named units: "SMART,OFFICE".
   dewpoint_block_devices: ""
+  # device source (no hardware): read a TPS device's status from the Ambientika
+  # cloud. Set dewpoint_source: "device", give the TPS serial (see add-on log),
+  # and block when its operating mode is one of dewpoint_device_block_modes.
+  dewpoint_device_serial: ""
+  dewpoint_device_block_modes: "Off"
   # computed source (bridge computes dew points from these four topics):
   dewpoint_indoor_temp_topic: "ambientika/dewpoint/indoor_temp"
   dewpoint_indoor_humidity_topic: "ambientika/dewpoint/indoor_humidity"
