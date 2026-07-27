@@ -17,7 +17,12 @@ Wir erfassen deshalb nicht einen Kontakt, sondern **ob auf der TPS-geschalteten 
 
 > Damit die Bridge SMART/OFFICE überhaupt schalten kann, müssen diese an **Dauerstrom** hängen (eigene, permanente Versorgung) — nicht an der von der TPS geschalteten Leitung. Liegen sie auf der geschalteten Leitung, gehen sie mit dem Netz ohnehin aus und brauchen keine Kopplung.
 
-## Netz-Präsenz erfassen — drei Wege zur Hardware
+## Zwei Grundwege
+
+- **Hardwarefrei (Variante D, empfohlen):** Hängt die TPS im selben Ambientika-Konto, liest die Bridge ihren Zustand direkt aus der Cloud — kein Relais, kein ESP. Siehe unten.
+- **Netz-Präsenz erfassen (Varianten A/B/C):** Falls die TPS *nicht* im Konto ist, wird stattdessen erfasst, ob auf der geschalteten Leitung Netzspannung anliegt. Das folgende Kapitel gilt nur für diesen Weg.
+
+## Netz-Präsenz erfassen — Hardware für die Varianten A/B/C
 
 - **Koppelrelais (empfohlen, elektrikerüblich):** ein Installations-/Koppelrelais mit **230-V-AC-Spule** parallel zur geschalteten Lüfter-Phase. Der potenzialfreie Kontakt geht an den Steuer-Eingang. Netz da → Spule an → Kontakt geschlossen. Robust, prellarm, potenzialfrei.
   ```
@@ -33,11 +38,30 @@ Zwei Pflicht-Punkte in allen Varianten:
 1. **Erfassungs-Knoten an Dauerstrom** (nicht an der geschalteten Leitung) — sonst stirbt er genau dann, wenn er „block" senden müsste.
 2. **Fail-safe** (in Variante A eingebaut): fällt der Knoten aus, wird „block" gesetzt (im Zweifel *nicht* lüften). Beim Reconnect wird der echte Zustand sofort wieder gesendet.
 
-Wähle danach **eine** der drei Varianten.
+Wähle danach **eine** Variante. Empfehlungsreihenfolge: **D** (keine Hardware, wenn die TPS im Konto hängt), sonst **A** (Relais, garantiert), dann B/C.
 
 ---
 
-## Variante A — ESPHome, direkt (empfohlen)
+## Variante D — hardwarefrei (empfohlen, wenn die TPS im Ambientika-Konto ist)
+
+Die TPS hängt per WLAN im selben Ambientika-Konto wie SMART und OFFICE. Die Bridge liest ihren Zustand daher **direkt aus der Ambientika-Cloud** — ohne Relais, ohne ESP, ohne zusätzliche Verkabelung.
+
+1. **TPS-Seriennummer finden:** das Add-on einmal starten und ins **Log** schauen. Jedes gefundene Gerät steht dort als `Device: <name> (serial: <serial>)`. Das Gerät neben SMART und OFFICE ist die TPS. (Alternativ listet das mitgelieferte `ambientika_probe.py` alle Geräte auf.)
+2. **Im Add-on setzen:**
+   ```yaml
+   dewpoint_enabled: true
+   dewpoint_source: "device"
+   dewpoint_device_serial: "<TPS-Seriennummer>"
+   dewpoint_device_block_modes: "Off"      # Modus/Modi, in denen die TPS sperrt
+   dewpoint_block_devices: "SMART,OFFICE"
+   ```
+3. **Fertig.** Die Bridge liest bei jedem Poll den TPS-Status, nimmt die TPS **aus dem Lüfter-Satz heraus** (sie wird nie selbst als Lüfter geschaltet) und setzt SMART/OFFICE auf `Off`, sobald die TPS in einem der `dewpoint_device_block_modes` steht (Standard: `Off`).
+
+**Kontrolle beim ersten Lauf (eine Log-Zeile genügt):** Im Log erscheint beim Start `Dew-point source device: <name> (serial ...)` und bei jedem Umschalten `NeuraCell-X: dew-point ventilation BLOCKED (fans off)` bzw. `released`. Steht die TPS beim Sperren in einem anderen Modus als `Off`, einfach `dewpoint_device_block_modes` anpassen (z. B. `"Off,Expulsion"`). Ändert die TPS ihren Modus laut Log gar nicht, nimm **Variante A** (Relais) — die funktioniert unabhängig davon garantiert.
+
+---
+
+## Variante A — ESPHome + Relais (garantierter Rückfall)
 
 Datei: `esphome_ambientika_tps.yaml`
 
@@ -92,6 +116,8 @@ dewpoint_block_devices: "SMART,OFFICE"     # exakt eure Gerätenamen; leer = all
 ```
 
 Für Variante C zusätzlich `dewpoint_source: "computed"` und die vier `dewpoint_*_topic` wie voreingestellt lassen.
+
+Für Variante D `dewpoint_source: "device"` mit `dewpoint_device_serial` (aus dem Add-on-Log) und optional `dewpoint_device_block_modes` (Standard `Off`) — siehe Variante D oben.
 
 Hinweis zu den Gerätenamen: Der Abgleich ist **groß/klein egal** und trifft **Gerätename ODER Seriennummer**. Wie eure Einheiten heißen, steht im Ambientika-Konto bzw. im Bridge-Log („Device: … (serial: …)").
 
