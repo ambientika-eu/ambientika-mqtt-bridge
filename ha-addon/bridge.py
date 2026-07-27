@@ -157,6 +157,10 @@ class BridgeConfig:
         # Block ventilation when outdoor_dp >= indoor_dp - margin (would add moisture).
         self.dewpoint_margin = 1.0        # °C
         self.dewpoint_hysteresis = 0.5    # °C
+        # Restrict the dew-point block to specific units (by device name or
+        # serial number, comma-separated). Empty = all devices (default,
+        # backward compatible). Example: "SMART,OFFICE".
+        self.dewpoint_block_devices = ""
 
     # ----- helpers -----
     @property
@@ -166,6 +170,17 @@ class BridgeConfig:
         except KeyError:
             log.warning("Invalid radon_protection_fan %r, using Low.", self.radon_protection_fan)
             return RADON_PROTECTION_FAN_DEFAULT
+
+    @property
+    def dewpoint_block_device_tokens(self) -> set:
+        """Normalised set of device selectors for the dew-point block.
+
+        Empty set means the block applies to every device (legacy behaviour).
+        Accepts commas or semicolons as separators; matching is
+        case-insensitive against device name or serial number.
+        """
+        raw = str(self.dewpoint_block_devices or "").replace(";", ",")
+        return {t.strip().lower() for t in raw.split(",") if t.strip()}
 
     def _apply_extras(self, get, cast_bool=bool) -> None:
         """Populate NeuraCell-X + dew-point fields using a getter get(key, default)."""
@@ -190,6 +205,9 @@ class BridgeConfig:
         self.dewpoint_indoor_humidity_topic = get("dewpoint_indoor_humidity_topic", self.dewpoint_indoor_humidity_topic) or self.dewpoint_indoor_humidity_topic
         self.dewpoint_outdoor_temp_topic = get("dewpoint_outdoor_temp_topic", self.dewpoint_outdoor_temp_topic) or self.dewpoint_outdoor_temp_topic
         self.dewpoint_outdoor_humidity_topic = get("dewpoint_outdoor_humidity_topic", self.dewpoint_outdoor_humidity_topic) or self.dewpoint_outdoor_humidity_topic
+        # Empty string is a valid value here (means "all devices"), so accept it verbatim.
+        dbd = get("dewpoint_block_devices", self.dewpoint_block_devices)
+        self.dewpoint_block_devices = "" if dbd is None else str(dbd)
         try:
             self.dewpoint_margin = float(get("dewpoint_margin", self.dewpoint_margin))
         except (TypeError, ValueError):
@@ -219,6 +237,7 @@ class BridgeConfig:
             ("radon_protection_fan", ("RADON_PROTECTION_FAN",)),
             ("dewpoint_source", ("DEWPOINT_SOURCE",)),
             ("dewpoint_block_topic", ("DEWPOINT_BLOCK_TOPIC",)),
+            ("dewpoint_block_devices", ("DEWPOINT_BLOCK_DEVICES",)),
         ):
             v = _env(*names)
             if v:
@@ -524,6 +543,31 @@ class NeuraCellXController:
     def override_active(self) -> bool:
         return self.radon_active or self.dewpoint_block
 
+    def _dewpoint_targets(self, serial: str, device: Any) -> bool:
+        """Whether a dew-point block applies to this device.
+
+        Empty selector list -> every device (legacy behaviour). Otherwise the
+        device matches if its serial number or its name is in the list
+        (case-insensitive).
+        """
+        tokens = self.cfg.dewpoint_block_device_tokens
+        if not tokens:
+            return True
+        name = (getattr(device, "name", "") or "").strip().lower()
+        return serial.strip().lower() in tokens or name in tokens
+
+    def _device_under_control(self, serial: str, device: Any) -> bool:
+        """Whether the currently active protection actually controls this device.
+
+        Radon protection always applies to every unit (safety overpressure).
+        A dew-point block may be limited to selected units.
+        """
+        if self.radon_active:
+            return True
+        if self.dewpoint_block:
+            return self._dewpoint_targets(serial, device)
+        return False
+
     # ----- radon signals -----
     async def on_radon_value(self, raw: str) -> None:
         if not self.cfg.neuracell_enabled:
@@ -618,12 +662,22 @@ class NeuraCellXController:
         async with self._lock:
             if self.override_active:
                 for serial, device in list(self.bridge.devices.items()):
+                    # Only touch devices the active protection actually controls.
+                    # Radon protects every unit; a dew-point block can be limited
+                    # to selected units (cfg.dewpoint_block_devices).
+                    if not self._device_under_control(serial, device):
+                        continue
                     status = await self.bridge.read_status(device)
                     if status is None:
                         log.warning("NeuraCell-X: %s unreachable; will retry on next poll.", serial)
                         continue
+                    desired = self._desired(status)
+                    if desired is None:
+                        continue
                     # Capture the pre-protection baseline exactly once per device,
                     # honouring any manual change made while it was overridden.
+                    # Only devices we actually control get a baseline, so a
+                    # targeted dew-point block never disturbs the other units.
                     if serial not in self._saved_modes:
                         base = {
                             "operating_mode": status["operating_mode"],
@@ -632,9 +686,6 @@ class NeuraCellXController:
                         }
                         base.update(self._pending_manual.pop(serial, {}))
                         self._saved_modes[serial] = base
-                    desired = self._desired(status)
-                    if desired is None:
-                        continue
                     mode, fan, hum = desired
                     if (force or status["operating_mode"] != mode
                             or status["fan_speed"] != fan
@@ -823,11 +874,13 @@ class AmbientikaBridge:
             log.error("Invalid value %r for %s", value, attr)
             return
 
-        # While a protection override is active, manual changes to baseline
-        # attributes (mode/fan/humidity) must not fight the controller. Record
-        # them as the new baseline (applied once protections clear) instead of
-        # applying them now. Non-baseline attrs (light sensor) pass through.
-        if self.neuracell.override_active and attr in self._BASELINE_ATTRS:
+        # While this device is under active protection control, manual changes
+        # to baseline attributes (mode/fan/humidity) must not fight the
+        # controller. Record them as the new baseline (applied once protection
+        # clears) instead of applying them now. Devices NOT under control (e.g.
+        # units outside a targeted dew-point block) stay fully controllable.
+        # Non-baseline attrs (light sensor) always pass through.
+        if self.neuracell._device_under_control(serial, device) and attr in self._BASELINE_ATTRS:
             nc = self.neuracell
             if serial in nc._saved_modes:
                 nc._saved_modes[serial][attr] = parsed
@@ -881,6 +934,7 @@ class AmbientikaBridge:
             "radon": nc.last_radon,
             "radon_threshold": self.cfg.radon_threshold,
             "dewpoint_block": nc.dewpoint_block,
+            "dewpoint_block_devices": sorted(self.cfg.dewpoint_block_device_tokens) or "all",
             "indoor_dew_point": round(nc.indoor_dew_point, 1) if nc.indoor_dew_point is not None else None,
             "outdoor_dew_point": round(nc.outdoor_dew_point, 1) if nc.outdoor_dew_point is not None else None,
             "override_active": nc.override_active,
@@ -985,8 +1039,9 @@ class AmbientikaBridge:
             log.info("NeuraCell-X radon: threshold=%d Bq/m3 -> Intake/%s",
                      self.cfg.radon_threshold, self.cfg.radon_protection_fan)
         if self.cfg.dewpoint_enabled:
-            log.info("NeuraCell-X dew point: source=%s -> block => Off (radon has priority).",
-                     self.cfg.dewpoint_source)
+            scope = ", ".join(sorted(self.cfg.dewpoint_block_device_tokens)) or "ALL devices"
+            log.info("NeuraCell-X dew point: source=%s, scope=%s -> block => Off (radon has priority).",
+                     self.cfg.dewpoint_source, scope)
         await self._poll_loop()
 
     def stop(self) -> None:
