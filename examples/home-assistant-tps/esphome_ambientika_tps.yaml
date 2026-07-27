@@ -1,0 +1,97 @@
+# =============================================================================
+# ESPHome  –  Ambientika Taupunkt-Kopplung  (Variante A, empfohlen)
+# =============================================================================
+# Liest den potenzialfreien "Nicht lüften"-Kontakt der Taupunktsteuerung (TPS)
+# an einem GPIO ein und publiziert das Blocksignal DIREKT an die Ambientika-
+# Bridge (Topic: ambientika/dewpoint/block). Es wird KEIN Home Assistant für
+# die eigentliche Funktion benötigt – der ESP redet direkt mit dem MQTT-Broker.
+#
+# Kontakt-Logik (Standardannahme):
+#   Kontakt GESCHLOSSEN (gegen GND)  ->  TPS sperrt  ->  "block"  -> SMART/OFFICE aus
+#   Kontakt OFFEN                    ->  TPS gibt frei ->  "clear" -> Geräte zurück
+# Ist es bei deiner TPS umgekehrt, einfach `inverted:` unten umdrehen.
+#
+# Hardware: beliebiger ESP32 (oder ESP8266, Board unten anpassen). Der TPS-
+# Kontakt kommt zwischen GPIO23 und GND; interner Pullup ist aktiv, es wird
+# also KEINE Fremdspannung eingespeist (potenzialfrei!).
+# =============================================================================
+
+esphome:
+  name: ambientika-tps
+  friendly_name: Ambientika TPS-Kopplung
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+# --- Netzwerk ---------------------------------------------------------------
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Ambientika-TPS Fallback"
+    password: !secret fallback_password
+
+captive_portal:
+
+# --- MQTT (gleicher Broker wie die Ambientika-Bridge) -----------------------
+mqtt:
+  broker: !secret mqtt_broker
+  port: 1883
+  username: !secret mqtt_user
+  password: !secret mqtt_password
+  # Beim (Wieder-)Verbinden den aktuellen Zustand einmal aktiv senden, damit
+  # Bridge und ESP nach einem Neustart garantiert synchron sind.
+  on_connect:
+    - mqtt.publish:
+        topic: ambientika/dewpoint/block
+        retain: true
+        payload: !lambda 'return id(tps_contact).state ? "block" : "clear";'
+
+# --- Eingang: TPS-"Nicht lüften"-Kontakt ------------------------------------
+binary_sensor:
+  - platform: gpio
+    id: tps_contact
+    name: "TPS Ventilation Block"
+    device_class: moisture
+    pin:
+      number: GPIO23
+      mode:
+        input: true
+        pullup: true
+      inverted: true          # geschlossen == "block". Bei umgekehrter TPS: false
+    filters:
+      - delayed_on: 1s         # Entprellung / Störimpulse ignorieren
+      - delayed_off: 1s
+    on_press:
+      - mqtt.publish:
+          topic: ambientika/dewpoint/block
+          payload: "block"
+          retain: true
+    on_release:
+      - mqtt.publish:
+          topic: ambientika/dewpoint/block
+          payload: "clear"
+          retain: true
+
+# --- Optionaler manueller Test-Taster (Weboberfläche/HA) --------------------
+# Schaltet das Blocksignal von Hand, ohne die TPS – praktisch zum Prüfen,
+# dass SMART und OFFICE wirklich ausgehen.
+button:
+  - platform: template
+    name: "TPS Test: block senden"
+    on_press:
+      - mqtt.publish:
+          topic: ambientika/dewpoint/block
+          payload: "block"
+          retain: true
+  - platform: template
+    name: "TPS Test: clear senden"
+    on_press:
+      - mqtt.publish:
+          topic: ambientika/dewpoint/block
+          payload: "clear"
+          retain: true
