@@ -1,0 +1,78 @@
+# =============================================================================
+# Home Assistant Package  –  Ambientika Taupunkt-Kopplung  (Variante B)
+# =============================================================================
+# Für den Fall, dass der TPS-"Nicht lüften"-Kontakt bereits als Entität in
+# Home Assistant vorliegt (z. B. über Shelly, KNX, Modbus, einen wired input
+# oder eine MQTT-Meldung). Diese Automation spiegelt den Zustand auf das Topic
+# der Ambientika-Bridge: ambientika/dewpoint/block  ->  SMART/OFFICE aus.
+#
+# Einbau:  Datei nach  <config>/packages/ambientika_tps.yaml  legen und in
+# configuration.yaml aktivieren:
+#     homeassistant:
+#       packages: !include_dir_named packages
+#
+# WICHTIG: Passe `binary_sensor.tps_ventilation_block` unten an die reale
+# Entität deiner Installation an – ODER nutze den mitgelieferten MQTT-Sensor,
+# indem du dessen state_topic auf deine Kontaktquelle setzt.
+# =============================================================================
+
+# --- (Option) TPS-Kontakt als MQTT-Binärsensor ------------------------------
+# Nur nötig, wenn der Kontakt per MQTT kommt. Sonst diesen Block löschen und in
+# der Automation die eigene Entität eintragen.
+mqtt:
+  binary_sensor:
+    - name: "TPS Ventilation Block"
+      unique_id: tps_ventilation_block
+      state_topic: "tps/contact"      # <-- an deine Kontaktquelle anpassen
+      payload_on: "ON"
+      payload_off: "OFF"
+      device_class: moisture
+
+# --- Manueller Test-Schalter ------------------------------------------------
+input_boolean:
+  tps_test_block:
+    name: "TPS Test: Lüftung sperren"
+    icon: mdi:water-off
+
+# --- Automationen -----------------------------------------------------------
+automation:
+  # 1) TPS-Kontakt  ->  Ambientika-Blocktopic
+  - id: tps_block_to_ambientika
+    alias: "TPS → Ambientika Taupunkt-Block"
+    description: >-
+      Spiegelt den TPS-"Nicht lüften"-Kontakt auf ambientika/dewpoint/block.
+      Sperrt -> "block" (SMART/OFFICE aus). Frei -> "clear" (Geräte zurück).
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.tps_ventilation_block
+        to: "on"
+      - platform: state
+        entity_id: binary_sensor.tps_ventilation_block
+        to: "off"
+      - platform: homeassistant           # nach HA-Neustart einmal re-syncen
+        event: start
+    action:
+      - action: mqtt.publish
+        data:
+          topic: ambientika/dewpoint/block
+          retain: true
+          payload: >-
+            {{ 'block' if is_state('binary_sensor.tps_ventilation_block', 'on')
+               else 'clear' }}
+
+  # 2) Manueller Test-Schalter  ->  Blocktopic  (zum Prüfen ohne echte TPS)
+  - id: tps_manual_test_to_ambientika
+    alias: "TPS Test-Schalter → Ambientika Taupunkt-Block"
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: input_boolean.tps_test_block
+    action:
+      - action: mqtt.publish
+        data:
+          topic: ambientika/dewpoint/block
+          retain: true
+          payload: >-
+            {{ 'block' if is_state('input_boolean.tps_test_block', 'on')
+               else 'clear' }}
