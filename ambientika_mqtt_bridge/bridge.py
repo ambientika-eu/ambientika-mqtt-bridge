@@ -149,6 +149,11 @@ class BridgeConfig:
         self.dewpoint_source = "signal"
         # signal source:
         self.dewpoint_block_topic = "ambientika/dewpoint/block"  # truthy = block ventilation
+        # device source: read a TPS device's status from the Ambientika cloud
+        # (no extra hardware). Requires the TPS serial; block when its operating
+        # mode is one of dewpoint_device_block_modes (default: Off).
+        self.dewpoint_device_serial = ""
+        self.dewpoint_device_block_modes = "Off"
         # computed source:
         self.dewpoint_indoor_temp_topic = "ambientika/dewpoint/indoor_temp"
         self.dewpoint_indoor_humidity_topic = "ambientika/dewpoint/indoor_humidity"
@@ -182,6 +187,21 @@ class BridgeConfig:
         raw = str(self.dewpoint_block_devices or "").replace(";", ",")
         return {t.strip().lower() for t in raw.split(",") if t.strip()}
 
+    @property
+    def dewpoint_device_block_mode_set(self) -> set:
+        """OperatingModes that mean the source TPS device is blocking ventilation.
+
+        Empty/invalid -> defaults to {Off}. Used only with dewpoint_source='device'.
+        """
+        raw = str(self.dewpoint_device_block_modes or "").replace(";", ",")
+        modes = set()
+        for name in (t.strip() for t in raw.split(",") if t.strip()):
+            try:
+                modes.add(OperatingMode[name])
+            except KeyError:
+                log.warning("Invalid dewpoint_device_block_mode %r (ignored).", name)
+        return modes or {OperatingMode.Off}
+
     def _apply_extras(self, get, cast_bool=bool) -> None:
         """Populate NeuraCell-X + dew-point fields using a getter get(key, default)."""
         # radon
@@ -208,6 +228,8 @@ class BridgeConfig:
         # Empty string is a valid value here (means "all devices"), so accept it verbatim.
         dbd = get("dewpoint_block_devices", self.dewpoint_block_devices)
         self.dewpoint_block_devices = "" if dbd is None else str(dbd)
+        self.dewpoint_device_serial = get("dewpoint_device_serial", self.dewpoint_device_serial) or self.dewpoint_device_serial
+        self.dewpoint_device_block_modes = get("dewpoint_device_block_modes", self.dewpoint_device_block_modes) or self.dewpoint_device_block_modes
         try:
             self.dewpoint_margin = float(get("dewpoint_margin", self.dewpoint_margin))
         except (TypeError, ValueError):
@@ -216,7 +238,7 @@ class BridgeConfig:
             self.dewpoint_hysteresis = float(get("dewpoint_hysteresis", self.dewpoint_hysteresis))
         except (TypeError, ValueError):
             pass
-        if self.dewpoint_source not in ("signal", "computed"):
+        if self.dewpoint_source not in ("signal", "computed", "device"):
             log.warning("Invalid dewpoint_source %r, using 'signal'.", self.dewpoint_source)
             self.dewpoint_source = "signal"
 
@@ -238,6 +260,8 @@ class BridgeConfig:
             ("dewpoint_source", ("DEWPOINT_SOURCE",)),
             ("dewpoint_block_topic", ("DEWPOINT_BLOCK_TOPIC",)),
             ("dewpoint_block_devices", ("DEWPOINT_BLOCK_DEVICES",)),
+            ("dewpoint_device_serial", ("DEWPOINT_DEVICE_SERIAL",)),
+            ("dewpoint_device_block_modes", ("DEWPOINT_DEVICE_BLOCK_MODES",)),
         ):
             v = _env(*names)
             if v:
@@ -643,6 +667,25 @@ class NeuraCellXController:
                     "BLOCKED (fans off)" if block else "released")
         await self.reconcile(force=True)
 
+    async def poll_dewpoint_device(self, device: Any) -> None:
+        """Derive the dew-point block from a TPS device's cloud status (source='device').
+
+        Reads the TPS's operating mode via the Ambientika API and blocks when it
+        is one of cfg.dewpoint_device_block_mode_set (default: Off). No hardware.
+        """
+        if not self.cfg.dewpoint_enabled:
+            return
+        status = await self.bridge.read_status(device)
+        if status is None:
+            log.warning("NeuraCell-X: dew-point source device %s unreachable this poll; keeping last state.",
+                        getattr(device, "serial_number", "?"))
+            return
+        mode = status["operating_mode"]
+        block = mode in self.cfg.dewpoint_device_block_mode_set
+        log.debug("NeuraCell-X: TPS %s operating_mode=%s -> %s",
+                  getattr(device, "serial_number", "?"), mode.name, "block" if block else "clear")
+        await self._set_dewpoint_block(block)
+
     # ----- desired state -----
     def _desired(self, status: dict):
         """Return (operating_mode, fan_speed, humidity_level) or None to restore."""
@@ -726,6 +769,7 @@ class AmbientikaBridge:
         self.client: Optional[mqtt.Client] = None
         self.api: Optional[Ambientika] = None
         self.devices: dict = {}
+        self.dewpoint_device: Optional[Device] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop_event: Optional[asyncio.Event] = None
         self.neuracell = NeuraCellXController(self, cfg)
@@ -796,6 +840,9 @@ class AmbientikaBridge:
                     if topic:
                         client.subscribe(topic)
                 log.info("NeuraCell-X: dew-point computed from sensor topics.")
+            elif self.cfg.dewpoint_source == "device":
+                log.info("NeuraCell-X: dew-point read from TPS device %s (Ambientika cloud, no MQTT input).",
+                         self.cfg.dewpoint_device_serial)
             else:
                 if self.cfg.dewpoint_block_topic:
                     client.subscribe(self.cfg.dewpoint_block_topic)
@@ -968,6 +1015,19 @@ class AmbientikaBridge:
                     log.info("  Device: %s  (serial: %s)", device.name, device.serial_number)
         log.info("Found %d device(s).", len(self.devices))
 
+        # dew-point source='device': take the TPS OUT of the controllable-fan set,
+        # so it is never exposed/commanded as a fan - it is only read for its state.
+        self.dewpoint_device = None
+        if self.cfg.dewpoint_enabled and self.cfg.dewpoint_source == "device":
+            serial = self.cfg.dewpoint_device_serial
+            self.dewpoint_device = self.devices.pop(serial, None) if serial else None
+            if self.dewpoint_device is None:
+                log.error("dewpoint_source=device but TPS serial %r not found. Available serials: %s",
+                          serial, ", ".join(self.devices.keys()) or "(none)")
+            else:
+                log.info("Dew-point source device: %s (serial %s) - read-only, not exposed as a fan.",
+                         self.dewpoint_device.name, serial)
+
     def _publish_discovery(self) -> None:
         if not self.cfg.enable_discovery or self.client is None:
             return
@@ -1013,6 +1073,14 @@ class AmbientikaBridge:
                 except Exception as e:
                     log.exception("Error polling %s: %s", serial, e)
 
+            # Read the TPS device (source='device') and derive the block.
+            if (self.cfg.dewpoint_enabled and self.cfg.dewpoint_source == "device"
+                    and self.dewpoint_device is not None):
+                try:
+                    await self.neuracell.poll_dewpoint_device(self.dewpoint_device)
+                except Exception as e:
+                    log.exception("NeuraCell-X dew-point device poll error: %s", e)
+
             # Keep asserting the active protection state.
             try:
                 await self.neuracell.enforce()
@@ -1040,8 +1108,14 @@ class AmbientikaBridge:
                      self.cfg.radon_threshold, self.cfg.radon_protection_fan)
         if self.cfg.dewpoint_enabled:
             scope = ", ".join(sorted(self.cfg.dewpoint_block_device_tokens)) or "ALL devices"
+            src = self.cfg.dewpoint_source
+            if src == "device":
+                block_modes = "/".join(m.name for m in sorted(
+                    self.cfg.dewpoint_device_block_mode_set, key=lambda x: x.value))
+                src = "device(serial=%s, block-when-mode=%s)" % (
+                    self.cfg.dewpoint_device_serial or "?", block_modes)
             log.info("NeuraCell-X dew point: source=%s, scope=%s -> block => Off (radon has priority).",
-                     self.cfg.dewpoint_source, scope)
+                     src, scope)
         await self._poll_loop()
 
     def stop(self) -> None:
