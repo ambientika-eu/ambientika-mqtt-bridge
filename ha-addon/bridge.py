@@ -141,6 +141,15 @@ class BridgeConfig:
         self.radon_threshold = 300                          # Bq/m3 (DE reference value)
         self.radon_hysteresis = 50                          # Bq/m3
         self.radon_protection_fan = "Low"
+        # radon "source": "signal" = the MQTT topics above; "device" = read the
+        # radon meter's status directly from the Ambientika cloud (no hardware).
+        self.radon_source = "signal"
+        self.radon_device_serial = ""
+        # Which status field of the radon meter carries its alarm/level, and
+        # which of its values mean "radon alarm". Numeric values are compared to
+        # radon_threshold; strings are matched against radon_device_alarm_values.
+        self.radon_device_alarm_field = "air_quality"
+        self.radon_device_alarm_values = "Bad,Poor,Very Bad,Alarm,Alert"
 
         # --- Dew-point control (Taupunktsteuerung) ---
         self.dewpoint_enabled = True
@@ -175,6 +184,17 @@ class BridgeConfig:
         except KeyError:
             log.warning("Invalid radon_protection_fan %r, using Low.", self.radon_protection_fan)
             return RADON_PROTECTION_FAN_DEFAULT
+
+    @property
+    def radon_device_alarm_value_set(self) -> set:
+        """String status values of the radon meter that mean "radon alarm".
+
+        Used only with radon_source='device' when the alarm field is a string
+        (e.g. air_quality). Numeric fields are compared to radon_threshold
+        instead. Accepts commas or semicolons; matching is case-insensitive.
+        """
+        raw = str(self.radon_device_alarm_values or "").replace(";", ",")
+        return {t.strip().lower() for t in raw.split(",") if t.strip()}
 
     @property
     def dewpoint_block_device_tokens(self) -> set:
@@ -217,6 +237,15 @@ class BridgeConfig:
         except (TypeError, ValueError):
             pass
         self.radon_protection_fan = get("radon_protection_fan", self.radon_protection_fan) or self.radon_protection_fan
+        self.radon_source = get("radon_source", self.radon_source) or self.radon_source
+        self.radon_device_serial = get("radon_device_serial", self.radon_device_serial) or self.radon_device_serial
+        self.radon_device_alarm_field = get("radon_device_alarm_field", self.radon_device_alarm_field) or self.radon_device_alarm_field
+        # Empty string is a valid value here (means "no string values"), accept verbatim.
+        rdav = get("radon_device_alarm_values", self.radon_device_alarm_values)
+        self.radon_device_alarm_values = self.radon_device_alarm_values if rdav is None else str(rdav)
+        if self.radon_source not in ("signal", "device"):
+            log.warning("Invalid radon_source %r, using 'signal'.", self.radon_source)
+            self.radon_source = "signal"
         # dew point
         self.dewpoint_enabled = cast_bool(get("dewpoint_enabled", self.dewpoint_enabled))
         self.dewpoint_source = get("dewpoint_source", self.dewpoint_source) or self.dewpoint_source
@@ -257,6 +286,10 @@ class BridgeConfig:
             ("radon_topic", ("RADON_TOPIC",)),
             ("radon_alarm_topic", ("RADON_ALARM_TOPIC",)),
             ("radon_protection_fan", ("RADON_PROTECTION_FAN",)),
+            ("radon_source", ("RADON_SOURCE",)),
+            ("radon_device_serial", ("RADON_DEVICE_SERIAL",)),
+            ("radon_device_alarm_field", ("RADON_DEVICE_ALARM_FIELD",)),
+            ("radon_device_alarm_values", ("RADON_DEVICE_ALARM_VALUES",)),
             ("dewpoint_source", ("DEWPOINT_SOURCE",)),
             ("dewpoint_block_topic", ("DEWPOINT_BLOCK_TOPIC",)),
             ("dewpoint_block_devices", ("DEWPOINT_BLOCK_DEVICES",)),
@@ -625,6 +658,50 @@ class NeuraCellXController:
             log.warning("NeuraCell-X: explicit radon alarm %s.", "ON" if on else "OFF")
             await self.reconcile(force=True)
 
+    async def poll_radon_device(self, device: Any) -> None:
+        """Derive the radon alarm from a radon meter's cloud status (source='device').
+
+        Reads one status field of the radon meter via the Ambientika API and
+        decides whether radon protection should be active. Numeric fields go
+        through the same threshold/hysteresis path as radon_topic; boolean
+        fields are used directly; string/enum fields (e.g. air_quality) count as
+        an alarm when their value is in cfg.radon_device_alarm_value_set. No hardware.
+        """
+        if not self.cfg.neuracell_enabled:
+            return
+        status = await self.bridge.read_status(device)
+        if status is None:
+            log.warning("NeuraCell-X: radon source device %s unreachable this poll; keeping last state.",
+                        getattr(device, "serial_number", "?"))
+            return
+        field = self.cfg.radon_device_alarm_field
+        raw = status.get(field)
+        if raw is None:
+            log.warning("NeuraCell-X: radon source device %s has no status field %r; keeping last state. "
+                        "Available fields: %s",
+                        getattr(device, "serial_number", "?"), field,
+                        ", ".join(sorted(status.keys())))
+            return
+        # bool must be checked before int (bool is a subclass of int).
+        if isinstance(raw, bool):
+            on = raw
+        elif isinstance(raw, (int, float)):
+            # Numeric field -> reuse the threshold/hysteresis path (does reconcile).
+            await self.on_radon_value(str(raw))
+            return
+        else:
+            value = getattr(raw, "name", raw)   # enum -> its name, else the value itself
+            on = str(value).strip().lower() in self.cfg.radon_device_alarm_value_set
+        log.debug("NeuraCell-X: radon meter %s %s=%r -> %s",
+                  getattr(device, "serial_number", "?"), field, raw, "ALARM" if on else "clear")
+        if on != self.radon_active:
+            self.radon_active = on
+            log.warning("NeuraCell-X: radon meter %s -> radon protection %s.",
+                        getattr(device, "serial_number", "?"), "ON" if on else "OFF")
+            await self.reconcile(force=True)
+        else:
+            self.bridge.publish_neuracell_state()
+
     # ----- dew-point signals -----
     async def on_dewpoint_block(self, raw: str) -> None:
         """External ON/OFF block signal (source='signal')."""
@@ -770,6 +847,7 @@ class AmbientikaBridge:
         self.api: Optional[Ambientika] = None
         self.devices: dict = {}
         self.dewpoint_device: Optional[Device] = None
+        self.radon_device: Optional[Device] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop_event: Optional[asyncio.Event] = None
         self.neuracell = NeuraCellXController(self, cfg)
@@ -828,12 +906,16 @@ class AmbientikaBridge:
         for serial in self.devices:
             client.subscribe(f"{self.cfg.topic_prefix}/{serial}/set/+")
         if self.cfg.neuracell_enabled:
-            if self.cfg.radon_topic:
-                client.subscribe(self.cfg.radon_topic)
-            if self.cfg.radon_alarm_topic:
-                client.subscribe(self.cfg.radon_alarm_topic)
-            log.info("NeuraCell-X: radon topics subscribed (%s / %s).",
-                     self.cfg.radon_topic, self.cfg.radon_alarm_topic)
+            if self.cfg.radon_source == "device":
+                log.info("NeuraCell-X: radon read from meter %s (Ambientika cloud, no MQTT input).",
+                         self.cfg.radon_device_serial)
+            else:
+                if self.cfg.radon_topic:
+                    client.subscribe(self.cfg.radon_topic)
+                if self.cfg.radon_alarm_topic:
+                    client.subscribe(self.cfg.radon_alarm_topic)
+                log.info("NeuraCell-X: radon topics subscribed (%s / %s).",
+                         self.cfg.radon_topic, self.cfg.radon_alarm_topic)
         if self.cfg.dewpoint_enabled:
             if self.cfg.dewpoint_source == "computed":
                 for topic in self._dewpoint_sensor_map():
@@ -870,7 +952,7 @@ class AmbientikaBridge:
             payload = msg.payload.decode("utf-8", errors="replace").strip()
             topic = msg.topic
 
-            if self.cfg.neuracell_enabled:
+            if self.cfg.neuracell_enabled and self.cfg.radon_source != "device":
                 if topic == self.cfg.radon_topic:
                     self._dispatch(self.neuracell.on_radon_value(payload)); return
                 if topic == self.cfg.radon_alarm_topic:
@@ -1028,6 +1110,19 @@ class AmbientikaBridge:
                 log.info("Dew-point source device: %s (serial %s) - read-only, not exposed as a fan.",
                          self.dewpoint_device.name, serial)
 
+        # radon source='device': take the radon meter OUT of the controllable-fan
+        # set, so it is only read for its radon state, never commanded as a fan.
+        self.radon_device = None
+        if self.cfg.neuracell_enabled and self.cfg.radon_source == "device":
+            serial = self.cfg.radon_device_serial
+            self.radon_device = self.devices.pop(serial, None) if serial else None
+            if self.radon_device is None:
+                log.error("radon_source=device but radon meter serial %r not found. Available serials: %s",
+                          serial, ", ".join(self.devices.keys()) or "(none)")
+            else:
+                log.info("Radon source device: %s (serial %s) - read-only, not exposed as a fan.",
+                         self.radon_device.name, serial)
+
     def _publish_discovery(self) -> None:
         if not self.cfg.enable_discovery or self.client is None:
             return
@@ -1073,6 +1168,15 @@ class AmbientikaBridge:
                 except Exception as e:
                     log.exception("Error polling %s: %s", serial, e)
 
+            # Read the radon meter (source='device') FIRST - radon has priority
+            # over dew point, so its state must be current before we enforce.
+            if (self.cfg.neuracell_enabled and self.cfg.radon_source == "device"
+                    and self.radon_device is not None):
+                try:
+                    await self.neuracell.poll_radon_device(self.radon_device)
+                except Exception as e:
+                    log.exception("NeuraCell-X radon device poll error: %s", e)
+
             # Read the TPS device (source='device') and derive the block.
             if (self.cfg.dewpoint_enabled and self.cfg.dewpoint_source == "device"
                     and self.dewpoint_device is not None):
@@ -1104,8 +1208,13 @@ class AmbientikaBridge:
 
         log.info("Starting poll loop (every %ss) ...", self.cfg.poll_interval)
         if self.cfg.neuracell_enabled:
-            log.info("NeuraCell-X radon: threshold=%d Bq/m3 -> Intake/%s",
-                     self.cfg.radon_threshold, self.cfg.radon_protection_fan)
+            if self.cfg.radon_source == "device":
+                rsrc = "device(serial=%s, field=%s)" % (
+                    self.cfg.radon_device_serial or "?", self.cfg.radon_device_alarm_field)
+            else:
+                rsrc = "signal(threshold=%d Bq/m3)" % self.cfg.radon_threshold
+            log.info("NeuraCell-X radon: source=%s -> alarm => Intake/%s (highest priority).",
+                     rsrc, self.cfg.radon_protection_fan)
         if self.cfg.dewpoint_enabled:
             scope = ", ".join(sorted(self.cfg.dewpoint_block_device_tokens)) or "ALL devices"
             src = self.cfg.dewpoint_source
