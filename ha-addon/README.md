@@ -44,10 +44,44 @@ After installation, configure the add-on via the **Configuration** tab:
 | `mqtt_topic_prefix` | MQTT topic prefix | `ambientika` |
 | `poll_interval` | Polling interval in seconds | `30` |
 | `log_level` | Log verbosity | `INFO` |
+| `neuracell_enabled` | Enable NeuraCell-X&reg; radon protection + dew-point control | `true` |
+| `radon_source` | Where the radon alarm comes from: `signal` (MQTT) or `device` (read the radon meter directly from the Ambientika cloud &mdash; no hardware) | `signal` |
+| `radon_device_serial` | Radon meter serial number (only for `radon_source: device`; see the add-on log) | `` |
+| `radon_device_alarm_field` | Which status field of the radon meter carries the alarm (`device` source) | `air_quality` |
+| `radon_device_alarm_values` | Values of that field that mean "radon alarm" (comma-separated) | `Bad,Poor,Very Bad,Alarm,Alert` |
+| `radon_threshold` | Radon alarm threshold in Bq/m³ (numeric source) | `300` |
+| `radon_protection_fan` | Fan level during radon protection (`Low` / `Medium` / `High`) | `Low` |
+| `dewpoint_source` | Dew-point trigger: `signal` (MQTT), `computed` (from sensors) or `device` (read the TPS from the cloud) | `signal` |
 
 > **MQTT credentials are required for most brokers.** The official Home Assistant Mosquitto add-on and most production setups disable anonymous MQTT access. If `mqtt_username` / `mqtt_password` are empty the bridge cannot connect (`Not authorized`). Create a dedicated MQTT user for the bridge (e.g. via the Mosquitto add-on's `logins` option) and set both fields. Only leave them empty if you have explicitly configured your broker to allow anonymous access.
 >
 > **Note:** If you use the official **Mosquitto broker** add-on, the default `core-mosquitto` hostname works out of the box.
+
+---
+
+## NeuraCell-X&reg; — radon protection & dew-point control
+
+**NeuraCell-X&reg;** (patent pending) couples the Ambientika radon meter and dew-point control (TPS) with your ventilation units:
+
+- **Radon protection (highest priority):** on a radon alarm, **all** units go to **Intake (supply air / Zuluft) at fan Stufe 1 (Low)** — a gentle fresh-air overpressure that slows radon ingress.
+- **Dew-point control:** when ventilating would raise indoor humidity, the units switch **off**; when conditions are favourable again, ventilation is released.
+- **Radon has priority:** while a radon alarm is active it overrides the dew-point block. When all protections clear, every unit returns to the exact mode it had before.
+
+### Hardware-free source (recommended)
+
+If your radon meter and/or TPS hang in the same Ambientika account, the bridge can read them **directly from the Ambientika cloud** — no relay, no ESP, no extra sensors:
+
+```yaml
+neuracell_enabled: true
+radon_source: "device"
+radon_device_serial: "<radon meter serial>"       # see the add-on log: Device: <name> (serial: <serial>)
+radon_device_alarm_field: "air_quality"           # a numeric field would use radon_threshold instead
+radon_device_alarm_values: "Bad,Poor,Very Bad,Alarm,Alert"
+```
+
+On the first run the log shows `Radon source device: <name> (serial ...)` and, on each change, `NeuraCell-X: radon meter ... -> radon protection ON/OFF`. If your meter reports its alarm as a different value, adjust `radon_device_alarm_values` (the actual value appears in the log). If it reports a numeric radon level instead, point `radon_device_alarm_field` at that numeric field and it will use `radon_threshold` / `radon_hysteresis`.
+
+The default `radon_source: "signal"` keeps the classic MQTT input, so nothing changes for existing setups. The TPS / dew-point side has the same hardware-free option (`dewpoint_source: "device"`) — see [`examples/home-assistant-tps`](../examples/home-assistant-tps/README.md).
 
 ---
 
