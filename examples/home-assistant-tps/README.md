@@ -61,6 +61,22 @@ Die TPS hängt per WLAN im selben Ambientika-Konto wie SMART und OFFICE. Die Bri
 
 ---
 
+## Radon — hardwarefrei (dasselbe Prinzip für das Radonsystem)
+
+Hängt euer **Radon-Messgerät** ebenfalls im Ambientika-Konto, funktioniert der Radon-Schutz genauso hardwarefrei — die Bridge liest den Radon-Zustand **direkt aus der Cloud**. Bei **Radon-Alarm gehen alle Lüfter auf Stufe 1 (Low) im permanenten Zuluftbetrieb (Intake)**; **Radon hat dabei Vorrang** vor dem Taupunkt-Block.
+
+```yaml
+neuracell_enabled: true
+radon_source: "device"
+radon_device_serial: "<Radon-Messgerät-Seriennummer>"    # aus dem Add-on-Log: Device: … (serial: …)
+radon_device_alarm_field: "air_quality"                  # Textfeld; bei Zahlenwert greift radon_threshold
+radon_device_alarm_values: "Bad,Poor,Very Bad,Alarm,Alert"
+```
+
+**Kontrolle im Log:** beim Start `Radon source device: <name> (serial ...)`, beim Umschalten `NeuraCell-X: radon meter ... -> radon protection ON/OFF`. Meldet euer Gerät einen anderen Alarm-Text, `radon_device_alarm_values` anpassen (der echte Wert steht im Log). Standard bleibt `radon_source: "signal"` (MQTT) — es ändert sich also nichts von allein.
+
+---
+
 ## Variante A — ESPHome + Relais (garantierter Rückfall)
 
 Datei: `esphome_ambientika_tps.yaml`
