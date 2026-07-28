@@ -32,6 +32,10 @@ options:
   radon_threshold: 300
   radon_hysteresis: 50
   radon_protection_fan: "Low"
+  radon_source: "signal"
+  radon_device_serial: ""
+  radon_device_alarm_field: "air_quality"
+  radon_device_alarm_values: "Bad,Poor,Very Bad,Alarm,Alert"
   # --- Dew-point control (Taupunktsteuerung) - radon has priority ---
   dewpoint_enabled: true
   dewpoint_source: "signal"
@@ -62,6 +66,10 @@ schema:
   radon_threshold: int(50,1000)
   radon_hysteresis: int(0,500)
   radon_protection_fan: list(Low|Medium|High)
+  radon_source: list(signal|device)
+  radon_device_serial: str?
+  radon_device_alarm_field: str?
+  radon_device_alarm_values: str?
   # --- Dew-point control ---
   dewpoint_enabled: bool
   dewpoint_source: list(signal|computed|device)

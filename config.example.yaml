@@ -30,6 +30,16 @@ neuracell:
   radon_threshold: 300                          # Bq/m3 (DE reference value; WHO = 100)
   radon_hysteresis: 50                          # Bq/m3
   radon_protection_fan: "Low"
+  radon_source: "signal"                        # "signal" (MQTT topics above) or "device"
+  # device source (no hardware): read a radon meter's status directly from the
+  # Ambientika cloud. Set radon_source: "device", give the meter's serial (see
+  # add-on log), and pick the status field that carries its alarm/level.
+  radon_device_serial: ""
+  # Numeric fields (e.g. a Bq/m3 value) are compared to radon_threshold above.
+  # String fields (e.g. air_quality) trigger an alarm when their value is one of
+  # radon_device_alarm_values. Boolean fields are used directly.
+  radon_device_alarm_field: "air_quality"
+  radon_device_alarm_values: "Bad,Poor,Very Bad,Alarm,Alert"
 
 # --- Dew-point control (Taupunktsteuerung) - radon has priority ---
 # "Not ideal to ventilate" -> all devices Off; good conditions -> release/restore.
