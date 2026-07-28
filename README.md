@@ -100,8 +100,13 @@ The live status is published to `ambientika/neuracell/state` and surfaced native
 | **Matter** (SmartThings, ...) | *NeuraCell-X Radon Protection* contact sensor |
 | **Node-RED / Loxone** | `ambientika/neuracell/state` inputs (see the examples) |
 
-Configure it in the add-on options / `config.yaml`: `radon_threshold`, `radon_protection_fan`,
-`dewpoint_source` (`signal` or `computed`), `dewpoint_margin`, and more.
+Both protections can read their trigger **hardware-free, straight from the Ambientika cloud** &mdash; no
+extra sensor wiring, relay or MQTT signal needed. Set `radon_source: "device"` (radon meter) and/or
+`dewpoint_source: "device"` (TPS) and give the device's serial number (it appears in the add-on log).
+
+Configure it in the add-on options / `config.yaml`: `radon_source` (`signal` or `device`),
+`radon_device_serial`, `radon_device_alarm_field` / `radon_device_alarm_values`, `radon_threshold`,
+`radon_protection_fan`, `dewpoint_source` (`signal`, `computed` or `device`), `dewpoint_margin`, and more.
 
 *NeuraCell-X&reg; and PhaseCell-X&reg; are registered trademarks of S&uuml;dwind / Ambientika. Patent pending.*
 
