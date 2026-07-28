@@ -1,0 +1,90 @@
+# =============================================================================
+# Home Assistant Package  –  Ambientika Taupunkt-Kopplung  (Variante B)
+# =============================================================================
+# Nutze diese Variante, wenn die Netz-Präsenz der TPS-geschalteten Leitung
+# bereits als HA-Entität vorliegt, z. B.:
+#   - ein Koppelrelais (230-V-Spule) -> potenzialfreier Kontakt -> Shelly i4 /
+#     KNX / wired input  (Entität ist AN, wenn Netz vorhanden), ODER
+#   - eine Leistungs-Messsteckdose in der TPS-geschalteten Lüfterleitung
+#     (Leistung > 0 = Netz vorhanden = lüften erlaubt).
+#
+# So schaltet die TPS:  Netz VORHANDEN = lüften erlaubt = "clear".
+#                        Netz WEG      = TPS sperrt      = "block" (SMART/OFFICE aus).
+#
+# Einbau:  Datei nach  <config>/packages/ambientika_tps.yaml  legen und in
+# configuration.yaml aktivieren:
+#     homeassistant:
+#       packages: !include_dir_named packages
+#
+# WICHTIG: `binary_sensor.tps_mains_present` unten auf deine reale Quelle
+# anpassen (Kontakt-Entität ODER Leistungssteckdose per Template, s. u.).
+# =============================================================================
+
+# --- Netz-Präsenz als Binärsensor -------------------------------------------
+# Beispiel 1 (auskommentiert): aus einer Leistungssteckdose ableiten.
+# template:
+#   - binary_sensor:
+#       - name: "TPS Netz vorhanden"
+#         unique_id: tps_mains_present
+#         device_class: power
+#         state: "{{ states('sensor.tps_luefter_leistung') | float(0) > 2 }}"
+#
+# Beispiel 2 (aktiv): Kontakt-Zustand kommt per MQTT (z. B. Shelly/ESP).
+# ON = Netz vorhanden. Bei umgekehrter Kontaktlogik payload_on/off tauschen.
+mqtt:
+  binary_sensor:
+    - name: "TPS Netz vorhanden"
+      unique_id: tps_mains_present
+      state_topic: "tps/mains"        # <-- an deine Quelle anpassen
+      payload_on: "ON"                #     ON  = Netz vorhanden
+      payload_off: "OFF"              #     OFF = Netz weg (TPS sperrt)
+      device_class: power
+
+# --- Manueller Test-Schalter (simuliert "block") ----------------------------
+input_boolean:
+  tps_test_block:
+    name: "TPS Test: Lüftung sperren"
+    icon: mdi:water-off
+
+# --- Automationen -----------------------------------------------------------
+automation:
+  # 1) Netz-Präsenz  ->  Ambientika-Blocktopic  (invertiert: kein Netz = block)
+  - id: tps_mains_to_ambientika
+    alias: "TPS Netz-Präsenz → Ambientika Taupunkt-Block"
+    description: >-
+      Netz vorhanden -> "clear" (lüften erlaubt). Netz weg -> "block"
+      (SMART/OFFICE aus). Re-sync nach HA-Neustart.
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.tps_mains_present
+        to: "on"
+      - platform: state
+        entity_id: binary_sensor.tps_mains_present
+        to: "off"
+      - platform: homeassistant
+        event: start
+    action:
+      - action: mqtt.publish
+        data:
+          topic: ambientika/dewpoint/block
+          retain: true
+          payload: >-
+            {{ 'clear' if is_state('binary_sensor.tps_mains_present', 'on')
+               else 'block' }}
+
+  # 2) Manueller Test-Schalter  ->  Blocktopic  (zum Prüfen ohne echte TPS)
+  - id: tps_manual_test_to_ambientika
+    alias: "TPS Test-Schalter → Ambientika Taupunkt-Block"
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: input_boolean.tps_test_block
+    action:
+      - action: mqtt.publish
+        data:
+          topic: ambientika/dewpoint/block
+          retain: true
+          payload: >-
+            {{ 'block' if is_state('input_boolean.tps_test_block', 'on')
+               else 'clear' }}

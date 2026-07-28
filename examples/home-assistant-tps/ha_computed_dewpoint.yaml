@@ -1,0 +1,55 @@
+# =============================================================================
+# Home Assistant Package  –  Ambientika Taupunkt "computed"  (Variante C)
+# =============================================================================
+# Kein TPS-Kontakt vorhanden, aber Temperatur- und Feuchtesensoren innen und
+# außen? Dann kann die Bridge den Taupunkt selbst berechnen. Sie erwartet vier
+# Werte auf vier Topics; diese Automation füttert sie aus vorhandenen HA-
+# Sensoren. In der Bridge/Add-on dazu `dewpoint_source: computed` setzen.
+#
+# Sperrlogik der Bridge (computed):  Außen-Taupunkt >= Innen-Taupunkt - margin
+# -> lüften würde Feuchte reinholen -> block. Hysterese/margin per Add-on-Option.
+#
+# Sensoren unten an deine echten Entitäten anpassen.
+# =============================================================================
+
+automation:
+  - id: tps_feed_dewpoint_sensors
+    alias: "Taupunkt-Sensoren → Ambientika (computed)"
+    description: >-
+      Publiziert Innen/Außen Temperatur und Feuchte auf die vier
+      ambientika/dewpoint/* Topics, aus denen die Bridge den Taupunkt rechnet.
+    mode: queued
+    trigger:
+      # Bei jeder Sensoränderung neu senden ...
+      - platform: state
+        entity_id:
+          - sensor.innen_temperatur       # <-- anpassen
+          - sensor.innen_luftfeuchte      # <-- anpassen
+          - sensor.aussen_temperatur      # <-- anpassen
+          - sensor.aussen_luftfeuchte     # <-- anpassen
+      # ... und regelmäßig + nach Neustart re-syncen
+      - platform: time_pattern
+        minutes: "/5"
+      - platform: homeassistant
+        event: start
+    action:
+      - action: mqtt.publish
+        data:
+          topic: ambientika/dewpoint/indoor_temp
+          retain: true
+          payload: "{{ states('sensor.innen_temperatur') }}"
+      - action: mqtt.publish
+        data:
+          topic: ambientika/dewpoint/indoor_humidity
+          retain: true
+          payload: "{{ states('sensor.innen_luftfeuchte') }}"
+      - action: mqtt.publish
+        data:
+          topic: ambientika/dewpoint/outdoor_temp
+          retain: true
+          payload: "{{ states('sensor.aussen_temperatur') }}"
+      - action: mqtt.publish
+        data:
+          topic: ambientika/dewpoint/outdoor_humidity
+          retain: true
+          payload: "{{ states('sensor.aussen_luftfeuchte') }}"

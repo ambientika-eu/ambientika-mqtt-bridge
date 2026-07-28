@@ -1,0 +1,120 @@
+# =============================================================================
+# ESPHome  –  Ambientika Taupunkt-Kopplung  (Variante A, empfohlen)
+# =============================================================================
+# WICHTIG – so schaltet die TPS/der Funkempfänger wirklich:
+#   Es gibt KEINEN potenzialfreien Zustandskontakt. Die TPS schaltet die
+#   NETZSPANNUNG der Lüfterleitung:
+#       Netz VORHANDEN  ->  lüften erlaubt        ->  "clear"
+#       Netz WEG        ->  TPS sperrt (Relais offen) -> "block"  -> SMART/OFFICE aus
+#
+# Wir erfassen daher NICHT einen Kontakt, sondern ob auf der geschalteten
+# Leitung Netzspannung anliegt. Empfohlen: ein Koppelrelais mit 230-V-Spule
+# parallel zur geschalteten Lüfter-Phase; sein potenzialfreier Kontakt geht an
+# GPIO23. So bleibt der ESP-Eingang strikt potenzialfrei.
+#
+#   [TPS geschaltete Phase L] ──┐
+#                               │  230-V-Spule Koppelrelais
+#   [Neutralleiter N] ──────────┘
+#            Koppelrelais-Kontakt (potenzialfrei, Schließer):
+#            ─ COM ── GPIO23
+#            ─ NO  ── GND
+#        Netz vorhanden -> Spule an -> Kontakt geschlossen -> GPIO23 = LOW = "vorhanden"
+#
+# ZWEI PFLICHT-PUNKTE:
+#  1) Diesen ESP an DAUERSTROM betreiben (eigenes Netzteil), NICHT an der von
+#     der TPS geschalteten Leitung – sonst stirbt er genau dann, wenn er
+#     "block" senden müsste.
+#  2) Fail-safe (unten, will_message): fällt der Knoten ungeplant aus, setzt der
+#     Broker "block" (im Zweifel NICHT lüften). Beim Reconnect wird der echte
+#     Zustand sofort wieder gesendet.
+#
+# 230-V-Anschluss der Relaisspule nur durch eine Elektrofachkraft.
+# =============================================================================
+
+esphome:
+  name: ambientika-tps
+  friendly_name: Ambientika TPS-Kopplung
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+# --- Netzwerk ---------------------------------------------------------------
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Ambientika-TPS Fallback"
+    password: !secret fallback_password
+
+captive_portal:
+
+# --- MQTT (gleicher Broker wie die Ambientika-Bridge) -----------------------
+mqtt:
+  broker: !secret mqtt_broker
+  port: 1883
+  username: !secret mqtt_user
+  password: !secret mqtt_password
+  # FAIL-SAFE: Bei ungeplantem Verbindungsabriss des Knotens setzt der Broker
+  # "block" (sicherer Zustand = nicht lüften). Bewusst weglassen, wenn die
+  # Geräte bei kurzen Aussetzern lieber ihren letzten Zustand behalten sollen.
+  will_message:
+    topic: ambientika/dewpoint/block
+    payload: "block"
+    qos: 1
+    retain: true
+  # Beim (Wieder-)Verbinden den ECHTEN aktuellen Zustand aktiv senden – das
+  # überschreibt ein evtl. vom Fail-safe gesetztes "block" sofort wieder.
+  on_connect:
+    - mqtt.publish:
+        topic: ambientika/dewpoint/block
+        retain: true
+        payload: !lambda 'return id(tps_mains).state ? "clear" : "block";'
+
+# --- Eingang: Netz-Präsenz der TPS-geschalteten Leitung ---------------------
+binary_sensor:
+  - platform: gpio
+    id: tps_mains
+    name: "TPS Netz vorhanden"
+    device_class: power        # true = Netz vorhanden = lüften erlaubt
+    pin:
+      number: GPIO23
+      mode:
+        input: true
+        pullup: true
+      inverted: true           # Kontakt geschlossen (gegen GND) == Netz vorhanden
+    filters:
+      - delayed_on: 1s         # Relais-Prellen / kurze Netzlücken überbrücken
+      - delayed_off: 2s
+    on_press:                  # Netz kam -> lüften erlaubt
+      - mqtt.publish:
+          topic: ambientika/dewpoint/block
+          payload: "clear"
+          retain: true
+    on_release:                # Netz weg -> TPS sperrt
+      - mqtt.publish:
+          topic: ambientika/dewpoint/block
+          payload: "block"
+          retain: true
+
+# --- Optionale manuelle Test-Taster -----------------------------------------
+# Setzt das Blocksignal von Hand (ohne echte TPS), um zu prüfen, dass SMART und
+# OFFICE wirklich aus- bzw. wieder angehen.
+button:
+  - platform: template
+    name: "TPS Test: block senden"
+    on_press:
+      - mqtt.publish:
+          topic: ambientika/dewpoint/block
+          payload: "block"
+          retain: true
+  - platform: template
+    name: "TPS Test: clear senden"
+    on_press:
+      - mqtt.publish:
+          topic: ambientika/dewpoint/block
+          payload: "clear"
+          retain: true
