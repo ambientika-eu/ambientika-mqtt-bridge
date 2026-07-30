@@ -1,6 +1,6 @@
 {
     "name": "homebridge-ambientika",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "displayName": "Ambientika",
     "description": "Homebridge plugin for Ambientika ventilation units – Apple Home, Google Home, Amazon Alexa",
     "license": "MIT",
