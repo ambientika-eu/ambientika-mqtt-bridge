@@ -450,6 +450,8 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
         ("humidity_level", "Humidity Level", None, None, "mdi:water-percent"),
         ("light_sensor_level", "Light Sensor Level", None, None, "mdi:brightness-5"),
         ("device_role", "Device Role", None, None, "mdi:information"),
+        ("last_operating_mode", "Last Mode", None, None, "mdi:fan-clock"),
+        ("zone_index", "Zone", None, None, "mdi:home-group"),
     ]
     for key, name, unit, dc, icon in sensor_defs:
         p = {
@@ -1159,6 +1161,8 @@ class AmbientikaBridge:
                         "filters_status": s["filters_status"],
                         "night_alarm": s["night_alarm"],
                         "device_role": s["device_role"],
+                        "last_operating_mode": s["last_operating_mode"].name,
+                        "zone_index": device.zone_index,
                     }
                     if self.client is not None:
                         self.client.publish(state_topic(self.cfg.topic_prefix, serial),
