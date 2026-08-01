@@ -1,0 +1,50 @@
+name: Functional test (bridge logic)
+
+# Runs the fast, hardware-free functional test of bridge.py:
+# HA discovery, dew-point math, config parsing, NeuraCell-X radon/dew-point
+# logic (baseline restore + priority), the real state-payload path and command
+# handling. Complements smoke-test.yml (which does Docker build + import check).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "bridge.py"
+      - "test_bridge_deep.py"
+      - "requirements.txt"
+      - ".github/workflows/functional-test.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "bridge.py"
+      - "test_bridge_deep.py"
+      - "requirements.txt"
+      - ".github/workflows/functional-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  functional-test:
+    name: Bridge functional test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Byte-compile bridge.py
+        run: python -m py_compile bridge.py
+
+      - name: Run functional test
+        run: python test_bridge_deep.py
