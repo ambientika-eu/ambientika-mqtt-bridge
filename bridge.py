@@ -66,6 +66,96 @@ except ImportError as exc:
 log = logging.getLogger("ambientika_bridge")
 
 # ---------------------------------------------------------------------------
+# ambientika_py enum compatibility  (issue #5)
+# ---------------------------------------------------------------------------
+# The Ambientika cloud API returns enum values that the pinned ambientika_py
+# release does not know yet. ambientika_py resolves them with plain Enum[...]
+# lookups, so an unknown value raises KeyError *inside* Device.status() and
+# aborts the whole poll for that device.
+#
+# Known case: while a unit runs in night mode the API reports
+# "fanSpeed": "Night", which is missing from FanSpeed (Low/Medium/High). The
+# resulting KeyError surfaces in the log as
+#     ERROR  Error polling <serial>: 'Night'
+# and the unit keeps its last retained MQTT values - in Home Assistant it then
+# looks live while it is in fact no longer being updated.
+#
+# We register the known value explicitly and install a tolerant member map as a
+# safety net, so any future unknown value is auto-registered with a warning
+# instead of killing the poll. Compatibility members are read-only: they are
+# published as state but rejected as commands, because the API would not accept
+# them back.
+
+COMPAT_ENUM_MEMBERS: dict = {}   # enum class -> set of names added at runtime
+_COMPAT_AUTO_BASE = 900          # value range for auto-registered members
+
+# Values seen in the wild that are missing from the pinned ambientika_py.
+KNOWN_MISSING_ENUM_MEMBERS = {
+    "FanSpeed": (("Night", 3),),
+}
+
+
+def _register_enum_member(enum_cls, name: str, value: int):
+    """Add a member to an existing IntEnum at runtime."""
+    member = int.__new__(enum_cls, value)
+    member._name_ = name
+    member._value_ = value
+    type.__setattr__(enum_cls, name, member)
+    dict.__setitem__(enum_cls._member_map_, name, member)
+    enum_cls._value2member_map_.setdefault(value, member)
+    if name not in enum_cls._member_names_:
+        enum_cls._member_names_.append(name)
+    COMPAT_ENUM_MEMBERS.setdefault(enum_cls, set()).add(name)
+    return member
+
+
+class _TolerantMemberMap(dict):
+    """Member map that registers unknown names instead of raising KeyError."""
+
+    def __init__(self, enum_cls, data):
+        super().__init__(data)
+        self._enum_cls = enum_cls
+
+    def __missing__(self, key):
+        cls = self._enum_cls
+        value = _COMPAT_AUTO_BASE + len(COMPAT_ENUM_MEMBERS.get(cls, ()))
+        log.warning(
+            "Unknown %s value %r reported by the Ambientika API - registering it "
+            "as a compatibility member so the status poll keeps running. Please "
+            "report this value so it can be added properly (see issue #5).",
+            cls.__name__, key,
+        )
+        return _register_enum_member(cls, key, value)
+
+
+def strict_enum_lookup(enum_cls, name: str):
+    """Look up a member WITHOUT the tolerant fallback.
+
+    Used on the command path: a bad MQTT payload must not silently create a new
+    enum member, and compatibility members must not be sent back to the API.
+    """
+    member = dict.get(enum_cls._member_map_, name)
+    if member is None or name in COMPAT_ENUM_MEMBERS.get(enum_cls, ()):
+        return None
+    return member
+
+
+def install_enum_compat() -> None:
+    """Register known missing members and make enum lookups fault tolerant."""
+    for enum_cls in (OperatingMode, FanSpeed, HumidityLevel, LightSensorLevel):
+        for name, value in KNOWN_MISSING_ENUM_MEMBERS.get(enum_cls.__name__, ()):
+            if name not in enum_cls._member_map_:
+                _register_enum_member(enum_cls, name, value)
+        if not isinstance(enum_cls._member_map_, _TolerantMemberMap):
+            type.__setattr__(
+                enum_cls, "_member_map_",
+                _TolerantMemberMap(enum_cls, enum_cls._member_map_),
+            )
+
+
+install_enum_compat()
+
+# ---------------------------------------------------------------------------
 # Protection constants
 # ---------------------------------------------------------------------------
 
@@ -132,6 +222,9 @@ class BridgeConfig:
         self.discovery_prefix = "homeassistant"
         self.enable_discovery = True
         self.poll_interval = 30
+        # Consecutive failed polls before a device is flagged offline. 1 = old
+        # behaviour (offline on every single miss).
+        self.availability_failure_threshold = 3
         self.log_level = "INFO"
 
         # --- NeuraCell-X radon protection ---
@@ -312,6 +405,12 @@ class BridgeConfig:
                 self.poll_interval = int(pi)
             except ValueError:
                 pass
+        aft = _env("AVAILABILITY_FAILURE_THRESHOLD")
+        if aft:
+            try:
+                self.availability_failure_threshold = int(aft)
+            except ValueError:
+                pass
         rth = _env("RADON_THRESHOLD")
         if rth:
             try:
@@ -366,6 +465,8 @@ class BridgeConfig:
         cfg.discovery_prefix = br.get("discovery_prefix", cfg.discovery_prefix)
         cfg.enable_discovery = bool(br.get("enable_discovery", True))
         cfg.poll_interval = int(br.get("poll_interval", cfg.poll_interval))
+        cfg.availability_failure_threshold = int(br.get(
+            "availability_failure_threshold", cfg.availability_failure_threshold))
         cfg.log_level = br.get("log_level", cfg.log_level)
 
         extras = {}
@@ -394,6 +495,8 @@ class BridgeConfig:
         cfg.discovery_prefix = raw.get("discovery_prefix", cfg.discovery_prefix)
         cfg.enable_discovery = bool(raw.get("enable_discovery", True))
         cfg.poll_interval = int(raw.get("poll_interval", cfg.poll_interval))
+        cfg.availability_failure_threshold = int(raw.get(
+            "availability_failure_threshold", cfg.availability_failure_threshold))
         cfg.log_level = raw.get("log_level", cfg.log_level)
         cfg._apply_extras(raw.get)
         cfg.apply_env_overrides()
@@ -940,6 +1043,35 @@ class AmbientikaBridge:
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop_event: Optional[asyncio.Event] = None
         self.neuracell = NeuraCellXController(self, cfg)
+        # serial -> number of consecutive failed polls (availability debounce)
+        self._poll_failures: dict = {}
+
+    # ----- availability debounce -----
+    def _note_poll_failure(self, serial: str, reason: str) -> None:
+        """Count a failed poll and flag the device offline only after N in a row.
+
+        A single missed cycle is normally a transient cloud hiccup - the API
+        sporadically answers HTTP 404 "Status packet not found!" for a device
+        that is perfectly reachable. Publishing "offline" on the first miss
+        makes the entity flicker to unavailable and back for one poll interval.
+        """
+        n = self._poll_failures.get(serial, 0) + 1
+        self._poll_failures[serial] = n
+        threshold = max(1, self.cfg.availability_failure_threshold)
+        if n < threshold:
+            log.info("Poll %d/%d failed for %s (%s) - keeping it available.",
+                     n, threshold, serial, reason)
+            return
+        if n == threshold:
+            log.warning("Poll failed %d times in a row for %s (%s) - marking offline.",
+                        n, serial, reason)
+        if self.client is not None:
+            self.client.publish(avail_topic(self.cfg.topic_prefix, serial),
+                                "offline", qos=0, retain=True)
+
+    def _note_poll_success(self, serial: str) -> None:
+        if self._poll_failures.pop(serial, 0):
+            log.info("Device %s is answering again.", serial)
 
     # ----- device helpers -----
     async def read_status(self, device: Device) -> Optional[dict]:
@@ -1101,10 +1233,12 @@ class AmbientikaBridge:
         if enum_cls is None and attr != "light_sensor_level":
             log.warning("Unsupported attribute: %s", attr)
             return
-        try:
-            parsed = (enum_cls[value] if enum_cls is not None
-                      else LightSensorLevel[value])
-        except KeyError:
+        # Strict lookup on purpose: a bad payload must not create a new enum
+        # member via the compatibility map, and compatibility members (e.g. the
+        # reported-only fan speed "Night") must not be sent back to the API.
+        parsed = strict_enum_lookup(enum_cls if enum_cls is not None
+                                    else LightSensorLevel, value)
+        if parsed is None:
             log.error("Invalid value %r for %s", value, attr)
             return
 
@@ -1247,9 +1381,7 @@ class AmbientikaBridge:
                     res = await device.status()
                     if isinstance(res, Failure):
                         log.warning("status() failed for %s: %s", serial, res)
-                        if self.client is not None:
-                            self.client.publish(avail_topic(self.cfg.topic_prefix, serial),
-                                                "offline", qos=0, retain=True)
+                        self._note_poll_failure(serial, "status() failed")
                         continue
                     s = res.unwrap()
                     payload = {
@@ -1280,8 +1412,13 @@ class AmbientikaBridge:
                                             json.dumps(payload), qos=0, retain=True)
                         self.client.publish(avail_topic(self.cfg.topic_prefix, serial),
                                             "online", qos=0, retain=True)
+                    self._note_poll_success(serial)
                 except Exception as e:
+                    # An exception here used to publish nothing at all, so the
+                    # entity silently kept its last retained values and looked
+                    # live in the dashboard. Count it like any other failed poll.
                     log.exception("Error polling %s: %s", serial, e)
+                    self._note_poll_failure(serial, "exception during poll")
 
             # Read the radon meter (source='device') FIRST - radon has priority
             # over dew point, so its state must be current before we enforce.

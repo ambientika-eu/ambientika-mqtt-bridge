@@ -183,6 +183,7 @@ See [`iobroker-adapter/README.md`](iobroker-adapter/README.md)
 | `MQTT_PASSWORD` | *(empty)* | MQTT password (**required** for most brokers) |
 | `MQTT_PREFIX` | `ambientika` | MQTT topic prefix |
 | `POLL_INTERVAL` | `30` | Device poll interval in seconds |
+| `AVAILABILITY_FAILURE_THRESHOLD` | `3` | Consecutive failed polls before a device is flagged offline |
 | `HA_DISCOVERY` | `true` | Enable Home Assistant Auto-Discovery |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
@@ -191,6 +192,34 @@ See [`iobroker-adapter/README.md`](iobroker-adapter/README.md)
 ---
 
 ## Notes
+
+### Unknown enum values from the cloud API
+
+The cloud API occasionally reports enum values that the pinned `ambientika_py`
+release does not know. `ambientika_py` resolves them with plain `Enum[...]`
+lookups, so an unknown value raises `KeyError` *inside* `Device.status()` and
+aborts the whole poll for that device. The known case is `"fanSpeed": "Night"`,
+reported while a unit runs in night mode (see
+[#5](https://github.com/ambientika-eu/ambientika-mqtt-bridge/issues/5)):
+
+```
+ERROR  Error polling <serial>: 'Night'
+```
+
+The bridge registers `FanSpeed.Night` at start-up and installs a tolerant enum
+lookup, so any future unknown value is auto-registered with a warning instead of
+breaking the poll. Such compatibility members are **read-only**: they are
+published as state but rejected on the command path, because the API would not
+accept them back.
+
+### Availability debounce
+
+A single failed poll is usually a transient cloud hiccup - the API sporadically
+answers `HTTP 404 Status packet not found!` for a device that is perfectly
+reachable. The bridge therefore only publishes `offline` after
+`AVAILABILITY_FAILURE_THRESHOLD` consecutive failures (default `3`), which stops
+entities from flickering to *unavailable* and back for one poll interval. Set it
+to `1` for the previous immediate-offline behaviour.
 
 ### `ambientika_py` dependency
 
