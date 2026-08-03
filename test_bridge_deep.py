@@ -119,6 +119,9 @@ def test_discovery():
     btn = next((p for t, p in ents if t.endswith("AMB-2_reset_filter/config") and "/button/" in t), None)
     check("discovery: reset_filter button present + command_topic",
           bool(btn) and btn["command_topic"].endswith("/AMB-2/set/reset_filter"), btn)
+    aqn = next((p for t, p in ents if t.endswith("AMB-2_air_quality_num/config") and "/sensor/" in t), None)
+    check("discovery: air_quality_num sensor + state_class=measurement",
+          bool(aqn) and aqn.get("state_class") == "measurement", aqn)
 
 
 def test_dewpoint():
@@ -199,6 +202,14 @@ async def test_payload():
     check("payload: operating_mode=MasterSlaveFlow (effective)", s.get("operating_mode") == "MasterSlaveFlow")
     check("payload: device_role present", s.get("device_role") == "Slave")
     check("payload: filters_status string present", s.get("filters_status") == "Green")
+    # numerische Begleitwerte (Zahl je Textwert) im state-Payload
+    check("payload: operating_mode_num=9 (MasterSlaveFlow)", s.get("operating_mode_num") == OM.MasterSlaveFlow.value, s.get("operating_mode_num"))
+    check("payload: last_operating_mode_num=3 (Night)", s.get("last_operating_mode_num") == OM.Night.value, s.get("last_operating_mode_num"))
+    check("payload: fan_speed_num=2 (Medium->+1)", s.get("fan_speed_num") == FS.Medium.value + 1, s.get("fan_speed_num"))
+    check("payload: humidity_level_num=1 (Normal)", s.get("humidity_level_num") == HL.Normal.value, s.get("humidity_level_num"))
+    check("payload: light_sensor_level_num=1 (Off)", s.get("light_sensor_level_num") == LS.Off.value, s.get("light_sensor_level_num"))
+    check("payload: air_quality_num=3 (Good)", s.get("air_quality_num") == 3, s.get("air_quality_num"))
+    check("payload: filter_status_num=0 (Green)", s.get("filter_status_num") == 0, s.get("filter_status_num"))
 
 
 async def test_command():
