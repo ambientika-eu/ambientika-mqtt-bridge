@@ -426,6 +426,54 @@ def neuracell_state_topic(prefix: str) -> str:
 # Home Assistant Auto-Discovery
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Numerische Begleitwerte (eine Zahl je kategorialem Textwert) - direkt im
+# state-Topic, damit Zeitreihen/Grafana ohne eigene Uebersetzungstabelle
+# auskommen. Kalibriert auf die realen Geraetestrings, konsistent mit der
+# Local-App-Historie.
+# ---------------------------------------------------------------------------
+_AIR_QUALITY_NUM = {                       # hoeher = bessere Luft (0..4)
+    "verygood": 4, "good": 3, "medium": 2, "bad": 1, "verybad": 0,
+    "sehrgut": 4, "gut": 3, "mittel": 2, "schlecht": 1, "sehrschlecht": 0,
+    "excellent": 4, "moderate": 2, "poor": 1, "verypoor": 0,
+}
+_FILTER_STATUS_NUM = {                      # hoeher = dringlicher (0 gruen..2 rot)
+    "good": 0, "green": 0, "gruen": 0, "ok": 0, "clean": 0,
+    "medium": 1, "yellow": 1, "gelb": 1, "moderate": 1, "warn": 1,
+    "bad": 2, "red": 2, "rot": 2, "dirty": 2, "alarm": 2,
+}
+
+
+def _norm_str(s):
+    if s is None:
+        return None
+    return str(s).strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+
+
+def air_quality_to_num(value):
+    """air_quality-String -> 0..4 (hoeher = besser). Unbekannt/Zahl -> None."""
+    return _AIR_QUALITY_NUM.get(_norm_str(value))
+
+
+def filter_status_to_num(value):
+    """filters_status-String -> 0/1/2 (hoeher = dringlicher). Unbekannt -> None."""
+    return _FILTER_STATUS_NUM.get(_norm_str(value))
+
+
+def _enum_num(v):
+    """IntEnum-Wert -> int, sonst None."""
+    try:
+        return int(v.value)
+    except Exception:
+        return None
+
+
+def _fan_speed_num(v):
+    """FanSpeed Low/Medium/High -> 1/2/3 (0 des Enums + 1)."""
+    n = _enum_num(v)
+    return n + 1 if n is not None else None
+
+
 def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
     device_info = {
         "identifiers": [serial],
@@ -468,6 +516,29 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
             p["device_class"] = dc
         if icon:
             p["icon"] = icon
+        entities.append((f"{base}/sensor/{serial}_{key}/config", p))
+
+    # Numerische Begleitsensoren: state_class=measurement => HA fuehrt die
+    # Langzeitstatistik selbst (Grafana ohne eigene Uebersetzungstabelle).
+    numeric_defs = [
+        ("air_quality_num", "Air Quality (num)"),
+        ("filter_status_num", "Filter Status (num)"),
+        ("operating_mode_num", "Mode (num)"),
+        ("last_operating_mode_num", "Last Mode (num)"),
+        ("fan_speed_num", "Fan Speed (num)"),
+        ("humidity_level_num", "Humidity Level (num)"),
+        ("light_sensor_level_num", "Light Sensor Level (num)"),
+    ]
+    for key, name in numeric_defs:
+        p = {
+            "name": name,
+            "unique_id": f"ambientika_{serial}_{key}",
+            "state_topic": state,
+            "value_template": f"{{{{ value_json.{key} }}}}",
+            "availability_topic": avail,
+            "device": device_info,
+            "state_class": "measurement",
+        }
         entities.append((f"{base}/sensor/{serial}_{key}/config", p))
 
     bin_defs = [
@@ -1195,6 +1266,14 @@ class AmbientikaBridge:
                         "device_role": s["device_role"],
                         "last_operating_mode": s["last_operating_mode"].name,
                         "zone_index": device.zone_index,
+                        # --- numerische Begleitwerte (Zahl je Textwert) ---
+                        "operating_mode_num": _enum_num(s["operating_mode"]),
+                        "last_operating_mode_num": _enum_num(s["last_operating_mode"]),
+                        "fan_speed_num": _fan_speed_num(s["fan_speed"]),
+                        "humidity_level_num": _enum_num(s["humidity_level"]),
+                        "light_sensor_level_num": _enum_num(s["light_sensor_level"]),
+                        "air_quality_num": air_quality_to_num(s["air_quality"]),
+                        "filter_status_num": filter_status_to_num(s["filters_status"]),
                     }
                     if self.client is not None:
                         self.client.publish(state_topic(self.cfg.topic_prefix, serial),
