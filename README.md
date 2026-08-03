@@ -223,7 +223,7 @@ to `1` for the previous immediate-offline behaviour.
 
 ### `ambientika_py` dependency
 
-This project currently installs the [`ambientika_py`](https://github.com/wingertge/ambientika-py) library directly from its upstream Git repository, pinned to a specific commit, because the latest PyPI release (0.0.5) does not yet contain the `LightSensorLevel` enum required by the bridge. This is a temporary workaround – see [#3](https://github.com/ambientika-eu/ambientika-mqtt-bridge/issues/3) and [wingertge/ambientika-py#8](https://github.com/wingertge/ambientika-py/issues/8) for tracking. Building from source therefore requires `git` to be available inside the build environment (already handled in the provided `Dockerfiles`).
+The bridge installs [`ambientika_py`](https://github.com/wingertge/ambientika-py) from PyPI (`ambientika_py>=0.0.6`). Release 0.0.6 contains the `LightSensorLevel` enum the bridge requires; the earlier 0.0.5 did not, so previous builds pinned the library to an upstream Git commit as a temporary workaround (see [#3](https://github.com/ambientika-eu/ambientika-mqtt-bridge/issues/3) and [wingertge/ambientika-py#8](https://github.com/wingertge/ambientika-py/issues/8)). That is no longer necessary.
 
 ---
 
