@@ -83,6 +83,7 @@ class FakeDevice:
         self.role = "Slave"
         self._status = status or mkstatus()
         self.mode_calls = []
+        self.reset_calls = 0
 
     async def status(self):
         return Success(dict(self._status))
@@ -92,6 +93,10 @@ class FakeDevice:
         self._status["operating_mode"] = mode["operating_mode"]
         self._status["fan_speed"] = mode["fan_speed"]
         self._status["humidity_level"] = mode["humidity_level"]
+        return Success(None)
+
+    async def reset_filter(self):
+        self.reset_calls += 1
         return Success(None)
 
 
@@ -111,6 +116,9 @@ def test_discovery():
     mode_sel = next((p for t, p in ents if t.endswith("AMB-2_operating_mode/config") and "/select/" in t), None)
     check("discovery: operating_mode select has all modes",
           mode_sel and mode_sel["options"] == [m.name for m in OM], mode_sel and len(mode_sel["options"]))
+    btn = next((p for t, p in ents if t.endswith("AMB-2_reset_filter/config") and "/button/" in t), None)
+    check("discovery: reset_filter button present + command_topic",
+          bool(btn) and btn["command_topic"].endswith("/AMB-2/set/reset_filter"), btn)
 
 
 def test_dewpoint():
@@ -209,6 +217,14 @@ async def test_command():
     check("command: fan_speed=High -> change_mode", dev.mode_calls[-1]["fan_speed"] == FS.High)
     await b._handle_command("AMB-2", "operating_mode", "Bogus")  # invalid -> no crash
     check("command: invalid value does not crash", True)
+    # Filter-Reset: ruft device.reset_filter(), unabhaengig vom Filterzustand,
+    # und loest KEINEN change_mode aus.
+    n_modes = len(dev.mode_calls)
+    await b._handle_command("AMB-2", "reset_filter", "PRESS")
+    check("command: reset_filter -> device.reset_filter()", dev.reset_calls == 1, dev.reset_calls)
+    await b._handle_command("AMB-2", "reset_filter", "anything")  # Payload egal
+    check("command: reset_filter erneut (Payload beliebig)", dev.reset_calls == 2, dev.reset_calls)
+    check("command: reset_filter loest keinen change_mode aus", len(dev.mode_calls) == n_modes, len(dev.mode_calls))
 
 
 async def _async_suite():
