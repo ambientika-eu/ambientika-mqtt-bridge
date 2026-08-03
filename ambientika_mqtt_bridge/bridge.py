@@ -9,7 +9,7 @@ Loxone and Node-RED (any MQTT-capable system).
 Built on top of the community library 'ambientika_py' by wingertge.
 
 ========================================================================
-NeuraCell-X(R) intelligent control  (v1.4.0)
+NeuraCell-X(R) intelligent control  (v1.4.1)
 ========================================================================
 Two coupled protections with a strict priority order:
 
@@ -1511,7 +1511,7 @@ def main() -> None:
         level=getattr(logging, str(cfg.log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)-7s %(message)s",
     )
-    log.info("=== Ambientika MQTT Bridge  v1.4.0 (NeuraCell-X: radon + dew point)  starting ===")
+    log.info("=== Ambientika MQTT Bridge  v1.4.1 (NeuraCell-X: radon + dew point)  starting ===")
     log.info("API host      : %s", cfg.host)
     log.info("MQTT broker   : %s:%s", cfg.mqtt_host, cfg.mqtt_port)
     log.info("Topic prefix  : %s", cfg.topic_prefix)
