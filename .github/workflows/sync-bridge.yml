@@ -1,0 +1,103 @@
+# Keeps the single source of truth for bridge.py in sync everywhere.
+#
+# Canonical file:  ambientika_mqtt_bridge/bridge.py  (edit ONLY this one)
+# On every push to main that changes it, this workflow:
+#   1. copies it onto the two in-repo duplicates (./bridge.py and
+#      ha-addon/bridge.py) and commits them back to main, and
+#   2. opens a pull request in ambientika-eu/ambientika-ha-addon that updates
+#      its ambientika_mqtt_bridge/bridge.py to match.
+#
+# One-time setup for the cross-repo part (must be done by a maintainer):
+# Create a fine-grained Personal Access Token with, on the ambientika-ha-addon
+# repo, Contents: Read and write + Pull requests: Read and write. Add it to THIS
+# repo under Settings > Secrets and variables > Actions as a secret named
+# ADDON_SYNC_TOKEN. Until that secret exists the in-repo sync still runs; only
+# the cross-repo PR step is skipped (with a notice in the run log).
+
+name: Sync bridge.py
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ambientika_mqtt_bridge/bridge.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-bridge
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      SRC: ambientika_mqtt_bridge/bridge.py
+      ADDON_REPO: ambientika-eu/ambientika-ha-addon
+      ADDON_DEST: ambientika_mqtt_bridge/bridge.py
+      ADDON_SYNC_TOKEN: ${{ secrets.ADDON_SYNC_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # A broken canonical file must never be propagated.
+      - name: Sanity-check canonical bridge.py
+        run: python3 -m py_compile "$SRC"
+
+      # ---- 1) In-repo duplicates: root + ha-addon/ ----
+      - name: Sync in-repo copies
+        id: local
+        run: |
+          set -euo pipefail
+          changed=0
+          for dest in bridge.py ha-addon/bridge.py; do
+            if [ -f "$dest" ] && ! cmp -s "$SRC" "$dest"; then
+              cp "$SRC" "$dest"
+              changed=1
+              echo "updated $dest"
+            fi
+          done
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      - name: Commit in-repo copies
+        if: steps.local.outputs.changed == '1'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bridge.py ha-addon/bridge.py
+          git commit -m "chore: sync bridge.py copies from ${SRC} [skip ci]"
+          git push
+
+      # ---- 2) Cross-repo: open a review PR in the add-on repo ----
+      - name: Sync to add-on repo (opens a PR)
+        if: env.ADDON_SYNC_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ secrets.ADDON_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${ADDON_REPO}.git" "$tmp"
+          if cmp -s "$SRC" "$tmp/$ADDON_DEST"; then
+            echo "Add-on copy already up to date; nothing to do."
+            exit 0
+          fi
+          cp "$SRC" "$tmp/$ADDON_DEST"
+          cd "$tmp"
+          branch="sync/bridge-${GITHUB_SHA::7}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add "$ADDON_DEST"
+          git commit -m "chore: sync bridge.py from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}"
+          git push -u origin "$branch"
+          gh pr create --repo "$ADDON_REPO" --head "$branch" --base main \
+            --title "chore: sync bridge.py from ambientika-mqtt-bridge" \
+            --body "Automated sync of the canonical bridge.py from ${GITHUB_REPOSITORY}@${GITHUB_SHA}. Review the diff before merging." \
+            || echo "A pull request for $branch may already exist."
+
+      - name: Note when cross-repo sync is not configured
+        if: env.ADDON_SYNC_TOKEN == ''
+        run: |
+          echo "::notice::In-repo copies are in sync. Cross-repo sync to ${ADDON_REPO} was skipped because the ADDON_SYNC_TOKEN secret is not set."
