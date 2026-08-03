@@ -71,6 +71,11 @@ log = logging.getLogger("ambientika_bridge")
 # at build time (see Dockerfile). Unset -> the banner omits the version.
 _BRIDGE_VERSION = os.environ.get("BRIDGE_VERSION", "").strip()
 
+# Seconds to wait after a filter-reset call before re-reading the status to
+# verify the counter actually changed (the cloud acknowledges the call either
+# way). Overridable in tests.
+FILTER_RESET_VERIFY_DELAY = 10.0
+
 # ---------------------------------------------------------------------------
 # ambientika_py enum compatibility  (issue #5)
 # ---------------------------------------------------------------------------
@@ -1080,6 +1085,60 @@ class AmbientikaBridge:
             log.info("Device %s is answering again.", serial)
 
     # ----- device helpers -----
+    async def _reset_filter(self, device) -> bool:
+        """Reset the filter counter and verify it actually changed.
+
+        The Ambientika cloud acknowledges the reset call with HTTP 200 but does
+        not clear the counter (confirmed in the field for master and slave,
+        yellow and red). The working change-mode call uses POST, so we send the
+        reset as POST first and fall back to the library GET, then re-read the
+        real status and report whether the counter truly went back - instead of
+        trusting the acknowledgement (which made the old "reset_filter OK" log
+        misleading).
+        """
+        serial = device.serial_number
+        before = await self.read_status(device)
+        before_fs = before.get("filters_status") if before else None
+
+        async def _send(label, awaitable) -> bool:
+            try:
+                res = await awaitable
+            except Exception as e:
+                log.warning("filter reset via %s raised for %s: %s", label, serial, e)
+                return False
+            if isinstance(res, Failure):
+                log.warning("filter reset via %s not accepted for %s: %s", label, serial, res)
+                return False
+            log.info("filter reset via %s acknowledged for %s", label, serial)
+            return True
+
+        # 1) POST device/reset-filter (the server may only act on POST, like
+        #    device/change-mode). 2) fall back to the library's GET call.
+        api = getattr(device, "api", None)
+        accepted = False
+        if api is not None:
+            accepted = await _send("POST", api.post(
+                "device/reset-filter", {"deviceSerialNumber": serial}))
+        if not accepted:
+            accepted = await _send("GET", device.reset_filter())
+        if not accepted:
+            log.error("filter reset for %s: no reset call was accepted by the API", serial)
+            return False
+
+        # Verify against the real status instead of the acknowledgement.
+        await asyncio.sleep(FILTER_RESET_VERIFY_DELAY)
+        after = await self.read_status(device)
+        after_fs = after.get("filters_status") if after else None
+        if before_fs is not None and after_fs is not None and after_fs != before_fs:
+            log.info("filter reset CONFIRMED for %s: filters_status %s -> %s",
+                     serial, before_fs, after_fs)
+            return True
+        log.warning("filter reset for %s: filters_status still %r about %.0fs after the "
+                    "call - the cloud acknowledged the request but did not clear the "
+                    "counter (it may still change on a later poll)",
+                    serial, after_fs, FILTER_RESET_VERIFY_DELAY)
+        return False
+
     async def read_status(self, device: Device) -> Optional[dict]:
         try:
             res = await device.status()
@@ -1217,20 +1276,13 @@ class AmbientikaBridge:
             log.warning("Unknown device serial: %s", serial)
             return
 
-        # Filter-Reset: eigener, ZUSTANDSUNABHAENGIGER Befehl (Cloud-Endpunkt
-        # device/reset-filter je Seriennummer). Funktioniert bei gruen/gelb/rot -
-        # anders als der App-Button, der erst bei Rot erscheint. Kein Enum, keine
-        # NeuraCell-Zurueckstellung (setzt nur den Filteralarm/-zaehler zurueck).
+        # Filter-Reset: sendet den Reset an die Cloud (POST device/reset-filter,
+        # Rueckfall auf den bisherigen GET) und prueft danach den echten
+        # Filterstatus nach, statt die HTTP-Quittung als Erfolg zu werten. Der
+        # Server quittiert den Aufruf zwar, raeumt den Zaehler aber nicht immer -
+        # deshalb die Verifikation (siehe _reset_filter).
         if attr == "reset_filter":
-            try:
-                res = await device.reset_filter()
-            except Exception as e:
-                log.exception("reset_filter raised for %s: %s", serial, e)
-                return
-            if isinstance(res, Failure):
-                log.error("reset_filter failed for %s: %s", serial, res)
-            else:
-                log.info("reset_filter OK for %s", serial)
+            await self._reset_filter(device)
             return
 
         # Parse the target attribute first - this needs no live status, so a
