@@ -9,7 +9,7 @@ Loxone and Node-RED (any MQTT-capable system).
 Built on top of the community library 'ambientika_py' by wingertge.
 
 ========================================================================
-NeuraCell-X(R) intelligent control  (v1.4.1)
+NeuraCell-X(R) intelligent control
 ========================================================================
 Two coupled protections with a strict priority order:
 
@@ -64,6 +64,12 @@ except ImportError as exc:
     sys.exit(1)
 
 log = logging.getLogger("ambientika_bridge")
+
+# Version shown in the startup banner. Read from the environment so this file
+# stays byte-identical across all copies/repos (single source of truth); each
+# Home Assistant add-on injects its own config.yaml version via BRIDGE_VERSION
+# at build time (see Dockerfile). Unset -> the banner omits the version.
+_BRIDGE_VERSION = os.environ.get("BRIDGE_VERSION", "").strip()
 
 # ---------------------------------------------------------------------------
 # ambientika_py enum compatibility  (issue #5)
@@ -1511,7 +1517,8 @@ def main() -> None:
         level=getattr(logging, str(cfg.log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)-7s %(message)s",
     )
-    log.info("=== Ambientika MQTT Bridge  v1.4.1 (NeuraCell-X: radon + dew point)  starting ===")
+    _banner = ("Ambientika MQTT Bridge v%s" % _BRIDGE_VERSION) if _BRIDGE_VERSION else "Ambientika MQTT Bridge"
+    log.info("=== %s (NeuraCell-X: radon + dew point)  starting ===", _banner)
     log.info("API host      : %s", cfg.host)
     log.info("MQTT broker   : %s:%s", cfg.mqtt_host, cfg.mqtt_port)
     log.info("Topic prefix  : %s", cfg.topic_prefix)
