@@ -19,6 +19,9 @@ bridge:
   discovery_prefix: "homeassistant"
   enable_discovery: true
   poll_interval: 30
+  # Consecutive failed polls before a device is flagged offline in MQTT.
+  # 1 = flag offline on the first miss (old behaviour).
+  availability_failure_threshold: 3
   log_level: "INFO"
 
 # --- NeuraCell-X radon protection ---
