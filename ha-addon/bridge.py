@@ -508,6 +508,22 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
         }
         entities.append((f"{base}/select/{serial}_{key}/config", p))
 
+    # Button: Filter-Reset. Setzt den Filteralarm/-zaehler ueber den
+    # Cloud-Endpunkt zurueck - auch schon bei "gelb" (verschmutzt), also bevor
+    # der App-eigene Reset-Button (erst bei "rot") erscheint.
+    entities.append((
+        f"{base}/button/{serial}_reset_filter/config",
+        {
+            "name": "Filter zuruecksetzen",
+            "unique_id": f"ambientika_{serial}_reset_filter",
+            "command_topic": cmd_topic(prefix, serial, "reset_filter"),
+            "payload_press": "PRESS",
+            "availability_topic": avail,
+            "device": device_info,
+            "icon": "mdi:air-filter",
+        },
+    ))
+
     return entities
 
 
@@ -990,6 +1006,22 @@ class AmbientikaBridge:
         device = self.devices.get(serial)
         if device is None:
             log.warning("Unknown device serial: %s", serial)
+            return
+
+        # Filter-Reset: eigener, ZUSTANDSUNABHAENGIGER Befehl (Cloud-Endpunkt
+        # device/reset-filter je Seriennummer). Funktioniert bei gruen/gelb/rot -
+        # anders als der App-Button, der erst bei Rot erscheint. Kein Enum, keine
+        # NeuraCell-Zurueckstellung (setzt nur den Filteralarm/-zaehler zurueck).
+        if attr == "reset_filter":
+            try:
+                res = await device.reset_filter()
+            except Exception as e:
+                log.exception("reset_filter raised for %s: %s", serial, e)
+                return
+            if isinstance(res, Failure):
+                log.error("reset_filter failed for %s: %s", serial, res)
+            else:
+                log.info("reset_filter OK for %s", serial)
             return
 
         # Parse the target attribute first - this needs no live status, so a
