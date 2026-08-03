@@ -1,4 +1,4 @@
-ambientika_py @ git+https://github.com/wingertge/ambientika-py.git@29c857d
+ambientika_py>=0.0.6
 paho-mqtt>=1.6.1,<2.0
 pyyaml>=6.0
 aiohttp>=3.9.0
