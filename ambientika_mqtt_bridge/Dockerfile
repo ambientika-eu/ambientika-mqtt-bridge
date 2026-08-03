@@ -5,6 +5,7 @@ FROM $BUILD_FROM
 # to LABEL and other instructions after FROM (Docker scoping rule).
 ARG BUILD_ARCH
 ARG BUILD_VERSION
+ENV BRIDGE_VERSION=${BUILD_VERSION}
 
 LABEL \
     io.hass.name="Ambientika MQTT Bridge" \
