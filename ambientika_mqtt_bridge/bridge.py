@@ -77,6 +77,30 @@ _BRIDGE_VERSION = os.environ.get("BRIDGE_VERSION", "").strip()
 # way). Overridable in tests.
 FILTER_RESET_VERIFY_DELAY = 10.0
 
+# Filter-reset endpoint discovery.
+# device/reset-filter GET returns HTTP 200 but never clears the counter, and the
+# server allows only GET there (confirmed in the field). The official Ambientika
+# app resets successfully over the SAME REST API (port 4521), so a working call
+# exists at a different path and/or parameter shape. On a reset request we walk a
+# short list of filter-scoped variants and, after each acknowledged (2xx) call,
+# re-read the real status; the first variant that actually clears the counter
+# wins and is remembered for next time. Safety: only URLs whose path name is
+# about the *filter* are ever contacted - never a device/config/factory reset -
+# and DELETE is never sent.
+#
+# Alternative paths to the known-dead "device/reset-filter" (all filter-scoped).
+_FILTER_RESET_ALT_PATHS = (
+    "device/reset-filters",
+    "device/filter-reset",
+    "device/resetfilter",
+    "device/reset-filter-alarm",
+    "device/reset-filter-status",
+    "device/filter/reset",
+)
+# Cap on how many acknowledged calls we verify (each verify waits
+# FILTER_RESET_VERIFY_DELAY seconds), so a reset press can never run away.
+FILTER_RESET_MAX_VERIFIES = 8
+
 # ---------------------------------------------------------------------------
 # ambientika_py enum compatibility  (issue #5)
 # ---------------------------------------------------------------------------
@@ -1086,108 +1110,158 @@ class AmbientikaBridge:
             log.info("Device %s is answering again.", serial)
 
     # ----- device helpers -----
-    async def _reset_request(self, device, method):
-        """Send one raw filter-reset request; return (status_code, allow_header).
+    async def _reset_request(self, device, method, path, params):
+        """Send one raw filter-reset request; return (status, allow_header, body).
 
-        Raw on purpose: the library hides the response, but a 405 answer carries
-        an "Allow" header naming the methods the endpoint accepts. Returns
-        (None, None) on a transport error or unknown method. DELETE is never sent.
+        Raw on purpose: the library hides the response, but the status code, the
+        "Allow" header of a 405 and a short body snippet are exactly what we need
+        to discover which call the server actually honours. Returns
+        (None, None, None) on a transport error or unknown method. DELETE is
+        never sent, and only filter-scoped paths are ever passed in.
         """
         api = getattr(device, "api", None)
         if api is None:
-            return (None, None)
-        url = f"{api.host}/device/reset-filter"
+            return (None, None, None)
+        url = f"{api.host}/{path}"
         headers = {"Authorization": f"Bearer {api.token}"}
-        body = {"deviceSerialNumber": device.serial_number}
         m = method.upper()
         try:
             async with aiohttp.ClientSession() as sess:
                 if m == "GET":
-                    cm = sess.get(url, headers=headers, params=body)
+                    cm = sess.get(url, headers=headers, params=params)
                 elif m == "POST":
-                    cm = sess.post(url, headers=headers, json=body)
+                    cm = sess.post(url, headers=headers, json=params)
                 elif m == "PUT":
-                    cm = sess.put(url, headers=headers, json=body)
+                    cm = sess.put(url, headers=headers, json=params)
                 elif m == "PATCH":
-                    cm = sess.patch(url, headers=headers, json=body)
+                    cm = sess.patch(url, headers=headers, json=params)
                 else:
-                    return (None, None)
+                    return (None, None, None)
                 async with cm as r:
-                    return (r.status, r.headers.get("Allow"))
+                    try:
+                        body = (await r.text())[:120]
+                    except Exception:
+                        body = ""
+                    return (r.status, r.headers.get("Allow"), body)
         except Exception as e:
-            log.warning("filter reset request via %s raised for %s: %s",
-                        m, device.serial_number, e)
-            return (None, None)
+            log.warning("filter reset request %s %s raised for %s: %s",
+                        m, path, device.serial_number, e)
+            return (None, None, None)
+
+    def _reset_candidates(self, device):
+        """Build the ordered (method, path, params, label) list to probe.
+
+        Best guesses first (the app uses a different path or parameter shape),
+        the known-dead device/reset-filter GET last as a baseline. Every path is
+        filter-scoped, so nothing here can touch device config or trigger a
+        factory reset.
+        """
+        serial = device.serial_number
+        dev_id = getattr(device, "id", None)
+        cands = []
+        # 1) Alternative filter-reset paths, GET with the standard serial param.
+        for p in _FILTER_RESET_ALT_PATHS:
+            cands.append(("GET", p, {"deviceSerialNumber": serial}, f"alt-path {p}"))
+        # 2) Same known path, GET, but parameter shapes the app might use instead.
+        cands.append(("GET", "device/reset-filter", {"serialNumber": serial},
+                      "reset-filter serialNumber"))
+        cands.append(("GET", "device/reset-filter", {"serial": serial},
+                      "reset-filter serial"))
+        if dev_id is not None:
+            cands.append(("GET", "device/reset-filter", {"deviceId": dev_id},
+                          "reset-filter deviceId"))
+            cands.append(("GET", "device/reset-filter",
+                          {"deviceSerialNumber": serial, "deviceId": dev_id},
+                          "reset-filter serial+deviceId"))
+        # 3) Baseline: the current library call (known HTTP 200 no-op) - kept last
+        #    so the log always ends with it for reference.
+        cands.append(("GET", "device/reset-filter", {"deviceSerialNumber": serial},
+                      "reset-filter baseline"))
+        return cands
 
     async def _reset_filter(self, device) -> bool:
-        """Reset the filter counter, discover the server's accepted method, verify.
+        """Reset the filter counter by discovering the call the server honours.
 
-        device/reset-filter rejects POST with HTTP 405 and only acknowledges GET
-        without clearing the counter (confirmed in the field). We read the
-        "Allow" header the 405 carries, then try exactly the methods the server
-        advertises (never DELETE), re-read the real status after each and report
-        whether the counter truly changed instead of trusting the ack.
+        device/reset-filter GET is a confirmed no-op and the server allows only
+        GET there. The official app resets over the same REST API, so a working
+        variant exists. We walk _reset_candidates(); after every acknowledged
+        (2xx) call we re-read the real filter status and keep the first variant
+        that truly changes it. A 405 that advertises other methods in its "Allow"
+        header makes us retry that same path with those methods (never DELETE).
+        Nothing but filter-reset paths is ever contacted.
         """
         serial = device.serial_number
         before = await self.read_status(device)
         before_fs = before.get("filters_status") if before else None
-        tried = []
-        allow = None
+        if before_fs is not None and str(before_fs).lower() not in ("bad", "red"):
+            log.info("filter reset for %s: filter status is %r (not Bad/red); a "
+                     "successful reset may not be observable until the filter is due",
+                     serial, before_fs)
+        seen = set()
+        verifies = [0]
 
         async def _verify(label) -> bool:
             await asyncio.sleep(FILTER_RESET_VERIFY_DELAY)
             after = await self.read_status(device)
             after_fs = after.get("filters_status") if after else None
             if before_fs is not None and after_fs is not None and after_fs != before_fs:
-                log.info("filter reset CONFIRMED via %s for %s: filters_status %s -> %s",
+                log.info("filter reset CONFIRMED via [%s] for %s: filters_status %s -> %s",
                          label, serial, before_fs, after_fs)
                 return True
-            log.warning("filter reset via %s for %s: filters_status still %r about %.0fs "
-                        "after the call - acknowledged but counter unchanged",
+            log.warning("filter reset via [%s] for %s: filters_status still %r about "
+                        "%.0fs after the call - acknowledged but counter unchanged",
                         label, serial, after_fs, FILTER_RESET_VERIFY_DELAY)
             return False
 
-        async def _attempt(method) -> bool:
-            nonlocal allow
+        async def _attempt(method, path, params, label) -> bool:
             m = method.upper()
-            if m in tried or m == "DELETE":
+            if m == "DELETE":
                 return False
-            tried.append(m)
-            status, allow_hdr = await self._reset_request(device, m)
-            if allow_hdr and allow is None:
-                allow = allow_hdr
-                log.info("filter reset: endpoint device/reset-filter reports Allow: %s",
-                         allow_hdr)
+            key = (m, path, tuple(sorted(params.items())))
+            if key in seen:
+                return False
+            seen.add(key)
+            status, allow_hdr, body = await self._reset_request(device, m, path, params)
             if status is None:
                 return False
+            keys = "+".join(params.keys())
             if status == 405:
-                log.info("filter reset via %s not allowed (HTTP 405) for %s", m, serial)
+                log.info("filter reset probe [%s]: %s %s (%s) -> HTTP 405, Allow: %s",
+                         label, m, path, keys, allow_hdr)
+                if allow_hdr:
+                    for am in (x.strip().upper() for x in allow_hdr.split(",")):
+                        if (am in ("PUT", "PATCH", "POST")
+                                and verifies[0] < FILTER_RESET_MAX_VERIFIES
+                                and await _attempt(am, path, params, f"{label} via {am}")):
+                            return True
+                return False
+            if status == 404:
+                log.info("filter reset probe [%s]: %s %s (%s) -> HTTP 404 (no such route)",
+                         label, m, path, keys)
                 return False
             if status >= 400:
-                log.warning("filter reset via %s -> HTTP %s for %s", m, status, serial)
+                log.info("filter reset probe [%s]: %s %s (%s) -> HTTP %s %s",
+                         label, m, path, keys, status, (body or "").strip())
                 return False
-            log.info("filter reset via %s acknowledged (HTTP %s) for %s", m, status, serial)
-            return await _verify(m)
+            # 2xx: the call was accepted. Trust nothing - verify the counter.
+            if verifies[0] >= FILTER_RESET_MAX_VERIFIES:
+                log.warning("filter reset [%s]: %s %s (%s) -> HTTP %s but verify budget "
+                            "exhausted", label, m, path, keys, status)
+                return False
+            verifies[0] += 1
+            log.info("filter reset probe [%s]: %s %s (%s) -> HTTP %s (accepted, verifying)",
+                     label, m, path, keys, status)
+            return await _verify(label)
 
-        # 1) POST to reproduce the 405 and read the Allow header the server advertises.
-        if await _attempt("POST"):
-            return True
-        # 2) Try exactly the methods the server named in Allow (safe ones, never DELETE).
-        if allow:
-            for m in (x.strip().upper() for x in allow.split(",")):
-                if m in ("PUT", "PATCH", "POST", "GET") and await _attempt(m):
-                    return True
-        # 3) No usable hint from the server: probe the common safe write methods.
-        else:
-            for m in ("PUT", "PATCH"):
-                if await _attempt(m):
-                    return True
-        # 4) Last resort: the GET path (known no-op, but harmless).
-        if await _attempt("GET"):
-            return True
+        for method, path, params, label in self._reset_candidates(device):
+            if verifies[0] >= FILTER_RESET_MAX_VERIFIES:
+                break
+            if await _attempt(method, path, params, label):
+                return True
 
-        log.error("filter reset for %s: no accepted method cleared the counter "
-                  "(server Allow: %r)", serial, allow)
+        log.error("filter reset for %s: none of the tried filter-reset variants cleared "
+                  "the counter - see the probe lines above for the server's answers",
+                  serial)
         return False
 
     async def read_status(self, device: Device) -> Optional[dict]:
@@ -1327,11 +1401,13 @@ class AmbientikaBridge:
             log.warning("Unknown device serial: %s", serial)
             return
 
-        # Filter-Reset: sendet den Reset an die Cloud (POST device/reset-filter,
-        # Rueckfall auf den bisherigen GET) und prueft danach den echten
-        # Filterstatus nach, statt die HTTP-Quittung als Erfolg zu werten. Der
-        # Server quittiert den Aufruf zwar, raeumt den Zaehler aber nicht immer -
-        # deshalb die Verifikation (siehe _reset_filter).
+        # Filter-Reset: device/reset-filter GET quittiert zwar mit 200, raeumt den
+        # Zaehler aber nie (im Feld bestaetigt). Die offizielle App setzt ueber
+        # dieselbe REST-API zurueck - es gibt also einen funktionierenden Aufruf an
+        # einem anderen Pfad/Parameter. _reset_filter probiert eine kurze Liste
+        # filter-bezogener Varianten durch und prueft nach jeder den echten
+        # Filterstatus nach, statt der HTTP-Quittung zu trauen (siehe
+        # _reset_filter / _reset_candidates).
         if attr == "reset_filter":
             await self._reset_filter(device)
             return
