@@ -44,6 +44,7 @@ from typing import Any, Optional
 
 import paho.mqtt.client as mqtt
 import yaml
+import aiohttp
 
 try:
     from ambientika_py import (
@@ -1085,58 +1086,108 @@ class AmbientikaBridge:
             log.info("Device %s is answering again.", serial)
 
     # ----- device helpers -----
-    async def _reset_filter(self, device) -> bool:
-        """Reset the filter counter and verify it actually changed.
+    async def _reset_request(self, device, method):
+        """Send one raw filter-reset request; return (status_code, allow_header).
 
-        The Ambientika cloud acknowledges the reset call with HTTP 200 but does
-        not clear the counter (confirmed in the field for master and slave,
-        yellow and red). The working change-mode call uses POST, so we send the
-        reset as POST first and fall back to the library GET, then re-read the
-        real status and report whether the counter truly went back - instead of
-        trusting the acknowledgement (which made the old "reset_filter OK" log
-        misleading).
+        Raw on purpose: the library hides the response, but a 405 answer carries
+        an "Allow" header naming the methods the endpoint accepts. Returns
+        (None, None) on a transport error or unknown method. DELETE is never sent.
+        """
+        api = getattr(device, "api", None)
+        if api is None:
+            return (None, None)
+        url = f"{api.host}/device/reset-filter"
+        headers = {"Authorization": f"Bearer {api.token}"}
+        body = {"deviceSerialNumber": device.serial_number}
+        m = method.upper()
+        try:
+            async with aiohttp.ClientSession() as sess:
+                if m == "GET":
+                    cm = sess.get(url, headers=headers, params=body)
+                elif m == "POST":
+                    cm = sess.post(url, headers=headers, json=body)
+                elif m == "PUT":
+                    cm = sess.put(url, headers=headers, json=body)
+                elif m == "PATCH":
+                    cm = sess.patch(url, headers=headers, json=body)
+                else:
+                    return (None, None)
+                async with cm as r:
+                    return (r.status, r.headers.get("Allow"))
+        except Exception as e:
+            log.warning("filter reset request via %s raised for %s: %s",
+                        m, device.serial_number, e)
+            return (None, None)
+
+    async def _reset_filter(self, device) -> bool:
+        """Reset the filter counter, discover the server's accepted method, verify.
+
+        device/reset-filter rejects POST with HTTP 405 and only acknowledges GET
+        without clearing the counter (confirmed in the field). We read the
+        "Allow" header the 405 carries, then try exactly the methods the server
+        advertises (never DELETE), re-read the real status after each and report
+        whether the counter truly changed instead of trusting the ack.
         """
         serial = device.serial_number
         before = await self.read_status(device)
         before_fs = before.get("filters_status") if before else None
+        tried = []
+        allow = None
 
-        async def _send(label, awaitable) -> bool:
-            try:
-                res = await awaitable
-            except Exception as e:
-                log.warning("filter reset via %s raised for %s: %s", label, serial, e)
-                return False
-            if isinstance(res, Failure):
-                log.warning("filter reset via %s not accepted for %s: %s", label, serial, res)
-                return False
-            log.info("filter reset via %s acknowledged for %s", label, serial)
-            return True
-
-        # 1) POST device/reset-filter (the server may only act on POST, like
-        #    device/change-mode). 2) fall back to the library's GET call.
-        api = getattr(device, "api", None)
-        accepted = False
-        if api is not None:
-            accepted = await _send("POST", api.post(
-                "device/reset-filter", {"deviceSerialNumber": serial}))
-        if not accepted:
-            accepted = await _send("GET", device.reset_filter())
-        if not accepted:
-            log.error("filter reset for %s: no reset call was accepted by the API", serial)
+        async def _verify(label) -> bool:
+            await asyncio.sleep(FILTER_RESET_VERIFY_DELAY)
+            after = await self.read_status(device)
+            after_fs = after.get("filters_status") if after else None
+            if before_fs is not None and after_fs is not None and after_fs != before_fs:
+                log.info("filter reset CONFIRMED via %s for %s: filters_status %s -> %s",
+                         label, serial, before_fs, after_fs)
+                return True
+            log.warning("filter reset via %s for %s: filters_status still %r about %.0fs "
+                        "after the call - acknowledged but counter unchanged",
+                        label, serial, after_fs, FILTER_RESET_VERIFY_DELAY)
             return False
 
-        # Verify against the real status instead of the acknowledgement.
-        await asyncio.sleep(FILTER_RESET_VERIFY_DELAY)
-        after = await self.read_status(device)
-        after_fs = after.get("filters_status") if after else None
-        if before_fs is not None and after_fs is not None and after_fs != before_fs:
-            log.info("filter reset CONFIRMED for %s: filters_status %s -> %s",
-                     serial, before_fs, after_fs)
+        async def _attempt(method) -> bool:
+            nonlocal allow
+            m = method.upper()
+            if m in tried or m == "DELETE":
+                return False
+            tried.append(m)
+            status, allow_hdr = await self._reset_request(device, m)
+            if allow_hdr and allow is None:
+                allow = allow_hdr
+                log.info("filter reset: endpoint device/reset-filter reports Allow: %s",
+                         allow_hdr)
+            if status is None:
+                return False
+            if status == 405:
+                log.info("filter reset via %s not allowed (HTTP 405) for %s", m, serial)
+                return False
+            if status >= 400:
+                log.warning("filter reset via %s -> HTTP %s for %s", m, status, serial)
+                return False
+            log.info("filter reset via %s acknowledged (HTTP %s) for %s", m, status, serial)
+            return await _verify(m)
+
+        # 1) POST to reproduce the 405 and read the Allow header the server advertises.
+        if await _attempt("POST"):
             return True
-        log.warning("filter reset for %s: filters_status still %r about %.0fs after the "
-                    "call - the cloud acknowledged the request but did not clear the "
-                    "counter (it may still change on a later poll)",
-                    serial, after_fs, FILTER_RESET_VERIFY_DELAY)
+        # 2) Try exactly the methods the server named in Allow (safe ones, never DELETE).
+        if allow:
+            for m in (x.strip().upper() for x in allow.split(",")):
+                if m in ("PUT", "PATCH", "POST", "GET") and await _attempt(m):
+                    return True
+        # 3) No usable hint from the server: probe the common safe write methods.
+        else:
+            for m in ("PUT", "PATCH"):
+                if await _attempt(m):
+                    return True
+        # 4) Last resort: the GET path (known no-op, but harmless).
+        if await _attempt("GET"):
+            return True
+
+        log.error("filter reset for %s: no accepted method cleared the counter "
+                  "(server Allow: %r)", serial, allow)
         return False
 
     async def read_status(self, device: Device) -> Optional[dict]:
