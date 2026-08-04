@@ -1,20 +1,17 @@
-"""Tests for the change-mode based filter reset (bridge.py).
+"""Tests for the device+zone-Master filter reset (bridge.py).
 
-Insight from the Advanced+ RS485 protocol: the filter reset is a flag on the
-control message, not a dedicated endpoint. Its cloud form is POST
-device/change-mode, so _reset_filter re-sends the device's CURRENT mode
-(unchanged) with a filter-reset field added and keeps the first variant that
-actually clears the counter. These tests drive that walk with a scripted
-_reset_request and assert both correctness and safety: the running mode is never
-altered, only change-mode/reset-filter are contacted, and DELETE is never sent."""
+The official cloud API documents exactly one filter reset:
+GET device/reset-filter?deviceSerialNumber=... . Per the RS485 protocol the
+MASTER of a coupled group applies it, so _reset_filter sends that documented GET
+to the target device and, if the target is a Slave, to the Master of its zone;
+it keeps the first that actually clears the counter. These tests drive that walk
+with a scripted _reset_request and assert both correctness and safety: only
+device/reset-filter is ever contacted and DELETE is never sent."""
 import asyncio
 import bridge
 from returns.result import Success, Failure
 
 bridge.FILTER_RESET_VERIFY_DELAY = 0  # no real wait in tests
-
-OM, FS, HL, LL = (bridge.OperatingMode, bridge.FanSpeed,
-                  bridge.HumidityLevel, bridge.LightSensorLevel)
 
 PASS, FAIL = [], []
 def check(name, cond):
@@ -23,101 +20,99 @@ def check(name, cond):
 
 
 class Dev:
-    """Device whose status reports a fixed current mode + a filters_status queue."""
-    def __init__(self, statuses, ok=True):
-        self.serial_number = "D1"
-        self.id = 7
+    def __init__(self, serial, statuses=None, role="SlaveEqualMaster", zone=1, ok=True):
+        self.serial_number = serial
+        self.id = 1
+        self.role = role
+        self.zone_index = zone
         self.api = object()
-        self._st = list(statuses)
-        self._ok = ok  # False -> status() fails, so the mode is unreadable
+        self._st = list(statuses or ["Bad"])
+        self._ok = ok
 
     async def status(self):
         if not self._ok:
             return Failure({"status_code": 500, "data": "boom"})
         fs = self._st.pop(0) if len(self._st) > 1 else self._st[0]
         return Success({
-            "operating_mode": OM.Night,
-            "fan_speed": FS.Medium,
-            "humidity_level": HL.Normal,
-            "light_sensor_level": LL.Off,
+            "operating_mode": bridge.OperatingMode.Night,
+            "fan_speed": bridge.FanSpeed.Medium,
+            "humidity_level": bridge.HumidityLevel.Normal,
+            "light_sensor_level": bridge.LightSensorLevel.Off,
             "filters_status": fs,
         })
 
 
-def run(script, statuses, ok=True):
-    """script maps (METHOD, path) -> (status, allow, body). Unlisted -> 404.
-    Captures every (method, path, body) the walk sends."""
+def run(target, statuses, others=(), script=None, ok=True):
+    """target=Dev under test; others=extra devices in the house (e.g. the Master).
+    script maps a serial -> (status, allow, body) for its reset-filter GET;
+    default 200. Captures every (method, path, serial) sent."""
     b = bridge.AmbientikaBridge(bridge.BridgeConfig())
+    target._st = list(statuses)
+    target._ok = ok
+    b.devices = {target.serial_number: target}
+    for o in others:
+        b.devices[o.serial_number] = o
     sent = []
 
     async def fake(self, device, method, path, body):
-        sent.append((method.upper(), path, dict(body)))
-        return script.get((method.upper(), path), (404, None, ""))
+        ser = body.get("deviceSerialNumber")
+        sent.append((method.upper(), path, ser))
+        return (script or {}).get(ser, (200, None, ""))
 
     b._reset_request = fake.__get__(b, bridge.AmbientikaBridge)
-    r = asyncio.run(b._reset_filter(Dev(statuses, ok)))
+    r = asyncio.run(b._reset_filter(target))
     return r, sent
 
 
-def only_allowed_paths(sent):
-    return all(p in ("device/change-mode", "device/reset-filter") for _, p, _ in sent)
+def only_reset_filter(sent):
+    return all(p == "device/reset-filter" and m == "GET" for m, p, _ in sent)
 
 def no_delete(sent):
     return all(m != "DELETE" for m, _, _ in sent)
 
-def mode_never_changed(sent):
-    """Every change-mode body must echo the current mode exactly."""
-    for _, p, body in sent:
-        if p == "device/change-mode":
-            if (body.get("operatingMode") != str(OM.Night.value)
-                    or body.get("fanSpeed") != FS.Medium.value
-                    or body.get("humidityLevel") != HL.Normal.value
-                    or body.get("lightSensorLevel") != LL.Off.value):
-                return False
-    return True
 
-
-# A) change-mode with a reset flag clears the counter -> True, tried before baseline.
-r, sent = run({("POST", "device/change-mode"): (200, None, "")}, ["Bad", "Good"])
-check("change-mode clears -> True", r is True)
-check("first probe is POST device/change-mode",
-      bool(sent) and sent[0][0] == "POST" and sent[0][1] == "device/change-mode")
-check("A: a filter-reset flag rides in the body",
-      any(k in sent[0][2] for k in ("resetFilter", "filterReset", "resetFilterAlarm")))
-check("A: running mode echoed unchanged", mode_never_changed(sent))
-check("A: only change-mode / reset-filter contacted", only_allowed_paths(sent))
+# A) Slave: target reset alone does nothing, the ZONE MASTER reset clears it -> True.
+master = Dev("MASTER", role="Master", zone=1)
+r, sent = run(Dev("SLAVE", role="SlaveEqualMaster", zone=1), ["Bad", "Bad", "Good"],
+              others=[master])
+check("master reset clears the slave -> True", r is True)
+check("A: target device contacted first", sent and sent[0] == ("GET", "device/reset-filter", "SLAVE"))
+check("A: zone master contacted second", len(sent) >= 2 and sent[1] == ("GET", "device/reset-filter", "MASTER"))
+check("A: only reset-filter GET", only_reset_filter(sent))
 check("A: no DELETE", no_delete(sent))
 
-# B) every change-mode is an accepted no-op + baseline GET no-op -> honest False,
-#    and the baseline GET reset-filter is tried last.
-r, sent = run({("POST", "device/change-mode"): (200, None, ""),
-               ("GET", "device/reset-filter"): (200, None, "")}, ["Bad"])
-check("all no-op -> False", r is False)
-check("baseline GET reset-filter is contacted last",
-      sent[-1] == ("GET", "device/reset-filter", {"deviceSerialNumber": "D1"}))
-check("B: mode never changed", mode_never_changed(sent))
-check("B: only change-mode / reset-filter", only_allowed_paths(sent))
-check("B: no DELETE", no_delete(sent))
+# B) Target reset alone already clears it -> True, master never contacted.
+r, sent = run(Dev("SLAVE", role="SlaveEqualMaster", zone=1), ["Bad", "Good"],
+              others=[Dev("MASTER", role="Master", zone=1)])
+check("target reset alone clears -> True", r is True)
+check("B: master not contacted when target already cleared",
+      [s for _, _, s in sent] == ["SLAVE"])
 
-# C) A later change-mode variant clears (counter turns Good only after the 2nd
-#    verify) -> True, and more than one variant was tried, all echoing the mode.
-r, sent = run({("POST", "device/change-mode"): (200, None, "")},
-              ["Bad", "Bad", "Good"])
-cm_calls = [s for s in sent if s[1] == "device/change-mode"]
-check("clears on a later change-mode variant -> True", r is True)
-check("C: more than one change-mode variant tried", len(cm_calls) >= 2)
-check("C: mode never changed across variants", mode_never_changed(sent))
+# C) The device IS the master -> only itself is contacted (no separate master).
+r, sent = run(Dev("MASTER", role="Master", zone=1), ["Bad", "Good"],
+              others=[Dev("SLAVE", role="SlaveEqualMaster", zone=1)])
+check("master device: only itself contacted", [s for _, _, s in sent] == ["MASTER"])
 
-# D) Status unreadable -> the mode can't be echoed, so NO change-mode is sent;
-#    only the baseline GET is tried and the result is an honest False.
-r, sent = run({("GET", "device/reset-filter"): (200, None, "")}, ["Bad"], ok=False)
-check("unreadable status -> False", r is False)
-check("D: no change-mode sent when the mode is unknown",
-      all(p != "device/change-mode" for _, p, _ in sent))
-check("D: only reset-filter baseline contacted", only_allowed_paths(sent))
-check("D: no DELETE", no_delete(sent))
+# D) No master in the same zone -> only the target is contacted.
+r, sent = run(Dev("SLAVE", role="SlaveEqualMaster", zone=1), ["Bad"],
+              others=[Dev("OTHERMASTER", role="Master", zone=2)])
+check("no zone master -> only target contacted", [s for _, _, s in sent] == ["SLAVE"])
+check("D: only reset-filter GET", only_reset_filter(sent))
 
-# E) The verify budget bounds how many acknowledged calls we check.
+# E) Neither device nor master clears it -> honest False, both were contacted.
+r, sent = run(Dev("SLAVE", role="SlaveEqualMaster", zone=1), ["Bad"],
+              others=[Dev("MASTER", role="Master", zone=1)])
+check("neither clears -> False", r is False)
+check("E: both device and master were tried", [s for _, _, s in sent] == ["SLAVE", "MASTER"])
+check("E: no DELETE", no_delete(sent))
+
+# F) Status unreadable -> still sends the documented reset (no crash), honest False.
+r, sent = run(Dev("SLAVE", role="SlaveEqualMaster", zone=1), ["Bad"],
+              others=[Dev("MASTER", role="Master", zone=1)], ok=False)
+check("unreadable status -> False (no crash)", r is False)
+check("F: only reset-filter GET", only_reset_filter(sent))
+
+# G) verify budget is a small positive cap.
 check("verify budget is a small positive cap",
       isinstance(bridge.FILTER_RESET_MAX_VERIFIES, int)
       and 0 < bridge.FILTER_RESET_MAX_VERIFIES <= 20)
