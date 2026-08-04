@@ -77,19 +77,18 @@ _BRIDGE_VERSION = os.environ.get("BRIDGE_VERSION", "").strip()
 # way). Overridable in tests.
 FILTER_RESET_VERIFY_DELAY = 10.0
 
-# Filter-reset endpoint discovery.
-# Field result (add-on 1.6.3, confirmed on a live unit): every alternative path
-# 404s, every parameter name except deviceSerialNumber 400s ("Device not found"),
-# and GET device/reset-filter?deviceSerialNumber=... returns HTTP 200 yet never
-# clears the counter. The official Ambientika app resets over the SAME REST API
-# (port 4521), so a working call exists - and since path and field names are now
-# ruled out, the remaining cloud-side unknown is the HTTP *method*: a reset is a
-# mutation, so the app most likely POSTs/PUTs rather than GETs. On a reset press
-# we try the mutating verbs on the resolved shape(s) and, after each acknowledged
-# (2xx) call, re-read the real status; the first variant that actually clears the
-# counter wins and is remembered. Safety: only URLs whose path name is about the
-# *filter* are ever contacted - never a device/config/factory reset - and DELETE
-# is never sent.
+# Filter reset via the device's control channel.
+# The Advanced+ RS485 protocol shows the filter reset is not a dedicated command
+# but a flag inside the periodic control frame ("reset the operating-hour counter
+# and clear the filter alarm"). Its cloud counterpart is POST device/change-mode;
+# the device/reset-filter GET endpoint is a confirmed no-op (field-tested through
+# 1.6.4: GET 200 does nothing, POST/PUT/PATCH there answer 405 Allow: GET). So on
+# a reset press we re-send the device's CURRENT mode via change-mode - nothing
+# about how the unit runs changes - with a filter-reset flag added, try a short
+# list of plausible field names, and after each acknowledged (2xx) call re-read
+# the real status; the first that clears the counter wins. Safety: the running
+# mode is only ever echoed back unchanged, DELETE is never sent, and nothing but
+# change-mode and reset-filter is ever contacted.
 # Cap on how many acknowledged calls we verify (each verify waits
 # FILTER_RESET_VERIFY_DELAY seconds), so a reset press can never run away.
 FILTER_RESET_MAX_VERIFIES = 8
@@ -1103,14 +1102,15 @@ class AmbientikaBridge:
             log.info("Device %s is answering again.", serial)
 
     # ----- device helpers -----
-    async def _reset_request(self, device, method, path, params):
-        """Send one raw filter-reset request; return (status, allow_header, body).
+    async def _reset_request(self, device, method, path, body):
+        """Send one raw reset-related request; return (status, allow_header, text).
 
-        Raw on purpose: the library hides the response, but the status code, the
-        "Allow" header of a 405 and a short body snippet are exactly what we need
-        to discover which call the server actually honours. Returns
-        (None, None, None) on a transport error or unknown method. DELETE is
-        never sent, and only filter-scoped paths are ever passed in.
+        Raw on purpose so we see the real status code, a 405's "Allow" header and
+        a short body snippet. GET sends the dict as query parameters; POST/PUT/
+        PATCH send it as a JSON body (matching how the app's change-mode call is
+        shaped). Returns (None, None, None) on a transport error or unknown
+        method. DELETE is never sent; only device/change-mode (re-sending the
+        current mode) and device/reset-filter are ever passed in.
         """
         api = getattr(device, "api", None)
         if api is None:
@@ -1121,69 +1121,91 @@ class AmbientikaBridge:
         try:
             async with aiohttp.ClientSession() as sess:
                 if m == "GET":
-                    cm = sess.get(url, headers=headers, params=params)
+                    cm = sess.get(url, headers=headers, params=body)
                 elif m == "POST":
-                    cm = sess.post(url, headers=headers, params=params, json=params)
+                    cm = sess.post(url, headers=headers, json=body)
                 elif m == "PUT":
-                    cm = sess.put(url, headers=headers, params=params, json=params)
+                    cm = sess.put(url, headers=headers, json=body)
                 elif m == "PATCH":
-                    cm = sess.patch(url, headers=headers, params=params, json=params)
+                    cm = sess.patch(url, headers=headers, json=body)
                 else:
                     return (None, None, None)
                 async with cm as r:
                     try:
-                        body = (await r.text())[:120]
+                        text = (await r.text())[:120]
                     except Exception:
-                        body = ""
-                    return (r.status, r.headers.get("Allow"), body)
+                        text = ""
+                    return (r.status, r.headers.get("Allow"), text)
         except Exception as e:
             log.warning("filter reset request %s %s raised for %s: %s",
                         m, path, device.serial_number, e)
             return (None, None, None)
 
-    def _reset_candidates(self, device):
-        """Build the ordered (method, path, params, label) list to probe.
+    def _change_mode_echo(self, device, before):
+        """Build a device/change-mode body that re-sends the device's CURRENT
+        mode unchanged (a safe echo), so a filter-reset flag can ride along
+        without altering how the unit runs. Returns None if the mode cannot be
+        read from the status packet.
+        """
+        if not before:
+            return None
+        try:
+            return {
+                "deviceSerialNumber": device.serial_number,
+                "operatingMode": str(before["operating_mode"].value),
+                "fanSpeed": before["fan_speed"].value,
+                "humidityLevel": before["humidity_level"].value,
+                "lightSensorLevel": before["light_sensor_level"].value,
+            }
+        except (KeyError, AttributeError):
+            return None
 
-        Best guesses first (the app uses a different path or parameter shape),
-        the known-dead device/reset-filter GET last as a baseline. Every path is
-        filter-scoped, so nothing here can touch device config or trigger a
-        factory reset.
+    def _reset_candidates(self, device, before):
+        """Build the ordered (method, path, body, label) list to try.
+
+        The reset is a flag on the control message, whose cloud form is
+        POST device/change-mode. We re-send the CURRENT mode (nothing changes)
+        plus a filter-reset flag, trying a few plausible field names, and keep
+        the legacy GET device/reset-filter (a known no-op) last as a baseline.
+        Only change-mode (current mode) and reset-filter are ever contacted; the
+        running mode is never altered and DELETE is never queued.
         """
         serial = device.serial_number
-        dev_id = getattr(device, "id", None)
         cands = []
-        # Only deviceSerialNumber (alone or with deviceId) resolves the device;
-        # every other name 400s and every alternative path 404s (field-confirmed
-        # in 1.6.3). The open question is the HTTP method, so try the mutating
-        # verbs on the resolved shape(s); GET is the known HTTP 200 no-op, kept
-        # last as a labelled baseline. All filter-scoped; DELETE is never queued.
-        shapes = [("deviceSerialNumber", {"deviceSerialNumber": serial})]
-        if dev_id is not None:
-            shapes.append(("deviceSerialNumber+deviceId",
-                           {"deviceSerialNumber": serial, "deviceId": dev_id}))
-        for tag, shape in shapes:
-            for m in ("POST", "PUT", "PATCH"):
-                cands.append((m, "device/reset-filter", dict(shape),
-                              f"reset-filter {m} ({tag})"))
-        cands.append(("GET", "device/reset-filter", {"deviceSerialNumber": serial},
-                      "reset-filter GET baseline"))
+        base = self._change_mode_echo(device, before)
+        if base is not None:
+            for field, value, tag in (
+                ("resetFilter", True, "resetFilter=true"),
+                ("filterReset", True, "filterReset=true"),
+                ("resetFilterAlarm", True, "resetFilterAlarm=true"),
+                ("resetFilter", 1, "resetFilter=1"),
+            ):
+                body = dict(base)
+                body[field] = value
+                cands.append(("POST", "device/change-mode", body,
+                              f"change-mode {tag}"))
+        cands.append(("GET", "device/reset-filter",
+                      {"deviceSerialNumber": serial}, "reset-filter GET baseline"))
         return cands
 
     async def _reset_filter(self, device) -> bool:
-        """Reset the filter counter by discovering the call the server honours.
+        """Reset the filter counter via the device's real control channel.
 
-        device/reset-filter GET is a confirmed no-op and the server allows only
-        GET there. The official app resets over the same REST API, so a working
-        variant exists. We walk _reset_candidates(); after every acknowledged
-        (2xx) call we re-read the real filter status and keep the first variant
-        that truly changes it. A 405 that advertises other methods in its "Allow"
-        header makes us retry that same path with those methods (never DELETE).
-        Nothing but filter-reset paths is ever contacted.
+        device/reset-filter GET is a confirmed no-op. The reset is a flag on the
+        control message, so we re-send the current mode through
+        POST device/change-mode with a filter-reset field and, after every
+        acknowledged (2xx) call, re-read the real status; the first variant that
+        truly clears the counter wins. Safety: the running mode is only ever
+        echoed back unchanged, DELETE is never sent, and nothing but change-mode
+        and reset-filter is contacted.
         """
         serial = device.serial_number
         before = await self.read_status(device)
         before_fs = before.get("filters_status") if before else None
-        if before_fs is not None and str(before_fs).lower() not in ("bad", "red"):
+        if before is None:
+            log.error("filter reset for %s: could not read the current status, so the "
+                      "mode cannot be safely echoed - not sending change-mode", serial)
+        elif before_fs is not None and str(before_fs).lower() not in ("bad", "red"):
             log.info("filter reset for %s: filter status is %r (not Bad/red); a "
                      "successful reset may not be observable until the filter is due",
                      serial, before_fs)
@@ -1203,55 +1225,46 @@ class AmbientikaBridge:
                         label, serial, after_fs, FILTER_RESET_VERIFY_DELAY)
             return False
 
-        async def _attempt(method, path, params, label) -> bool:
+        async def _attempt(method, path, body, label) -> bool:
             m = method.upper()
             if m == "DELETE":
                 return False
-            key = (m, path, tuple(sorted(params.items())))
+            key = (m, path, tuple(sorted(body.items())))
             if key in seen:
                 return False
             seen.add(key)
-            status, allow_hdr, body = await self._reset_request(device, m, path, params)
+            status, allow_hdr, text = await self._reset_request(device, m, path, body)
             if status is None:
                 return False
-            keys = "+".join(params.keys())
             if status == 405:
-                log.info("filter reset probe [%s]: %s %s (%s) -> HTTP 405, Allow: %s",
-                         label, m, path, keys, allow_hdr)
-                if allow_hdr:
-                    for am in (x.strip().upper() for x in allow_hdr.split(",")):
-                        if (am in ("PUT", "PATCH", "POST")
-                                and verifies[0] < FILTER_RESET_MAX_VERIFIES
-                                and await _attempt(am, path, params, f"{label} via {am}")):
-                            return True
+                log.info("filter reset probe [%s]: %s %s -> HTTP 405, Allow: %s",
+                         label, m, path, allow_hdr)
                 return False
             if status == 404:
-                log.info("filter reset probe [%s]: %s %s (%s) -> HTTP 404 (no such route)",
-                         label, m, path, keys)
+                log.info("filter reset probe [%s]: %s %s -> HTTP 404 (no such route)",
+                         label, m, path)
                 return False
             if status >= 400:
-                log.info("filter reset probe [%s]: %s %s (%s) -> HTTP %s %s",
-                         label, m, path, keys, status, (body or "").strip())
+                log.info("filter reset probe [%s]: %s %s -> HTTP %s %s",
+                         label, m, path, status, (text or "").strip())
                 return False
-            # 2xx: the call was accepted. Trust nothing - verify the counter.
             if verifies[0] >= FILTER_RESET_MAX_VERIFIES:
-                log.warning("filter reset [%s]: %s %s (%s) -> HTTP %s but verify budget "
-                            "exhausted", label, m, path, keys, status)
+                log.warning("filter reset [%s]: %s %s -> HTTP %s but verify budget "
+                            "exhausted", label, m, path, status)
                 return False
             verifies[0] += 1
-            log.info("filter reset probe [%s]: %s %s (%s) -> HTTP %s (accepted, verifying)",
-                     label, m, path, keys, status)
+            log.info("filter reset probe [%s]: %s %s -> HTTP %s (accepted, verifying)",
+                     label, m, path, status)
             return await _verify(label)
 
-        for method, path, params, label in self._reset_candidates(device):
+        for method, path, body, label in self._reset_candidates(device, before):
             if verifies[0] >= FILTER_RESET_MAX_VERIFIES:
                 break
-            if await _attempt(method, path, params, label):
+            if await _attempt(method, path, body, label):
                 return True
 
-        log.error("filter reset for %s: none of the tried filter-reset variants cleared "
-                  "the counter - see the probe lines above for the server's answers",
-                  serial)
+        log.error("filter reset for %s: none of the tried variants cleared the counter "
+                  "- see the probe lines above for the server's answers", serial)
         return False
 
     async def read_status(self, device: Device) -> Optional[dict]:
