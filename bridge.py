@@ -78,25 +78,18 @@ _BRIDGE_VERSION = os.environ.get("BRIDGE_VERSION", "").strip()
 FILTER_RESET_VERIFY_DELAY = 10.0
 
 # Filter-reset endpoint discovery.
-# device/reset-filter GET returns HTTP 200 but never clears the counter, and the
-# server allows only GET there (confirmed in the field). The official Ambientika
-# app resets successfully over the SAME REST API (port 4521), so a working call
-# exists at a different path and/or parameter shape. On a reset request we walk a
-# short list of filter-scoped variants and, after each acknowledged (2xx) call,
-# re-read the real status; the first variant that actually clears the counter
-# wins and is remembered for next time. Safety: only URLs whose path name is
-# about the *filter* are ever contacted - never a device/config/factory reset -
-# and DELETE is never sent.
-#
-# Alternative paths to the known-dead "device/reset-filter" (all filter-scoped).
-_FILTER_RESET_ALT_PATHS = (
-    "device/reset-filters",
-    "device/filter-reset",
-    "device/resetfilter",
-    "device/reset-filter-alarm",
-    "device/reset-filter-status",
-    "device/filter/reset",
-)
+# Field result (add-on 1.6.3, confirmed on a live unit): every alternative path
+# 404s, every parameter name except deviceSerialNumber 400s ("Device not found"),
+# and GET device/reset-filter?deviceSerialNumber=... returns HTTP 200 yet never
+# clears the counter. The official Ambientika app resets over the SAME REST API
+# (port 4521), so a working call exists - and since path and field names are now
+# ruled out, the remaining cloud-side unknown is the HTTP *method*: a reset is a
+# mutation, so the app most likely POSTs/PUTs rather than GETs. On a reset press
+# we try the mutating verbs on the resolved shape(s) and, after each acknowledged
+# (2xx) call, re-read the real status; the first variant that actually clears the
+# counter wins and is remembered. Safety: only URLs whose path name is about the
+# *filter* are ever contacted - never a device/config/factory reset - and DELETE
+# is never sent.
 # Cap on how many acknowledged calls we verify (each verify waits
 # FILTER_RESET_VERIFY_DELAY seconds), so a reset press can never run away.
 FILTER_RESET_MAX_VERIFIES = 8
@@ -1130,11 +1123,11 @@ class AmbientikaBridge:
                 if m == "GET":
                     cm = sess.get(url, headers=headers, params=params)
                 elif m == "POST":
-                    cm = sess.post(url, headers=headers, json=params)
+                    cm = sess.post(url, headers=headers, params=params, json=params)
                 elif m == "PUT":
-                    cm = sess.put(url, headers=headers, json=params)
+                    cm = sess.put(url, headers=headers, params=params, json=params)
                 elif m == "PATCH":
-                    cm = sess.patch(url, headers=headers, json=params)
+                    cm = sess.patch(url, headers=headers, params=params, json=params)
                 else:
                     return (None, None, None)
                 async with cm as r:
@@ -1159,24 +1152,21 @@ class AmbientikaBridge:
         serial = device.serial_number
         dev_id = getattr(device, "id", None)
         cands = []
-        # 1) Alternative filter-reset paths, GET with the standard serial param.
-        for p in _FILTER_RESET_ALT_PATHS:
-            cands.append(("GET", p, {"deviceSerialNumber": serial}, f"alt-path {p}"))
-        # 2) Same known path, GET, but parameter shapes the app might use instead.
-        cands.append(("GET", "device/reset-filter", {"serialNumber": serial},
-                      "reset-filter serialNumber"))
-        cands.append(("GET", "device/reset-filter", {"serial": serial},
-                      "reset-filter serial"))
+        # Only deviceSerialNumber (alone or with deviceId) resolves the device;
+        # every other name 400s and every alternative path 404s (field-confirmed
+        # in 1.6.3). The open question is the HTTP method, so try the mutating
+        # verbs on the resolved shape(s); GET is the known HTTP 200 no-op, kept
+        # last as a labelled baseline. All filter-scoped; DELETE is never queued.
+        shapes = [("deviceSerialNumber", {"deviceSerialNumber": serial})]
         if dev_id is not None:
-            cands.append(("GET", "device/reset-filter", {"deviceId": dev_id},
-                          "reset-filter deviceId"))
-            cands.append(("GET", "device/reset-filter",
-                          {"deviceSerialNumber": serial, "deviceId": dev_id},
-                          "reset-filter serial+deviceId"))
-        # 3) Baseline: the current library call (known HTTP 200 no-op) - kept last
-        #    so the log always ends with it for reference.
+            shapes.append(("deviceSerialNumber+deviceId",
+                           {"deviceSerialNumber": serial, "deviceId": dev_id}))
+        for tag, shape in shapes:
+            for m in ("POST", "PUT", "PATCH"):
+                cands.append((m, "device/reset-filter", dict(shape),
+                              f"reset-filter {m} ({tag})"))
         cands.append(("GET", "device/reset-filter", {"deviceSerialNumber": serial},
-                      "reset-filter baseline"))
+                      "reset-filter GET baseline"))
         return cands
 
     async def _reset_filter(self, device) -> bool:
