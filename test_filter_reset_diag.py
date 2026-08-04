@@ -1,9 +1,11 @@
 """Tests for the self-verifying filter-reset endpoint discovery (bridge.py).
 
-device/reset-filter GET is a confirmed no-op; the official app resets over the
-same REST API, so a working call exists at a different path or parameter shape.
-_reset_filter walks a short list of filter-scoped variants and keeps the first
-one that actually changes the real status. These tests drive that walk with a
+Field result (1.6.3): only deviceSerialNumber resolves the device and GET
+device/reset-filter returns HTTP 200 without clearing the counter; every other
+path 404s and every other parameter name 400s. Since path and field names are
+ruled out, 1.6.4 varies the HTTP *method* (a reset is a mutation, so the app
+most likely POSTs/PUTs). _reset_filter walks the candidates and keeps the first
+that actually changes the real status. These tests drive that walk with a
 scripted _reset_request and assert both correctness and safety (only
 filter-scoped paths are ever contacted; DELETE is never sent)."""
 import asyncio
@@ -59,46 +61,48 @@ def no_delete(contacted):
     return all(m != "DELETE" for m, _, _ in contacted)
 
 
-# A) An alternative path clears via GET -> confirmed, and we stop before baseline.
-r, contacted = run({("GET", "device/reset-filters"): (200, None, "")},
+# A) POST on the resolved route clears the counter -> confirmed True, and POST is
+#    tried before the GET baseline.
+r, contacted = run({("POST", "device/reset-filter"): (200, None, "")},
                    ["Bad", "Good"])
-check("alt-path GET clears -> True", r is True)
-check("first probe is the first alt path",
-      contacted[0] == ("GET", "device/reset-filters", ("deviceSerialNumber",)))
-check("stops before the baseline reset-filter call",
-      ("GET", "device/reset-filter", ("deviceSerialNumber",)) not in contacted)
+check("POST clears -> True", r is True)
+check("first probe is POST on the resolved route",
+      contacted[0] == ("POST", "device/reset-filter", ("deviceSerialNumber",)))
 check("A: only filter-scoped paths", paths_are_filter_scoped(contacted))
 check("A: no DELETE", no_delete(contacted))
 
-# B) Everything is 404 or a 200 no-op -> honest False, baseline was tried.
+# B) Only the GET baseline answers (200 no-op), everything else 404 -> honest
+#    False, and the GET baseline was tried last.
 r, contacted = run({("GET", "device/reset-filter"): (200, None, "")}, ["Bad"])
 check("all no-op/404 -> False", r is False)
-check("baseline reset-filter was contacted",
-      any(p == "device/reset-filter" for _, p, _ in contacted))
+check("GET baseline was contacted",
+      ("GET", "device/reset-filter", ("deviceSerialNumber",)) in contacted)
+check("GET baseline is contacted last",
+      contacted[-1] == ("GET", "device/reset-filter", ("deviceSerialNumber",)))
 check("B: only filter-scoped paths", paths_are_filter_scoped(contacted))
 check("B: no DELETE", no_delete(contacted))
 
-# C) An alt path answers 405/Allow: PUT, and PUT on that path clears -> True.
-r, contacted = run({("GET", "device/filter-reset"): (405, "OPTIONS, PUT", ""),
-                    ("PUT", "device/filter-reset"): (200, None, "")},
+# C) POST answers 405/Allow: PUT, and PUT on that route clears -> True.
+r, contacted = run({("POST", "device/reset-filter"): (405, "OPTIONS, PUT", ""),
+                    ("PUT", "device/reset-filter"): (200, None, "")},
                    ["Bad", "Good"])
 check("405 Allow=PUT then PUT clears -> True", r is True)
-check("PUT was retried on the advertised path",
-      ("PUT", "device/filter-reset", ("deviceSerialNumber",)) in contacted)
+check("PUT was retried on the advertised route",
+      ("PUT", "device/reset-filter", ("deviceSerialNumber",)) in contacted)
 check("C: no DELETE", no_delete(contacted))
 
 # D) Allow advertises DELETE -> it must never be sent.
-r, contacted = run({("GET", "device/reset-filters"): (405, "OPTIONS, DELETE, GET", "")},
+r, contacted = run({("POST", "device/reset-filter"): (405, "OPTIONS, DELETE, GET", "")},
                    ["Bad"])
 check("Allow lists DELETE -> still False", r is False)
 check("DELETE from Allow is never sent", no_delete(contacted))
 
-# E) A parameter-shape variant clears (deviceId) -> True; needs device.id present.
-r, contacted = run({("GET", "device/reset-filter", ("deviceId",)): (200, None, "")},
-                   ["Bad", "Good"], dev_id=42)
-check("reset-filter deviceId variant clears -> True", r is True)
-check("deviceId variant was contacted",
-      ("GET", "device/reset-filter", ("deviceId",)) in contacted)
+# E) The deviceSerialNumber+deviceId shape clears via POST -> True (needs id).
+r, contacted = run({("POST", "device/reset-filter", ("deviceId", "deviceSerialNumber")):
+                    (200, None, "")}, ["Bad", "Good"], dev_id=42)
+check("POST deviceSerialNumber+deviceId clears -> True", r is True)
+check("the serial+deviceId shape was contacted",
+      ("POST", "device/reset-filter", ("deviceId", "deviceSerialNumber")) in contacted)
 check("E: only filter-scoped paths", paths_are_filter_scoped(contacted))
 
 # F) The verify budget bounds how many acknowledged calls we check.
