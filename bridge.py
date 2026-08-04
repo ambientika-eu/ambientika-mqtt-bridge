@@ -1114,7 +1114,12 @@ class AmbientikaBridge:
         if api is None:
             return (None, None, None)
         url = f"{api.host}/{path}"
-        headers = {"Authorization": f"Bearer {api.token}"}
+        # Match the official app byte-for-byte: it sends the reset-filter GET
+        # with BOTH the bearer token AND a JSON content-type header (verified in
+        # the app's own source, HttpService.ts / HouseService.ts). We were the
+        # only ones omitting Content-Type; add it so our request is identical.
+        headers = {"Authorization": f"Bearer {api.token}",
+                   "Content-Type": "application/json"}
         m = method.upper()
         try:
             async with aiohttp.ClientSession() as sess:
