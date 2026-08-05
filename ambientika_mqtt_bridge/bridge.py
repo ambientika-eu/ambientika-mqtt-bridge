@@ -91,11 +91,14 @@ FILTER_RESET_VERIFY_DELAY = 12.0
 # clears the counter wins. Safety: only the documented reset-filter GET is ever
 # sent - never change-mode, reset-device or DELETE - so nothing but the filter
 # alarm can ever be touched.
-# Bounded retry so a reset press can never run away: at most MAX_ATTEMPTS live
-# windows, RETRY_DELAY seconds apart, never longer than TOTAL_TIMEOUT seconds.
-FILTER_RESET_RETRY_DELAY = float(os.environ.get("FILTER_RESET_RETRY_DELAY", "45") or 45)
-FILTER_RESET_MAX_ATTEMPTS = int(os.environ.get("FILTER_RESET_MAX_ATTEMPTS", "12") or 12)
-FILTER_RESET_TOTAL_TIMEOUT = float(os.environ.get("FILTER_RESET_TOTAL_TIMEOUT", "900") or 900)
+# The reset is sent to the device's LIVE connection (decompiled: to the very
+# session the device reports its status on). If the counter does not clear after
+# a couple of confirmed sends, retrying more cannot help - per Ambientika's
+# protocol the filter reset is a physical maintenance action at the unit's
+# WallPanel, not a remote one. So keep the retry short, then report honestly.
+FILTER_RESET_RETRY_DELAY = float(os.environ.get("FILTER_RESET_RETRY_DELAY", "20") or 20)
+FILTER_RESET_MAX_ATTEMPTS = int(os.environ.get("FILTER_RESET_MAX_ATTEMPTS", "3") or 3)
+FILTER_RESET_TOTAL_TIMEOUT = float(os.environ.get("FILTER_RESET_TOTAL_TIMEOUT", "180") or 180)
 
 # Re-authenticate proactively at this interval, and immediately if the cloud
 # starts answering 401 (JWT expired) - otherwise every device would stay offline
@@ -1335,19 +1338,19 @@ class AmbientikaBridge:
         """Reset the filter counter, retrying across the device's live windows.
 
         The cloud's reset-filter is fire-and-forget: decompiling the O.Erre
-        WebService showed the endpoint returns HTTP 200 as soon as the device has
-        a registered socket session and the bytes were pushed to it - with no
-        device acknowledgement and no check on filter status or Master/Slave role.
-        So a 200 proves nothing; the counter only clears if the device physically
-        received the packet. Units with a flaky server link often sit on a
-        half-open session, so a single reset press is silently lost.
+        WebService showed the endpoint returns HTTP 200 as soon as the bytes are
+        pushed to the device's LIVE socket (the very session the device reports
+        status on) - with no device acknowledgement and no status/Master gate. In
+        practice the device receives the command but does NOT clear the counter:
+        per Ambientika's own protocol the filter reset is a physical maintenance
+        action at the unit's WallPanel ("reset the hour counter on master units
+        with panel"), so no app, cloud or bridge can do it remotely.
 
-        Strategy: only fire the reset when a status read just proved the device is
-        reachable, send it to the zone Master (which applies the filter reset for
-        a coupled group) and to the device itself, then re-read the real status to
-        confirm the counter actually cleared. Retry over a bounded set of live
-        windows and stop the moment it clears. Only the documented reset-filter
-        GET is ever sent - never change-mode, reset-device or DELETE.
+        We still send the documented reset (to the device and its zone Master) and
+        verify against the real device status, so a genuine transient is caught -
+        but only a couple of times, then we report honestly instead of hammering.
+        Only the documented reset-filter GET is ever sent - never change-mode,
+        reset-device or DELETE.
         """
         serial = device.serial_number
         deadline = time.monotonic() + FILTER_RESET_TOTAL_TIMEOUT
@@ -1407,11 +1410,12 @@ class AmbientikaBridge:
                      (after.get("filters_status") if after else None),
                      FILTER_RESET_VERIFY_DELAY, attempt, FILTER_RESET_MAX_ATTEMPTS)
             await asyncio.sleep(FILTER_RESET_RETRY_DELAY)
-        log.warning("filter reset for %s: could not confirm a cleared counter after %d "
-                    "attempt(s). The cloud accepts the reset (HTTP 200) but the device did "
-                    "not apply it - typically a half-open device<->server link (the same "
-                    "units that log 'status packet not found'). The next reset press retries; "
-                    "a physical reset at the unit always works.", serial, attempt)
+        log.warning("filter reset for %s: the device did not clear the counter after %d "
+                    "attempt(s). The cloud command reaches the device, but the filter reset "
+                    "is a physical maintenance action at the unit's WallPanel (press S to "
+                    "unlock, then R = reset filter alarm) - it cannot be done remotely by the "
+                    "app, the cloud or this bridge. Reset the filter at the unit; the status "
+                    "follows on the next poll.", serial, attempt)
         return False
 
 
