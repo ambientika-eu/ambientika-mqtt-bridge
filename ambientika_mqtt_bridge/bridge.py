@@ -91,14 +91,11 @@ FILTER_RESET_VERIFY_DELAY = 12.0
 # clears the counter wins. Safety: only the documented reset-filter GET is ever
 # sent - never change-mode, reset-device or DELETE - so nothing but the filter
 # alarm can ever be touched.
-# The reset is sent to the device's LIVE connection (decompiled: to the very
-# session the device reports its status on). If the counter does not clear after
-# a couple of confirmed sends, retrying more cannot help - per Ambientika's
-# protocol the filter reset is a physical maintenance action at the unit's
-# WallPanel, not a remote one. So keep the retry short, then report honestly.
-FILTER_RESET_RETRY_DELAY = float(os.environ.get("FILTER_RESET_RETRY_DELAY", "20") or 20)
-FILTER_RESET_MAX_ATTEMPTS = int(os.environ.get("FILTER_RESET_MAX_ATTEMPTS", "3") or 3)
-FILTER_RESET_TOTAL_TIMEOUT = float(os.environ.get("FILTER_RESET_TOTAL_TIMEOUT", "180") or 180)
+# The cloud reset is fire-and-forget (decompiled): it is written to the device's
+# live socket and returns HTTP 200 without any device ack - exactly like the app,
+# which shows success without checking. Whether the counter then clears is a
+# device/app-side matter the bridge cannot force. So we send once, quietly, and
+# read the status once (below) only to update the hidden reset-status sensor.
 
 # Re-authenticate proactively at this interval, and immediately if the cloud
 # starts answering 401 (JWT expired) - otherwise every device would stay offline
@@ -771,9 +768,10 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
         },
     ))
 
-    # Filter-reset status sensor: shows whether the last reset press is running,
-    # was confirmed against the real device status, or could not be confirmed -
-    # so a reset is never a mystery and needs no follow-up question.
+    # Filter-reset status sensor: honest running/confirmed/unconfirmed indicator.
+    # Disabled by default and marked diagnostic, so it stays invisible to normal
+    # users (a cloud reset is fire-and-forget, like the app) while power users can
+    # switch it on to see whether a reset actually took.
     entities.append((
         f"{base}/sensor/{serial}_reset_state/config",
         {
@@ -783,6 +781,8 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
             "availability_topic": avail,
             "device": device_info,
             "icon": "mdi:air-filter",
+            "enabled_by_default": False,
+            "entity_category": "diagnostic",
         },
     ))
 
@@ -1335,87 +1335,53 @@ class AmbientikaBridge:
 
 
     async def _reset_filter(self, device) -> bool:
-        """Reset the filter counter, retrying across the device's live windows.
+        """Fire the documented filter reset once, quietly, and check once.
 
-        The cloud's reset-filter is fire-and-forget: decompiling the O.Erre
-        WebService showed the endpoint returns HTTP 200 as soon as the bytes are
-        pushed to the device's LIVE socket (the very session the device reports
-        status on) - with no device acknowledgement and no status/Master gate. In
-        practice the device receives the command but does NOT clear the counter:
-        per Ambientika's own protocol the filter reset is a physical maintenance
-        action at the unit's WallPanel ("reset the hour counter on master units
-        with panel"), so no app, cloud or bridge can do it remotely.
-
-        We still send the documented reset (to the device and its zone Master) and
-        verify against the real device status, so a genuine transient is caught -
-        but only a couple of times, then we report honestly instead of hammering.
-        Only the documented reset-filter GET is ever sent - never change-mode,
+        The cloud reset is fire-and-forget (decompiled): it is written to the
+        device's live socket and returns HTTP 200 without a device ack - exactly
+        like the app, which shows success without checking. We send it to the
+        device and its zone Master, then read the real status once to update the
+        (hidden) reset-status sensor. We do NOT retry or raise alarms: whether a
+        reset "takes" is a device/app-side matter the bridge cannot force. Only
+        the documented reset-filter GET is ever sent - never change-mode,
         reset-device or DELETE.
         """
         serial = device.serial_number
-        deadline = time.monotonic() + FILTER_RESET_TOTAL_TIMEOUT
-        sent_any = False
-        attempt = 0
-        while attempt < FILTER_RESET_MAX_ATTEMPTS and time.monotonic() < deadline:
-            attempt += 1
-            before = await self.read_status(device)
-            if before is None:
-                # No live status: the device is unreachable right now and a reset
-                # sent now would almost certainly be lost. Wait for a live window.
-                log.info("filter reset for %s: device not reachable (attempt %d/%d); "
-                         "waiting for a live window", serial, attempt,
-                         FILTER_RESET_MAX_ATTEMPTS)
-                await asyncio.sleep(FILTER_RESET_RETRY_DELAY)
+        before = await self.read_status(device)
+        before_fs = str((before or {}).get("filters_status") or "").lower()
+        if before_fs and before_fs not in ("bad", "red"):
+            log.info("filter reset for %s: filter status is already %r - nothing to do",
+                     serial, (before or {}).get("filters_status"))
+            return True
+        accepted = False
+        for tserial, label in self._reset_candidates(device):
+            status, _allow, text = await self._reset_request(
+                device, "GET", "device/reset-filter", {"deviceSerialNumber": tserial})
+            if status is None:
                 continue
-            before_fs = str(before.get("filters_status") or "").lower()
-            if before_fs and before_fs not in ("bad", "red"):
-                if sent_any:
-                    log.info("filter reset CONFIRMED for %s: filters_status is now %r",
-                             serial, before.get("filters_status"))
-                else:
-                    log.info("filter reset for %s: filter status is already %r - "
-                             "nothing to clear", serial, before.get("filters_status"))
-                return True
-            # Device is reachable and the filter is flagged: fire the documented
-            # reset to the zone Master and to the device itself.
-            accepted = False
-            for tserial, label in self._reset_candidates(device):
-                status, _allow, text = await self._reset_request(
-                    device, "GET", "device/reset-filter",
-                    {"deviceSerialNumber": tserial})
-                if status is None:
-                    continue
-                if status >= 400:
-                    log.info("filter reset [%s] %s -> HTTP %s %s",
-                             label, tserial, status, (text or "").strip())
-                    continue
-                accepted = True
-                sent_any = True
-                log.info("filter reset [%s] %s -> HTTP %s (accepted; verifying)",
-                         label, tserial, status)
-            if not accepted:
-                # Device dropped between the status read and the send. Retry.
-                await asyncio.sleep(FILTER_RESET_RETRY_DELAY)
+            if status >= 400:
+                log.info("filter reset [%s] %s -> HTTP %s %s",
+                         label, tserial, status, (text or "").strip())
                 continue
-            # Verify against the real device status.
-            await asyncio.sleep(FILTER_RESET_VERIFY_DELAY)
-            after = await self.read_status(device)
-            after_fs = str(after.get("filters_status") or "").lower() if after else ""
-            if after_fs and after_fs not in ("bad", "red"):
-                log.info("filter reset CONFIRMED for %s: filters_status %s -> %s "
-                         "(attempt %d)", serial, before_fs or "?", after_fs, attempt)
-                return True
-            log.info("filter reset for %s: counter still %r ~%.0fs after attempt "
-                     "%d/%d - retrying", serial,
-                     (after.get("filters_status") if after else None),
-                     FILTER_RESET_VERIFY_DELAY, attempt, FILTER_RESET_MAX_ATTEMPTS)
-            await asyncio.sleep(FILTER_RESET_RETRY_DELAY)
-        log.warning("filter reset for %s: the device did not clear the counter after %d "
-                    "attempt(s). The cloud command reaches the device, but the filter reset "
-                    "is a physical maintenance action at the unit's WallPanel (press S to "
-                    "unlock, then R = reset filter alarm) - it cannot be done remotely by the "
-                    "app, the cloud or this bridge. Reset the filter at the unit; the status "
-                    "follows on the next poll.", serial, attempt)
+            accepted = True
+            log.info("filter reset [%s] %s -> HTTP %s (sent)", label, tserial, status)
+        if not accepted:
+            log.info("filter reset for %s: device not reachable right now - nothing sent",
+                     serial)
+            return False
+        # One quiet check against the real device status.
+        await asyncio.sleep(FILTER_RESET_VERIFY_DELAY)
+        after = await self.read_status(device)
+        after_fs = str((after or {}).get("filters_status") or "").lower() if after else ""
+        if after_fs and after_fs not in ("bad", "red"):
+            log.info("filter reset for %s: confirmed - filters_status %s -> %s",
+                     serial, before_fs or "?", after_fs)
+            return True
+        log.info("filter reset for %s: sent to the device and its zone Master; the device "
+                 "still reports filter %r. A cloud reset is fire-and-forget (the app reports "
+                 "success the same way, without checking) - the real status will follow on "
+                 "the next poll if the device applies it.",
+                 serial, (after or {}).get("filters_status") if after else None)
         return False
 
 
@@ -1561,12 +1527,11 @@ class AmbientikaBridge:
             log.warning("Unknown device serial: %s", serial)
             return
 
-        # Filter reset: the cloud's reset-filter GET returns 200 as soon as the
-        # bytes are pushed to the device's socket - no device ack, no status/Master
-        # check (confirmed by decompiling WebService.dll). A single press is lost if
-        # the device session is half-open, so _reset_filter retries across the
-        # device's live windows and confirms against the real status. Run it in the
-        # background so this MQTT handler returns immediately.
+        # Filter reset: fire the documented cloud reset once, quietly (like the
+        # app, which shows success without checking - confirmed by decompiling
+        # WebService.dll). _reset_filter sends it and reads the real status once
+        # for the hidden reset-status sensor; it does not retry or alarm. Run it
+        # in the background so this MQTT handler returns immediately.
         if attr == "reset_filter":
             self._start_reset(device)
             return
