@@ -606,9 +606,10 @@ def build_bridge_discovery(cfg: BridgeConfig):
 # Local-App-Historie.
 # ---------------------------------------------------------------------------
 _AIR_QUALITY_NUM = {                       # hoeher = bessere Luft (0..4)
-    "verygood": 4, "good": 3, "medium": 2, "bad": 1, "verybad": 0,
-    "sehrgut": 4, "gut": 3, "mittel": 2, "schlecht": 1, "sehrschlecht": 0,
-    "excellent": 4, "moderate": 2, "poor": 1, "verypoor": 0,
+    # Real device air-quality scale (server AirQuality enum) has exactly five
+    # steps and NO "VeryBad": VeryGood(best)..Bad(worst). Mapped higher = better,
+    # so it lines up 1:1 with the app/local history and long-term charts.
+    "verygood": 4, "good": 3, "medium": 2, "poor": 1, "bad": 0,
 }
 _FILTER_STATUS_NUM = {                      # hoeher = dringlicher (0 gruen..2 rot)
     "good": 0, "green": 0, "gruen": 0, "ok": 0, "clean": 0,
