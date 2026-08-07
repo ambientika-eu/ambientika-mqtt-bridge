@@ -1138,6 +1138,11 @@ class AmbientikaBridge:
         self.neuracell = NeuraCellXController(self, cfg)
         # serial -> number of consecutive failed polls (availability debounce)
         self._poll_failures: dict = {}
+        # serial -> last light_sensor_level seen while the unit was running (or
+        # last set by the user). A powered-off unit reports a default level, so
+        # we keep this to avoid overwriting the user's dusk-sensor choice on an
+        # off->on toggle.
+        self._last_light: dict = {}
 
     # ----- availability debounce -----
     def _note_poll_failure(self, serial: str, reason: str) -> None:
@@ -1398,10 +1403,25 @@ class AmbientikaBridge:
         return res.unwrap()
 
     async def set_device_mode(self, device, operating_mode, fan_speed, humidity_level) -> bool:
+        # change_mode requires all four attributes; light_sensor_level is not a
+        # parameter here, so fill it from the user's remembered level (falling
+        # back to a live status read) instead of dropping it - dropping it both
+        # raised KeyError and would have reset the user's dusk sensor.
+        serial = device.serial_number
+        light = self._last_light.get(serial)
+        if light is None:
+            st = await self.read_status(device)
+            if st is not None:
+                light = st["light_sensor_level"]
+                if st["operating_mode"] != OperatingMode.Off:
+                    self._last_light[serial] = light
+        if light is None:
+            light = LightSensorLevel.Off
         mode = {
             "operating_mode": operating_mode,
             "fan_speed": fan_speed,
             "humidity_level": humidity_level,
+            "light_sensor_level": light,
         }
         try:
             res = await device.change_mode(mode)
@@ -1575,10 +1595,19 @@ class AmbientikaBridge:
         if status is None:
             log.error("Cannot read current status of %s", serial)
             return
-        op = status["operating_mode"]
+        cur_mode = status["operating_mode"]
+        op = cur_mode
         fan = status["fan_speed"]
         hum = status["humidity_level"]
         light = status["light_sensor_level"]
+        # A powered-off unit reports a default light-sensor level (e.g. Medium),
+        # not the user's setting. Re-sending that on the next change would
+        # silently overwrite the user's dusk-sensor choice (e.g. Off). So while
+        # the unit is Off, keep the last light-sensor level we saw while it ran
+        # (or that the user set) - unless the user is changing it right now.
+        if (attr != "light_sensor_level" and cur_mode == OperatingMode.Off
+                and serial in self._last_light):
+            light = self._last_light[serial]
         if attr == "operating_mode":
             op = parsed
         elif attr == "fan_speed":
@@ -1587,6 +1616,7 @@ class AmbientikaBridge:
             hum = parsed
         elif attr == "light_sensor_level":
             light = parsed
+            self._last_light[serial] = parsed
 
         mode = {
             "operating_mode": op, "fan_speed": fan,
@@ -1705,6 +1735,10 @@ class AmbientikaBridge:
                         self._note_poll_failure(serial, "status() failed")
                         continue
                     s = res.unwrap()
+                    # Remember the user's light-sensor level while the unit runs;
+                    # a powered-off unit reports a default (e.g. Medium) instead.
+                    if s["operating_mode"] != OperatingMode.Off:
+                        self._last_light[serial] = s["light_sensor_level"]
                     payload = {
                         "operating_mode": s["operating_mode"].name,
                         "fan_speed": s["fan_speed"].name,
