@@ -1309,8 +1309,9 @@ class AmbientikaBridge:
     async def _reauth(self, reason: str) -> bool:
         """Refresh the Ambientika token in place and re-point every device to it.
 
-        All device calls go through device.api.get/post, which read the token
-        from the shared api object, so a fresh login + re-point refreshes status,
+        All device calls go through device.api.get/post (device.api is the
+        AmbientikaApi HTTP client, i.e. Ambientika._api), so a fresh login +
+        re-point to the new client refreshes status,
         reset and change-mode without rebuilding any device - the poll loop and
         NeuraCell state stay intact. Never raises.
         """
@@ -1323,13 +1324,13 @@ class AmbientikaBridge:
             self.api = res.unwrap()
             for d in list(self.devices.values()):
                 try:
-                    d.api = self.api
+                    d.api = self.api._api
                 except Exception:
                     pass
             for d in (self.dewpoint_device, self.radon_device):
                 if d is not None:
                     try:
-                        d.api = self.api
+                        d.api = self.api._api
                     except Exception:
                         pass
             log.info("re-auth (%s) OK - token refreshed for %d device(s).",
