@@ -1342,18 +1342,24 @@ class AmbientikaBridge:
 
 
     async def _reset_filter(self, device) -> bool:
-        """Fire the documented filter reset once, quietly, and check once.
+        """Fire the documented filter reset and verify against the real status.
 
-        The cloud reset is fire-and-forget (decompiled): it is written to the
-        device's live socket and returns HTTP 200 without a device ack - exactly
-        like the app, which shows success without checking. We send it to the
-        device and its zone Master, then read the real status once to update the
-        (hidden) reset-status sensor. We do NOT retry or raise alarms: whether a
-        reset "takes" is a device/app-side matter the bridge cannot force. Only
-        the documented reset-filter GET is ever sent - never change-mode,
-        reset-device or DELETE.
+        Sent to the device and its zone Master (only the documented reset-filter
+        GET is ever sent - never change-mode, reset-device or DELETE). Then we
+        check the real device status and tell the truth about it:
+
+          * Master / standalone: a reset can actually take, so we re-check a few
+            times until the counter is confirmed cleared, instead of trusting the
+            fire-and-forget HTTP 200.
+          * Slave: the cloud CANNOT clear a Slave's counter at all - the reset is
+            applied only by the zone Master to the Master's own counter, while the
+            Slave keeps its own. So we do NOT claim the status "will follow on the
+            next poll"; we say plainly that a reset directly at the unit is needed,
+            and (if SLAVE_FILTER_SOFT_RESET is on) record a bridge-side "serviced"
+            acknowledgement so dashboards can go green without faking the raw value.
         """
         serial = device.serial_number
+        is_slave = self._zone_master(device) is not None
         before = await self.read_status(device)
         before_fs = str((before or {}).get("filters_status") or "").lower()
         if before_fs and before_fs not in ("bad", "red"):
@@ -1376,20 +1382,98 @@ class AmbientikaBridge:
             log.info("filter reset for %s: device not reachable right now - nothing sent",
                      serial)
             return False
-        # One quiet check against the real device status.
-        await asyncio.sleep(FILTER_RESET_VERIFY_DELAY)
-        after = await self.read_status(device)
-        after_fs = str((after or {}).get("filters_status") or "").lower() if after else ""
-        if after_fs and after_fs not in ("bad", "red"):
-            log.info("filter reset for %s: confirmed - filters_status %s -> %s",
-                     serial, before_fs or "?", after_fs)
-            return True
-        log.info("filter reset for %s: sent to the device and its zone Master; the device "
-                 "still reports filter %r. A cloud reset is fire-and-forget (the app reports "
-                 "success the same way, without checking) - the real status will follow on "
-                 "the next poll if the device applies it.",
-                 serial, (after or {}).get("filters_status") if after else None)
+        # Verify against the real device status. A Slave can never clear remotely,
+        # so we check once and then tell the truth; a Master we re-check a few times.
+        verify_attempts = 1 if is_slave else 3
+        after = before
+        for _ in range(verify_attempts):
+            await asyncio.sleep(FILTER_RESET_VERIFY_DELAY)
+            after = await self.read_status(device)
+            after_fs = str((after or {}).get("filters_status") or "").lower() if after else ""
+            if after_fs and after_fs not in ("bad", "red"):
+                log.info("filter reset for %s: confirmed - filters_status %s -> %s",
+                         serial, before_fs or "?", after_fs)
+                return True
+        if is_slave:
+            self._filter_ack_write(serial, (after or {}).get("filters_status") or "Bad")
+            log.warning(
+                "filter reset for %s: this is a SLAVE - its filter counter cannot be "
+                "reset remotely. The cloud reset is applied only by the zone Master to "
+                "the Master's own counter; the Slave keeps its own. Reset the filter "
+                "DIRECTLY AT THE UNIT (physical WallPanel / at the device). This is a "
+                "device-side limitation, not a transient delay.", serial)
+        else:
+            log.info(
+                "filter reset for %s: sent to the device and its zone Master; the device "
+                "still reports filter %r after %d check(s). A cloud reset is fire-and-forget; "
+                "if the device applies it, the change appears on a later poll.",
+                serial, (after or {}).get("filters_status") if after else None, verify_attempts)
         return False
+
+    # ---- optionaler Slave-Filter-Softreset (bridge-seitige Wartungs-Quittung) ----
+    # Aktivieren mit SLAVE_FILTER_SOFT_RESET=1. Der rohe filters_status wird nie
+    # veraendert; nur der EFFEKTIVE Wert (filter_status_num) zeigt fuer einen
+    # gewarteten, weiterhin roten Slave "Good", bis FILTER_ACK_TTL_DAYS ablaufen.
+    @staticmethod
+    def _soft_reset_enabled() -> bool:
+        return os.environ.get("SLAVE_FILTER_SOFT_RESET", "0") in ("1", "true", "True", "yes")
+
+    @staticmethod
+    def _filter_ack_path() -> str:
+        return os.environ.get("FILTER_ACK_PATH", "/data/filter_ack.json")
+
+    @staticmethod
+    def _filter_ack_ttl() -> float:
+        try:
+            return float(os.environ.get("FILTER_ACK_TTL_DAYS", "90")) * 86400.0
+        except Exception:
+            return 90.0 * 86400.0
+
+    @classmethod
+    def _filter_ack_load(cls) -> dict:
+        try:
+            with open(cls._filter_ack_path(), "r", encoding="utf-8") as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+
+    @classmethod
+    def _filter_ack_save(cls, data: dict) -> None:
+        try:
+            p = cls._filter_ack_path()
+            d = os.path.dirname(p) or "."
+            os.makedirs(d, exist_ok=True)
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, p)
+        except Exception:
+            pass  # best-effort; never break a reset/poll over a write error
+
+    @classmethod
+    def _filter_ack_write(cls, serial: str, raw_status) -> None:
+        if not cls._soft_reset_enabled():
+            return
+        import time
+        data = cls._filter_ack_load()
+        data[serial] = {"acked_at": time.time(), "raw_when_acked": str(raw_status)}
+        cls._filter_ack_save(data)
+
+    @classmethod
+    def _filter_ack_effective(cls, serial: str, raw_status):
+        """Roh, ausser eine gueltige Quittung ueberschreibt einen weiter roten Slave -> 'Good'."""
+        if not cls._soft_reset_enabled():
+            return raw_status
+        import time
+        data = cls._filter_ack_load()
+        rec = data.get(serial)
+        if not rec:
+            return raw_status
+        if time.time() - float(rec.get("acked_at", 0)) > cls._filter_ack_ttl():
+            data.pop(serial, None); cls._filter_ack_save(data); return raw_status
+        if str(raw_status).strip().lower() not in ("bad", "red", "rot", "dirty", "alarm"):
+            data.pop(serial, None); cls._filter_ack_save(data); return raw_status
+        return "Good"
 
 
     async def read_status(self, device: Device) -> Optional[dict]:
@@ -1761,7 +1845,9 @@ class AmbientikaBridge:
                         "humidity_level_num": _enum_num(s["humidity_level"]),
                         "light_sensor_level_num": _enum_num(s["light_sensor_level"]),
                         "air_quality_num": air_quality_to_num(s["air_quality"]),
-                        "filter_status_num": filter_status_to_num(s["filters_status"]),
+                        "filter_status_num": filter_status_to_num(
+                            self._filter_ack_effective(serial, s["filters_status"])),
+                        "filter_status_raw_num": filter_status_to_num(s["filters_status"]),
                     }
                     if self.client is not None:
                         self.client.publish(state_topic(self.cfg.topic_prefix, serial),
