@@ -697,6 +697,7 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
     numeric_defs = [
         ("air_quality_num", "Air Quality (num)"),
         ("filter_status_num", "Filter Status (num)"),
+        ("filter_status_raw_num", "Filter Status raw (num)"),
         ("operating_mode_num", "Mode (num)"),
         ("last_operating_mode_num", "Last Mode (num)"),
         ("fan_speed_num", "Fan Speed (num)"),
