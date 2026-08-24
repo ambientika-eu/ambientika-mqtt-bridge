@@ -667,6 +667,7 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
         ("humidity", "Humidity", "%", "humidity", None),
         ("air_quality", "Air Quality", None, None, "mdi:air-filter"),
         ("filters_status", "Filter Status", None, None, "mdi:air-filter"),
+        ("filters_status_raw", "Filter Status raw", None, None, "mdi:air-filter"),
         ("operating_mode", "Mode", None, None, "mdi:fan"),
         ("fan_speed", "Fan Speed", None, None, "mdi:speedometer"),
         ("humidity_level", "Humidity Level", None, None, "mdi:water-percent"),
@@ -1245,7 +1246,13 @@ class AmbientikaBridge:
 
     # ----- filter reset orchestration: dedupe, status sensor, persistence -----
     def _publish_reset_state(self, serial: str, state: str) -> None:
-        """Publish the per-device reset status (idle/running/confirmed/unconfirmed)."""
+        """Publish the per-device reset status.
+
+        idle / running / confirmed / acknowledged / unconfirmed. "acknowledged"
+        means: the counter could not be cleared remotely (a Slave), but the
+        maintenance was recorded bridge-side, so the effective filter status is
+        green while the raw device value stays red.
+        """
         if self.client is None:
             return
         try:
@@ -1294,14 +1301,15 @@ class AmbientikaBridge:
         def _done(t: "asyncio.Task") -> None:
             self._reset_tasks.discard(t)
             self._reset_inflight.discard(serial)
-            ok = False
+            state = "unconfirmed"
             try:
-                ok = bool(t.result())
+                res = t.result()
+                state = res if isinstance(res, str) else ("confirmed" if res else "unconfirmed")
             except asyncio.CancelledError:
                 log.info("filter reset for %s cancelled", serial)
             except Exception as e:
                 log.exception("filter reset task for %s crashed: %s", serial, e)
-            self._publish_reset_state(serial, "confirmed" if ok else "unconfirmed")
+            self._publish_reset_state(serial, state)
             self._pending_resets.discard(serial)
             self._save_pending()
 
@@ -1342,7 +1350,7 @@ class AmbientikaBridge:
             return False
 
 
-    async def _reset_filter(self, device) -> bool:
+    async def _reset_filter(self, device) -> str:
         """Fire the documented filter reset and verify against the real status.
 
         Sent to the device and its zone Master (only the documented reset-filter
@@ -1372,7 +1380,7 @@ class AmbientikaBridge:
         if before_num == 0:
             log.info("filter reset for %s: filter status is already %r - nothing to do",
                      serial, (before or {}).get("filters_status"))
-            return True
+            return "confirmed"
         accepted = False
         for tserial, label in self._reset_candidates(device):
             status, _allow, text = await self._reset_request(
@@ -1388,7 +1396,7 @@ class AmbientikaBridge:
         if not accepted:
             log.info("filter reset for %s: device not reachable right now - nothing sent",
                      serial)
-            return False
+            return "unconfirmed"
         # Verify against the real device status. A Slave can never clear remotely,
         # so we check once and then tell the truth; a Master we re-check a few times.
         verify_attempts = 1 if is_slave else 3
@@ -1406,9 +1414,11 @@ class AmbientikaBridge:
                     or (before_num is not None and after_num < before_num)):
                 log.info("filter reset for %s: confirmed - filters_status %s -> %s",
                          serial, before_fs or "?", after_fs)
-                return True
+                return "confirmed"
+        acknowledged = False
         if is_slave:
             self._filter_ack_write(serial, (after or {}).get("filters_status") or "Bad")
+            acknowledged = self._soft_reset_enabled()
             log.warning(
                 "filter reset for %s: this is a SLAVE - its filter counter cannot be "
                 "reset remotely. The cloud reset is applied only by the zone Master to "
@@ -1421,7 +1431,12 @@ class AmbientikaBridge:
                 "still reports filter %r after %d check(s). A cloud reset is fire-and-forget; "
                 "if the device applies it, the change appears on a later poll.",
                 serial, (after or {}).get("filters_status") if after else None, verify_attempts)
-        return False
+        if acknowledged:
+            log.info("filter reset for %s: recorded bridge-side as serviced - the effective "
+                     "filter status reports Good while the raw device value stays unchanged.",
+                     serial)
+            return "acknowledged"
+        return "unconfirmed"
 
     # ---- optionaler Slave-Filter-Softreset (bridge-seitige Wartungs-Quittung) ----
     # Aktivieren mit SLAVE_FILTER_SOFT_RESET=1. Der rohe filters_status wird nie
@@ -1839,6 +1854,12 @@ class AmbientikaBridge:
                     # a powered-off unit reports a default (e.g. Medium) instead.
                     if s["operating_mode"] != OperatingMode.Off:
                         self._last_light[serial] = s["light_sensor_level"]
+                    # Filterstatus einmal aufloesen: der effektive Wert (mit
+                    # Wartungsquittung) steht in den Hauptfeldern, der rohe
+                    # Geraetewert daneben in den *_raw-Feldern. Ohne aktive
+                    # Quittung sind beide identisch.
+                    fs_raw = s["filters_status"]
+                    fs_eff = self._filter_ack_effective(serial, fs_raw)
                     payload = {
                         "operating_mode": s["operating_mode"].name,
                         "fan_speed": s["fan_speed"].name,
@@ -1848,7 +1869,8 @@ class AmbientikaBridge:
                         "humidity": s["humidity"],
                         "air_quality": s["air_quality"],
                         "humidity_alarm": s["humidity_alarm"],
-                        "filters_status": s["filters_status"],
+                        "filters_status": fs_eff,
+                        "filters_status_raw": fs_raw,
                         "night_alarm": s["night_alarm"],
                         "device_role": s["device_role"],
                         "last_operating_mode": s["last_operating_mode"].name,
@@ -1860,9 +1882,8 @@ class AmbientikaBridge:
                         "humidity_level_num": _enum_num(s["humidity_level"]),
                         "light_sensor_level_num": _enum_num(s["light_sensor_level"]),
                         "air_quality_num": air_quality_to_num(s["air_quality"]),
-                        "filter_status_num": filter_status_to_num(
-                            self._filter_ack_effective(serial, s["filters_status"])),
-                        "filter_status_raw_num": filter_status_to_num(s["filters_status"]),
+                        "filter_status_num": filter_status_to_num(fs_eff),
+                        "filter_status_raw_num": filter_status_to_num(fs_raw),
                     }
                     if self.client is not None:
                         self.client.publish(state_topic(self.cfg.topic_prefix, serial),
