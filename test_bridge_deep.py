@@ -16,6 +16,10 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Kommandos werden im Betrieb ueber ein kurzes Fenster zusammengefasst. Fuer die
+# Einzelpruefungen unten ist das Fenster aus, damit sie deterministisch bleiben;
+# das Zusammenfassen selbst prueft test_command_coalescing() gezielt.
+os.environ.setdefault("COMMAND_COALESCE_MS", "0")
 _spec = importlib.util.spec_from_file_location("bridge", os.path.join(HERE, "bridge.py"))
 bridge = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bridge)
@@ -238,10 +242,69 @@ async def test_command():
     check("command: reset_filter zweiter Aufruf ohne change_mode", len(dev.mode_calls) == n_modes, len(dev.mode_calls))
 
 
+async def test_command_coalescing():
+    """Mehrere Kommandos kurz hintereinander -> EIN change_mode mit allen Werten.
+
+    Deckt den Wettlauf ab, den Issue #4 beschreibt: frueher fuellte jedes
+    Kommando die uebrigen Attribute aus dem gerade gelesenen Cloud-Status, der
+    die vorige Aenderung noch nicht kannte - das zweite Kommando schrieb den
+    alten Modus zurueck.
+    """
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    b = bridge.AmbientikaBridge(cfg)
+    b.client = FakeClient()
+    b.loop = asyncio.get_running_loop()
+    dev = FakeDevice()
+    b.devices = {dev.serial_number: dev}
+
+    alt = bridge.COMMAND_COALESCE_S
+    bridge.COMMAND_COALESCE_S = 0.2
+    try:
+        await b._handle_command("AMB-2", "operating_mode", "MasterSlaveFlow")
+        await b._handle_command("AMB-2", "fan_speed", "High")
+        await b._handle_command("AMB-2", "humidity_level", "Moist")
+        check("coalescing: noch kein change_mode vor Ablauf des Fensters",
+              len(dev.mode_calls) == 0, len(dev.mode_calls))
+        await asyncio.sleep(0.6)
+        check("coalescing: genau ein change_mode", len(dev.mode_calls) == 1, len(dev.mode_calls))
+        last = dev.mode_calls[-1] if dev.mode_calls else {}
+        check("coalescing: Modus uebernommen", last.get("operating_mode") == OM.MasterSlaveFlow, last)
+        check("coalescing: Luefterstufe uebernommen", last.get("fan_speed") == FS.High, last)
+        check("coalescing: Feuchtestufe uebernommen", last.get("humidity_level") == HL.Moist, last)
+
+        # Sammelkommando auf <prefix>/<serial>/set
+        n = len(dev.mode_calls)
+        await b._handle_command_set("AMB-2", {"mode": "Auto", "fanSpeed": "Low"})
+        await asyncio.sleep(0.6)
+        check("kombiniert: ein change_mode", len(dev.mode_calls) == n + 1, len(dev.mode_calls))
+        last = dev.mode_calls[-1]
+        check("kombiniert: Kurzname mode verstanden", last.get("operating_mode") == OM.Auto, last)
+        check("kombiniert: Kurzname fanSpeed verstanden", last.get("fan_speed") == FS.Low, last)
+
+        # Ungueltiger Wert verwirft das ganze Sammelkommando
+        n = len(dev.mode_calls)
+        await b._handle_command_set("AMB-2", {"mode": "Auto", "fanSpeed": "Bogus"})
+        await asyncio.sleep(0.6)
+        check("kombiniert: ungueltiger Wert verwirft alles", len(dev.mode_calls) == n, len(dev.mode_calls))
+
+        # Unbekanntes Attribut wird ignoriert, der Rest wirkt
+        n = len(dev.mode_calls)
+        await b._handle_command_set("AMB-2", {"temperature": 22, "fanSpeed": "High"})
+        await asyncio.sleep(0.6)
+        check("kombiniert: unbekanntes Attribut uebersprungen", len(dev.mode_calls) == n + 1, len(dev.mode_calls))
+        check("kombiniert: uebriges Attribut angewandt",
+              dev.mode_calls[-1].get("fan_speed") == FS.High, dev.mode_calls[-1])
+    finally:
+        bridge.COMMAND_COALESCE_S = alt
+
+
 async def _async_suite():
     await test_neuracell()
     await test_payload()
     await test_command()
+    await test_command_coalescing()
 
 
 def main():
