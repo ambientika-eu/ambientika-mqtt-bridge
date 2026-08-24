@@ -138,36 +138,90 @@ See [`iobroker-adapter/README.md`](iobroker-adapter/README.md)
 
 | Topic | Direction | Description |
 |-------|-----------|-------------|
-| `ambientika/<deviceId>/status` | Bridge → Broker | Full device state (JSON) |
-| `ambientika/<deviceId>/set` | Broker → Bridge | Set mode/fanSpeed (JSON) |
-| `ambientika/<deviceId>/availability` | Bridge → Broker | `online` / `offline` |
+| `ambientika/<serial>/state` | Bridge → Broker | Full device state (JSON, retained) |
+| `ambientika/<serial>/availability` | Bridge → Broker | `online` / `offline` |
+| `ambientika/<serial>/reset_state` | Bridge → Broker | Filter reset: `idle` / `running` / `confirmed` / `acknowledged` / `unconfirmed` |
+| `ambientika/<serial>/set/<attribute>` | Broker → Bridge | Set **one** attribute, plain value |
+| `ambientika/<serial>/set` | Broker → Bridge | Set **several** attributes at once (JSON object) |
+| `ambientika/bridge/availability` | Bridge → Broker | The bridge itself: `online` / `offline` |
 | `ambientika/neuracell/state` | Bridge → Broker | NeuraCell-X® radon + dew-point status (JSON) |
+
+`<serial>` is the device serial number as reported by the cloud; it is printed in
+the log at start-up. `ambientika` is the default prefix (`MQTT_PREFIX`).
 
 ### Status Payload Example
 
 ```json
 {
-  "deviceId": "DEV001",
-  "serial": "AMB-2024-001",
-  "name": "Bedroom",
-  "mode": "HRV",
-  "fanSpeed": 75,
-  "temperature": 21.5,
+  "operating_mode": "Smart",
+  "fan_speed": "Medium",
+  "humidity_level": "Normal",
+  "light_sensor_level": "Medium",
+  "temperature": 21,
   "humidity": 52,
-  "airQuality": 850,
-  "filterAlarm": false,
-  "online": true,
-  "rssi": -58
+  "air_quality": "Good",
+  "humidity_alarm": false,
+  "filters_status": "Good",
+  "filters_status_raw": "Good",
+  "night_alarm": false,
+  "device_role": "SlaveEqualMaster",
+  "last_operating_mode": "Smart",
+  "zone_index": 1,
+  "operating_mode_num": 0,
+  "last_operating_mode_num": 0,
+  "fan_speed_num": 2,
+  "humidity_level_num": 1,
+  "light_sensor_level_num": 3,
+  "air_quality_num": 3,
+  "filter_status_num": 0,
+  "filter_status_raw_num": 0
 }
 ```
 
-### Command Payload Example
+Every categorical value comes with a numeric companion (`*_num`) so long-term
+statistics and Grafana work without a translation table of your own.
 
-```json
-{ "mode": "NIGHT" }
-{ "fanSpeed": 50 }
-{ "mode": "HRV", "fanSpeed": 75 }
+### Commands
+
+Writable attributes and their accepted values:
+
+| Attribute | Values |
+|---|---|
+| `operating_mode` | `Smart`, `Auto`, `ManualHeatRecovery`, `Night`, `AwayHome`, `Surveillance`, `TimedExpulsion`, `Expulsion`, `Intake`, `MasterSlaveFlow`, `SlaveMasterFlow`, `Off` |
+| `fan_speed` | `Low`, `Medium`, `High` |
+| `humidity_level` | `Dry`, `Normal`, `Moist` |
+| `light_sensor_level` | `NotAvailable`, `Off`, `Low`, `Medium` |
+| `reset_filter` | any payload triggers the filter reset |
+
+**One attribute** — the value is the plain payload, not JSON:
+
 ```
+topic:   ambientika/AMB-2024-001/set/operating_mode
+payload: MasterSlaveFlow
+```
+
+**Several attributes at once** — a JSON object on the `set` topic, without an
+attribute in the topic:
+
+```
+topic:   ambientika/AMB-2024-001/set
+payload: {"operating_mode": "MasterSlaveFlow", "fan_speed": "High"}
+```
+
+The short names `mode`, `fanSpeed`, `humidityLevel` and `lightSensorLevel` are
+accepted as well. An invalid value rejects the whole command; an unknown key is
+skipped with a warning in the log.
+
+**Commands are coalesced.** Each command has to fill the attributes it does not
+set from the device's current status, and the cloud needs a moment to reflect a
+change. Commands that arrive for the same device within `COMMAND_COALESCE_MS`
+(default `800`) are therefore applied in a single call — so an automation that
+sets the operating mode and then the fan speed no longer writes the old mode
+back. Set `COMMAND_COALESCE_MS=0` to apply every command on its own, immediately.
+
+> `fan_speed` may be *reported* as `Night` while a unit runs on its night step.
+> That value is read-only: it is published as state but rejected on the command
+> path, because the API would not accept it back.
 
 ---
 
@@ -186,6 +240,7 @@ See [`iobroker-adapter/README.md`](iobroker-adapter/README.md)
 | `AVAILABILITY_FAILURE_THRESHOLD` | `3` | Consecutive failed polls before a device is flagged offline |
 | `HA_DISCOVERY` | `true` | Enable Home Assistant Auto-Discovery |
 | `LOG_LEVEL` | `INFO` | Logging level |
+| `COMMAND_COALESCE_MS` | `800` | Commands for the same device within this window are applied in one call (`0` = off) |
 | `SLAVE_FILTER_SOFT_RESET` | `0` | Record a bridge-side "serviced" acknowledgement when a Slave's filter counter cannot be cleared remotely (see below) |
 | `FILTER_ACK_TTL_DAYS` | `90` | How long such an acknowledgement stays valid |
 | `FILTER_ACK_PATH` | `/data/filter_ack.json` | Where the acknowledgements are stored (needs a persistent volume) |
