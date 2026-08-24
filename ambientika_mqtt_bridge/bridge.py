@@ -107,6 +107,18 @@ REAUTH_INTERVAL = float(os.environ.get("REAUTH_INTERVAL", "21600") or 21600)
 # restart/update resumes the retry instead of losing it.
 PENDING_RESET_FILE = os.environ.get("PENDING_RESET_FILE", "/data/ambientika_pending_resets.json")
 
+# Commands that arrive within this window for the same device are applied in a
+# SINGLE change_mode call. Home Assistant automations that set e.g. mode and fan
+# speed one after the other used to race: every command reads the current status
+# to fill the attributes it does not set, and the cloud still reported the old
+# mode when the second command was built - so the second one wrote the old mode
+# back. Coalescing removes the race and halves the cloud calls. 0 disables it
+# (immediate per-command behaviour).
+try:
+    COMMAND_COALESCE_S = max(0.0, float(os.environ.get("COMMAND_COALESCE_MS", "800"))) / 1000.0
+except Exception:
+    COMMAND_COALESCE_S = 0.8
+
 # ---------------------------------------------------------------------------
 # ambientika_py enum compatibility  (issue #5)
 # ---------------------------------------------------------------------------
@@ -1136,6 +1148,10 @@ class AmbientikaBridge:
         self._reset_inflight: set = set()
         self._pending_resets: set = set()
         self._reauth_ts: float = 0.0
+        # Pending command attributes per serial + their flush timers
+        # (see COMMAND_COALESCE_S).
+        self._pending_cmds: dict = {}
+        self._cmd_timers: dict = {}
         self._stop_event: Optional[asyncio.Event] = None
         self.neuracell = NeuraCellXController(self, cfg)
         # serial -> number of consecutive failed polls (availability debounce)
@@ -1576,6 +1592,9 @@ class AmbientikaBridge:
     def _subscribe_all(self, client) -> None:
         for serial in self.devices:
             client.subscribe(f"{self.cfg.topic_prefix}/{serial}/set/+")
+            # Combined command: one JSON payload with several attributes.
+            # "a/b/set/+" does not match "a/b/set", so this needs its own filter.
+            client.subscribe(f"{self.cfg.topic_prefix}/{serial}/set")
         if self.cfg.neuracell_enabled:
             if self.cfg.radon_source == "device":
                 log.info("NeuraCell-X: radon read from meter %s (Ambientika cloud, no MQTT input).",
@@ -1639,8 +1658,24 @@ class AmbientikaBridge:
                     if which:
                         self._dispatch(self.neuracell.on_dewpoint_sensor(which, payload)); return
 
-            # Device command topics: <prefix>/<serial>/set/<attr>
+            # Device command topics:
+            #   <prefix>/<serial>/set/<attr>  - one attribute, plain value
+            #   <prefix>/<serial>/set         - several attributes, JSON object
             parts = topic.split("/")
+            if len(parts) >= 3 and parts[-1] == "set":
+                serial = parts[-2]
+                try:
+                    data = json.loads(payload)
+                except Exception:
+                    log.error("Combined command for %s is not valid JSON: %r", serial, payload)
+                    return
+                if not isinstance(data, dict):
+                    log.error("Combined command for %s must be a JSON object, got %s",
+                              serial, type(data).__name__)
+                    return
+                log.info("Command received: serial=%s combined=%s", serial, payload)
+                self._dispatch(self._handle_command_set(serial, data))
+                return
             if len(parts) < 4 or parts[-2] != "set":
                 return
             serial = parts[-3]
@@ -1657,35 +1692,91 @@ class AmbientikaBridge:
         "humidity_level": HumidityLevel,
     }
 
-    async def _handle_command(self, serial: str, attr: str, value: str) -> None:
+    # Aliases accepted in the combined JSON command, so both the documented
+    # short names and the canonical state field names work.
+    _CMD_ALIASES = {
+        "mode": "operating_mode", "operatingmode": "operating_mode",
+        "operating_mode": "operating_mode",
+        "fanspeed": "fan_speed", "fan_speed": "fan_speed",
+        "humiditylevel": "humidity_level", "humidity_level": "humidity_level",
+        "lightsensorlevel": "light_sensor_level", "light_sensor_level": "light_sensor_level",
+        "resetfilter": "reset_filter", "reset_filter": "reset_filter",
+    }
+
+    async def _handle_command_set(self, serial: str, data: dict) -> None:
+        """Combined command: apply several attributes in ONE change_mode call."""
         device = self.devices.get(serial)
         if device is None:
             log.warning("Unknown device serial: %s", serial)
             return
-
-        # Filter reset: fire the documented cloud reset once, quietly (like the
-        # app, which shows success without checking - confirmed by decompiling
-        # WebService.dll). _reset_filter sends it and reads the real status once
-        # for the hidden reset-status sensor; it does not retry or alarm. Run it
-        # in the background so this MQTT handler returns immediately.
-        if attr == "reset_filter":
-            self._start_reset(device)
+        wanted = {}
+        for raw_key, raw_val in data.items():
+            key = self._CMD_ALIASES.get(str(raw_key).strip().lower().replace("-", "").replace("_", "")
+                                        .replace(" ", ""))
+            if key is None:
+                key = self._CMD_ALIASES.get(str(raw_key).strip().lower())
+            if key is None:
+                log.warning("Unsupported attribute in combined command for %s: %r", serial, raw_key)
+                continue
+            if key == "reset_filter":
+                if str(raw_val).strip().lower() not in ("0", "false", "no", "off", ""):
+                    self._start_reset(device)
+                continue
+            wanted[key] = raw_val
+        if not wanted:
             return
+        parsed = {}
+        for attr, value in wanted.items():
+            p = self._parse_command_value(attr, value)
+            if p is None:
+                log.error("Invalid value %r for %s", value, attr)
+                return
+            parsed[attr] = p
+        await self._queue_command(device, parsed)
 
-        # Parse the target attribute first - this needs no live status, so a
-        # baseline change can be deferred even while the device is offline.
+    def _parse_command_value(self, attr: str, value):
+        """Strict parse of one command value. None means: reject the command."""
         enum_cls = self._BASELINE_ATTRS.get(attr)
         if enum_cls is None and attr != "light_sensor_level":
-            log.warning("Unsupported attribute: %s", attr)
-            return
+            return None
         # Strict lookup on purpose: a bad payload must not create a new enum
         # member via the compatibility map, and compatibility members (e.g. the
         # reported-only fan speed "Night") must not be sent back to the API.
-        parsed = strict_enum_lookup(enum_cls if enum_cls is not None
-                                    else LightSensorLevel, value)
-        if parsed is None:
-            log.error("Invalid value %r for %s", value, attr)
+        return strict_enum_lookup(enum_cls if enum_cls is not None else LightSensorLevel,
+                                  str(value))
+
+    async def _queue_command(self, device, parsed: dict) -> None:
+        """Merge attributes into the device's pending set and schedule the flush."""
+        serial = device.serial_number
+        pend = self._pending_cmds.setdefault(serial, {})
+        pend.update(parsed)
+        if COMMAND_COALESCE_S <= 0:
+            await self._flush_commands(device)
             return
+        task = self._cmd_timers.get(serial)
+        if task is not None and not task.done():
+            return          # a flush is already scheduled; it will pick this up
+        async def _later():
+            try:
+                await asyncio.sleep(COMMAND_COALESCE_S)
+                await self._flush_commands(device)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.exception("command flush for %s crashed: %s", serial, e)
+            finally:
+                self._cmd_timers.pop(serial, None)
+        self._cmd_timers[serial] = asyncio.create_task(_later())
+
+    async def _flush_commands(self, device) -> None:
+        """Apply every pending attribute of one device in a single change_mode."""
+        serial = device.serial_number
+        parsed = self._pending_cmds.pop(serial, None)
+        if not parsed:
+            return
+        if len(parsed) > 1:
+            log.info("Applying %d attributes for %s in one call: %s",
+                     len(parsed), serial, ", ".join(sorted(parsed)))
 
         # While this device is under active protection control, manual changes
         # to baseline attributes (mode/fan/humidity) must not fight the
@@ -1693,19 +1784,24 @@ class AmbientikaBridge:
         # clears) instead of applying them now. Devices NOT under control (e.g.
         # units outside a targeted dew-point block) stay fully controllable.
         # Non-baseline attrs (light sensor) always pass through.
-        if self.neuracell._device_under_control(serial, device) and attr in self._BASELINE_ATTRS:
+        if self.neuracell._device_under_control(serial, device):
             nc = self.neuracell
-            if serial in nc._saved_modes:
-                nc._saved_modes[serial][attr] = parsed
-            else:
-                nc._pending_manual.setdefault(serial, {})[attr] = parsed
-            log.warning(
-                "NeuraCell-X active: deferring manual %s change on %s until protection clears.",
-                attr, serial,
-            )
-            return
+            deferred = [a for a in parsed if a in self._BASELINE_ATTRS]
+            for attr in deferred:
+                if serial in nc._saved_modes:
+                    nc._saved_modes[serial][attr] = parsed[attr]
+                else:
+                    nc._pending_manual.setdefault(serial, {})[attr] = parsed[attr]
+            if deferred:
+                log.warning(
+                    "NeuraCell-X active: deferring manual %s change on %s until protection clears.",
+                    ", ".join(sorted(deferred)), serial,
+                )
+            parsed = {a: v for a, v in parsed.items() if a not in self._BASELINE_ATTRS}
+            if not parsed:
+                return
 
-        # Live change: read current status to fill the unchanged attributes.
+        # Live change: read current status ONCE to fill the unchanged attributes.
         status = await self.read_status(device)
         if status is None:
             log.error("Cannot read current status of %s", serial)
@@ -1720,18 +1816,18 @@ class AmbientikaBridge:
         # silently overwrite the user's dusk-sensor choice (e.g. Off). So while
         # the unit is Off, keep the last light-sensor level we saw while it ran
         # (or that the user set) - unless the user is changing it right now.
-        if (attr != "light_sensor_level" and cur_mode == OperatingMode.Off
+        if ("light_sensor_level" not in parsed and cur_mode == OperatingMode.Off
                 and serial in self._last_light):
             light = self._last_light[serial]
-        if attr == "operating_mode":
-            op = parsed
-        elif attr == "fan_speed":
-            fan = parsed
-        elif attr == "humidity_level":
-            hum = parsed
-        elif attr == "light_sensor_level":
-            light = parsed
-            self._last_light[serial] = parsed
+        if "operating_mode" in parsed:
+            op = parsed["operating_mode"]
+        if "fan_speed" in parsed:
+            fan = parsed["fan_speed"]
+        if "humidity_level" in parsed:
+            hum = parsed["humidity_level"]
+        if "light_sensor_level" in parsed:
+            light = parsed["light_sensor_level"]
+            self._last_light[serial] = light
 
         mode = {
             "operating_mode": op, "fan_speed": fan,
@@ -1746,6 +1842,33 @@ class AmbientikaBridge:
             log.error("change_mode failed for %s: %s", serial, res)
         else:
             log.info("change_mode OK for %s", serial)
+
+    async def _handle_command(self, serial: str, attr: str, value: str) -> None:
+        """Single-attribute command: <prefix>/<serial>/set/<attr>."""
+        device = self.devices.get(serial)
+        if device is None:
+            log.warning("Unknown device serial: %s", serial)
+            return
+
+        # Filter reset: fire the documented cloud reset once, quietly (like the
+        # app, which shows success without checking - confirmed by decompiling
+        # WebService.dll). _reset_filter sends it and reads the real status once
+        # for the hidden reset-status sensor; it does not retry or alarm. Run it
+        # in the background so this MQTT handler returns immediately.
+        if attr == "reset_filter":
+            self._start_reset(device)
+            return
+
+        # Parse first - this needs no live status, so an invalid payload is
+        # rejected cleanly and a deferred baseline change works while offline.
+        parsed = self._parse_command_value(attr, value)
+        if parsed is None:
+            if attr not in self._BASELINE_ATTRS and attr != "light_sensor_level":
+                log.warning("Unsupported attribute: %s", attr)
+            else:
+                log.error("Invalid value %r for %s", value, attr)
+            return
+        await self._queue_command(device, {attr: parsed})
 
 
     def publish_neuracell_state(self) -> None:
