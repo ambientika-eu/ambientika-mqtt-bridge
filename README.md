@@ -186,6 +186,9 @@ See [`iobroker-adapter/README.md`](iobroker-adapter/README.md)
 | `AVAILABILITY_FAILURE_THRESHOLD` | `3` | Consecutive failed polls before a device is flagged offline |
 | `HA_DISCOVERY` | `true` | Enable Home Assistant Auto-Discovery |
 | `LOG_LEVEL` | `INFO` | Logging level |
+| `SLAVE_FILTER_SOFT_RESET` | `0` | Record a bridge-side "serviced" acknowledgement when a Slave's filter counter cannot be cleared remotely (see below) |
+| `FILTER_ACK_TTL_DAYS` | `90` | How long such an acknowledgement stays valid |
+| `FILTER_ACK_PATH` | `/data/filter_ack.json` | Where the acknowledgements are stored (needs a persistent volume) |
 
 > **MQTT credentials are required for most brokers.** The official Home Assistant Mosquitto add-on and most production setups disable anonymous MQTT access. If `MQTT_USER` / `MQTT_PASSWORD` are empty the bridge will fail to connect with `Not authorized`. Create a dedicated MQTT user for the bridge (e.g. via the Mosquitto add-on's `logins` option) and set both variables.
 
@@ -211,6 +214,31 @@ lookup, so any future unknown value is auto-registered with a warning instead of
 breaking the poll. Such compatibility members are **read-only**: they are
 published as state but rejected on the command path, because the API would not
 accept them back.
+
+### Filter reset on Master/Slave groups
+
+The filter reset is applied by the **Master** of a coupled zone. Each Slave keeps
+its own counter, which the cloud cannot reach: a reset addressed to a Slave is
+acknowledged with HTTP 200 but never carried out. The bridge sends the documented
+`device/reset-filter` to the device and to its zone Master, then checks the real
+device status and reports what actually happened - for a Slave it says plainly
+that the reset has to be done at the unit itself, instead of promising a change on
+a later poll.
+
+A counter is only skipped when it is positively `Good`. `Medium` (yellow) is a
+real reset case, since filters are usually cleaned before the alarm turns red.
+
+Set `SLAVE_FILTER_SOFT_RESET=1` and mount a persistent `/data` to record a
+bridge-side maintenance acknowledgement for such a Slave. `filter_status_num` then
+reports the serviced unit as green until `FILTER_ACK_TTL_DAYS` expire, while the
+raw device value stays untouched and remains visible in `filters_status` and in
+`filter_status_raw_num`. Warning rules on the worst filter state therefore fire
+correctly again, without a serviced Slave hanging on red forever. The feature is
+**off by default**.
+
+Truly zeroing a Slave's counter is only possible at the device: configure the unit
+in the app temporarily as a standalone device, reset the filter, then set it up as
+a Slave again.
 
 ### Availability debounce
 
