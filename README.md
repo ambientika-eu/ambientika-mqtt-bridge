@@ -231,10 +231,24 @@ real reset case, since filters are usually cleaned before the alarm turns red.
 Set `SLAVE_FILTER_SOFT_RESET=1` and mount a persistent `/data` to record a
 bridge-side maintenance acknowledgement for such a Slave. `filter_status_num` then
 reports the serviced unit as green until `FILTER_ACK_TTL_DAYS` expire, while the
-raw device value stays untouched and remains visible in `filters_status` and in
-`filter_status_raw_num`. Warning rules on the worst filter state therefore fire
-correctly again, without a serviced Slave hanging on red forever. The feature is
-**off by default**.
+raw device value stays untouched. Both the text and the numeric field come as a
+pair - the main field carries the effective value, the raw device value sits next
+to it:
+
+| Field | Content |
+|---|---|
+| `filters_status` | effective (acknowledgement applied) |
+| `filters_status_raw` | raw device value |
+| `filter_status_num` | effective |
+| `filter_status_raw_num` | raw device value |
+
+Warning rules on the worst filter state therefore fire correctly again, without a
+serviced Slave hanging on red forever. With the feature off - the default - the
+main and raw fields are identical.
+
+The diagnostic sensor *Filter Reset Status* reports `acknowledged` for such a
+reset, as opposed to `confirmed` (the counter really cleared) and `unconfirmed`
+(neither cleared nor recorded).
 
 Truly zeroing a Slave's counter is only possible at the device: configure the unit
 in the app temporarily as a standalone device, reset the filter, then set it up as
