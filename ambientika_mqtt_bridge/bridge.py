@@ -1350,8 +1350,9 @@ class AmbientikaBridge:
         check the real device status and tell the truth about it:
 
           * Master / standalone: a reset can actually take, so we re-check a few
-            times until the counter is confirmed cleared, instead of trusting the
-            fire-and-forget HTTP 200.
+            times until the counter has demonstrably improved, instead of trusting
+            the fire-and-forget HTTP 200. This runs for a Medium (yellow) counter
+            just as for a red one; only a counter already at Good is skipped.
           * Slave: the cloud CANNOT clear a Slave's counter at all - the reset is
             applied only by the zone Master to the Master's own counter, while the
             Slave keeps its own. So we do NOT claim the status "will follow on the
@@ -1363,7 +1364,12 @@ class AmbientikaBridge:
         is_slave = self._zone_master(device) is not None
         before = await self.read_status(device)
         before_fs = str((before or {}).get("filters_status") or "").lower()
-        if before_fs and before_fs not in ("bad", "red"):
+        before_num = filter_status_to_num(before_fs)
+        # Only a counter that is positively "Good" has nothing to reset. Medium
+        # (yellow) is a real reset case - filters are usually cleaned before the
+        # alarm turns red - and an unknown value is never a reason to skip
+        # silently; we send the documented reset and report what really happens.
+        if before_num == 0:
             log.info("filter reset for %s: filter status is already %r - nothing to do",
                      serial, (before or {}).get("filters_status"))
             return True
@@ -1391,7 +1397,13 @@ class AmbientikaBridge:
             await asyncio.sleep(FILTER_RESET_VERIFY_DELAY)
             after = await self.read_status(device)
             after_fs = str((after or {}).get("filters_status") or "").lower() if after else ""
-            if after_fs and after_fs not in ("bad", "red"):
+            after_num = filter_status_to_num(after_fs)
+            # Confirmed only when the counter really improved: cleared to Good, or
+            # at least one step less urgent than before. Testing for "not red"
+            # would report success for a Medium counter that never moved.
+            if after_num is not None and (
+                    after_num == 0
+                    or (before_num is not None and after_num < before_num)):
                 log.info("filter reset for %s: confirmed - filters_status %s -> %s",
                          serial, before_fs or "?", after_fs)
                 return True
@@ -1462,7 +1474,7 @@ class AmbientikaBridge:
 
     @classmethod
     def _filter_ack_effective(cls, serial: str, raw_status):
-        """Roh, ausser eine gueltige Quittung ueberschreibt einen weiter roten Slave -> 'Good'."""
+        """Roh, ausser eine gueltige Quittung ueberschreibt einen weiter faelligen Slave -> 'Good'."""
         if not cls._soft_reset_enabled():
             return raw_status
         import time
@@ -1472,7 +1484,9 @@ class AmbientikaBridge:
             return raw_status
         if time.time() - float(rec.get("acked_at", 0)) > cls._filter_ack_ttl():
             data.pop(serial, None); cls._filter_ack_save(data); return raw_status
-        if str(raw_status).strip().lower() not in ("bad", "red", "rot", "dirty", "alarm"):
+        # Faellig ist alles ueber "Good" - also Gelb wie Rot. Unbekannte Werte
+        # gelten als nicht faellig, dann wird die Quittung aufgeraeumt.
+        if (filter_status_to_num(raw_status) or 0) <= 0:
             data.pop(serial, None); cls._filter_ack_save(data); return raw_status
         return "Good"
 
