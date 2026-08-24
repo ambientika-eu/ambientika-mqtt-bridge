@@ -567,6 +567,26 @@ class BridgeConfig:
 # Topic helpers
 # ---------------------------------------------------------------------------
 
+# CONNACK return codes (MQTT 3.1.1) in plain words. The bare number tells a
+# user nothing, and the two common cases both point at the same two options.
+_MQTT_RC_HINTS = {
+    1: "the broker rejected the protocol version.",
+    2: "the broker rejected the client id.",
+    3: "the broker is unavailable - is the Mosquitto add-on installed and started, "
+       "and is 'mqtt_host' correct?",
+    4: "bad MQTT username or password - check 'mqtt_username' and 'mqtt_password' "
+       "in the add-on options.",
+    5: "not authorized - the broker refused the login. The official Mosquitto add-on "
+       "does not allow anonymous access, so 'mqtt_username' and 'mqtt_password' must "
+       "be set to a broker user (e.g. a Home Assistant user, or one from Mosquitto's "
+       "'logins' option).",
+}
+
+
+def _mqtt_rc_hint(rc) -> str:
+    return _MQTT_RC_HINTS.get(rc, "unknown reason - see the broker's log.")
+
+
 def state_topic(prefix: str, serial: str) -> str:
     return f"{prefix}/{serial}/state"
 
@@ -1633,7 +1653,7 @@ class AmbientikaBridge:
             self._publish_discovery()
             self.publish_neuracell_state()
         else:
-            log.error("MQTT connection failed (rc=%s).", rc)
+            log.error("MQTT connection failed (rc=%s): %s", rc, _mqtt_rc_hint(rc))
 
     def _dispatch(self, coro) -> None:
         if self.loop is not None:
@@ -2148,7 +2168,10 @@ def main() -> None:
     log.info("Poll interval : %ss", cfg.poll_interval)
 
     if not cfg.username or not cfg.password:
-        log.error("Ambientika username/password missing. Set them in the add-on options or config.yaml.")
+        log.error("Ambientika username/password missing. Set 'ambientika_username' and "
+                  "'ambientika_password' in the add-on options (or config.yaml). These are "
+                  "the same e-mail address and password you use to sign in to the Ambientika "
+                  "app - there is no separate account for the bridge.")
         sys.exit(1)
 
     bridge = AmbientikaBridge(cfg)
