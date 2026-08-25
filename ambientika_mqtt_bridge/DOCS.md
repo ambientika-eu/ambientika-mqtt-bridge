@@ -44,6 +44,7 @@ Then save and start the add-on. Your units appear under
 | `poll_interval` | `30` | How often the units are read, in seconds (10–300) |
 | `availability_failure_threshold` | `3` | Consecutive failed reads before a unit is shown as unavailable. Prevents flickering on a single cloud hiccup |
 | `log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR` |
+| `command_coalesce_ms` | `800` | Commands for the same unit within this window are applied in one call. `0` applies every command immediately |
 | `slave_filter_soft_reset` | `false` | Maintenance acknowledgement for Slave units, see below |
 | `filter_ack_ttl_days` | `90` | How long such an acknowledgement stays valid |
 
@@ -85,6 +86,10 @@ function actually running, and **Fan Speed** shows the real speed.
 
 Commands for the same unit that arrive close together are applied in a single
 call, so setting the mode and then the fan speed no longer overwrites the mode.
+The window is `command_coalesce_ms` (800 ms by default); a single command is
+therefore carried out up to that much later. Set it to `0` if you prefer every
+command to go out immediately.
+
 You can also send everything at once to `ambientika/<serial>/set`:
 
 ```json
