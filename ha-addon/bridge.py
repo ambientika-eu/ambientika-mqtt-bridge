@@ -708,6 +708,13 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
         ("last_operating_mode", "Last Mode", None, None, "mdi:fan-clock"),
         ("zone_index", "Zone", None, None, "mdi:home-group"),
     ]
+    # Nur die beiden echten Messwerte (Temperatur, Feuchte) bekommen
+    # state_class=measurement. Ohne das legt Home Assistant keine
+    # Langzeitstatistik an und die Werte fallen mit der Recorder-Aufbewahrung
+    # nach rund zehn Tagen weg - gerade der Feuchteverlauf ueber die
+    # Heizperiode ist aber die Auswertung, die man haben will. Die uebrigen
+    # Eintraege dieser Liste sind Textwerte, dort waere measurement falsch.
+    MEASUREMENT_KEYS = {"temperature", "humidity"}
     for key, name, unit, dc, icon in sensor_defs:
         p = {
             "name": name,
@@ -717,6 +724,8 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
             "availability_topic": avail,
             "device": device_info,
         }
+        if key in MEASUREMENT_KEYS:
+            p["state_class"] = "measurement"
         if unit:
             p["unit_of_measurement"] = unit
         if dc:
