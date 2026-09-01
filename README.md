@@ -334,3 +334,13 @@ MIT License – © Ambientika / SUEDWIND
 
 - 🌐 [ambientika.eu](https://www.ambientika.eu)
 - 📦 [GitHub Repository](https://github.com/ambientika-eu/ambientika-mqtt-bridge)
+
+---
+
+## Running without our server
+
+This bridge reads its data through the Ambientika server. There is a second, standalone version that replaces that server with a local service speaking the same protocol, so no measurement and no command leaves the house:
+
+https://github.com/ambientika-eu/ambientika-local-standalone
+
+Initial commissioning still runs once through the Ambientika app; after that the installation stays local. The standalone version is new and not yet proven on every firmware revision, so it ships in observation mode: it reads, decodes and publishes, but writes nothing to the units until you switch that off.
