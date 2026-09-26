@@ -907,7 +907,12 @@ class NeuraCellXController:
         self.bridge = bridge
         self.cfg = cfg
 
-        self.radon_active = False
+        # Radon alarm sources are tracked separately and OR-combined, so a
+        # value-based alarm (radon_topic / numeric meter field) and an explicit
+        # alarm (radon_alarm_topic / text or bool meter field) can never switch
+        # each other off. Either one keeps radon protection on (safety first).
+        self._radon_value_alarm = False
+        self._radon_signal_alarm = False
         self.dewpoint_block = False
         self.last_radon: Optional[float] = None
 
@@ -920,6 +925,10 @@ class NeuraCellXController:
         self._lock = asyncio.Lock()
 
     # ----- convenience -----
+    @property
+    def radon_active(self) -> bool:
+        return self._radon_value_alarm or self._radon_signal_alarm
+
     @property
     def override_active(self) -> bool:
         return self.radon_active or self.dewpoint_block
@@ -958,17 +967,19 @@ class NeuraCellXController:
             log.warning("NeuraCell-X: could not parse radon value %r", raw)
             return
         self.last_radon = value
-        changed = False
-        if not self.radon_active and value >= self.cfg.radon_threshold:
+        before = self.radon_active
+        if not self._radon_value_alarm and value >= self.cfg.radon_threshold:
             log.warning("NeuraCell-X: radon %.0f >= %d Bq/m3 -> radon protection ON.",
                         value, self.cfg.radon_threshold)
-            self.radon_active = True
-            changed = True
-        elif self.radon_active and value <= (self.cfg.radon_threshold - self.cfg.radon_hysteresis):
-            log.warning("NeuraCell-X: radon %.0f Bq/m3 back to safe -> radon protection OFF.", value)
-            self.radon_active = False
-            changed = True
-        if changed:
+            self._radon_value_alarm = True
+        elif self._radon_value_alarm and value <= (self.cfg.radon_threshold - self.cfg.radon_hysteresis):
+            if self._radon_signal_alarm:
+                log.warning("NeuraCell-X: radon %.0f Bq/m3 back to safe, but explicit radon alarm "
+                            "still active -> radon protection stays ON.", value)
+            else:
+                log.warning("NeuraCell-X: radon %.0f Bq/m3 back to safe -> radon protection OFF.", value)
+            self._radon_value_alarm = False
+        if self.radon_active != before:
             await self.reconcile(force=True)
         else:
             self.bridge.publish_neuracell_state()
@@ -977,10 +988,22 @@ class NeuraCellXController:
         if not self.cfg.neuracell_enabled:
             return
         on = _truthy(raw)
-        if on != self.radon_active:
-            self.radon_active = on
-            log.warning("NeuraCell-X: explicit radon alarm %s.", "ON" if on else "OFF")
+        await self._set_radon_signal_alarm(on, "explicit radon alarm %s." % ("ON" if on else "OFF"))
+
+    async def _set_radon_signal_alarm(self, on: bool, msg: str) -> None:
+        """Set the explicit (non-numeric) radon alarm source and reconcile on change."""
+        if on == self._radon_signal_alarm:
+            self.bridge.publish_neuracell_state()
+            return
+        before = self.radon_active
+        self._radon_signal_alarm = on
+        if not on and self._radon_value_alarm:
+            msg += " Radon value still above threshold -> radon protection stays ON."
+        log.warning("NeuraCell-X: %s", msg)
+        if self.radon_active != before:
             await self.reconcile(force=True)
+        else:
+            self.bridge.publish_neuracell_state()
 
     async def poll_radon_device(self, device: Any) -> None:
         """Derive the radon alarm from a radon meter's cloud status (source='device').
@@ -1018,13 +1041,9 @@ class NeuraCellXController:
             on = str(value).strip().lower() in self.cfg.radon_device_alarm_value_set
         log.debug("NeuraCell-X: radon meter %s %s=%r -> %s",
                   getattr(device, "serial_number", "?"), field, raw, "ALARM" if on else "clear")
-        if on != self.radon_active:
-            self.radon_active = on
-            log.warning("NeuraCell-X: radon meter %s -> radon protection %s.",
-                        getattr(device, "serial_number", "?"), "ON" if on else "OFF")
-            await self.reconcile(force=True)
-        else:
-            self.bridge.publish_neuracell_state()
+        await self._set_radon_signal_alarm(
+            on, "radon meter %s -> radon protection %s." % (getattr(device, "serial_number", "?"),
+                                                          "ON" if on else "OFF"))
 
     # ----- dew-point signals -----
     async def on_dewpoint_block(self, raw: str) -> None:
@@ -1110,6 +1129,19 @@ class NeuraCellXController:
                     # Radon protects every unit; a dew-point block can be limited
                     # to selected units (cfg.dewpoint_block_devices).
                     if not self._device_under_control(serial, device):
+                        # Not (or no longer) controlled by the active protection.
+                        # Typical case: radon cleared while the dew-point block
+                        # still holds the OFFICE units - the other units were in
+                        # radon Intake and must get their own baseline back now,
+                        # not only once the dew-point block is released too.
+                        if serial in self._saved_modes:
+                            saved = self._saved_modes[serial]
+                            ok = await self.bridge.set_device_mode(
+                                device, saved["operating_mode"], saved["fan_speed"],
+                                saved["humidity_level"])
+                            if ok:
+                                del self._saved_modes[serial]
+                                log.info("NeuraCell-X: %s released from protection -> restored.", serial)
                         continue
                     status = await self.bridge.read_status(device)
                     if status is None:
@@ -1829,6 +1861,13 @@ class AmbientikaBridge:
             parsed = {a: v for a, v in parsed.items() if a not in self._BASELINE_ATTRS}
             if not parsed:
                 return
+        elif serial in self.neuracell._saved_modes:
+            # Released from protection but its restore is still pending (e.g. the
+            # unit was offline). The user's newer choice becomes the baseline, so
+            # a later restore retry cannot overwrite it with the old values.
+            for attr in parsed:
+                if attr in self._BASELINE_ATTRS:
+                    self.neuracell._saved_modes[serial][attr] = parsed[attr]
 
         # Live change: read current status ONCE to fill the unchanged attributes.
         status = await self.read_status(device)
