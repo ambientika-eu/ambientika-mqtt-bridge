@@ -107,6 +107,25 @@ REAUTH_INTERVAL = float(os.environ.get("REAUTH_INTERVAL", "21600") or 21600)
 # restart/update resumes the retry instead of losing it.
 PENDING_RESET_FILE = os.environ.get("PENDING_RESET_FILE", "/data/ambientika_pending_resets.json")
 
+# Persisted NeuraCell-X baselines (the mode each unit had before radon/dew-point
+# protection took over). Without this, an add-on restart or update while
+# protection is active would capture the protection mode itself (e.g. Intake)
+# as the "baseline" and the unit would never return to its normal operation.
+NEURACELL_STATE_FILE = os.environ.get("NEURACELL_STATE_FILE", "/data/ambientika_neuracell_state.json")
+# Persisted baselines older than this are ignored on start (seconds). While
+# protection is active the file timestamp is refreshed every NEURACELL_STATE_REFRESH_S.
+NEURACELL_STATE_MAX_AGE = 7 * 24 * 3600
+NEURACELL_STATE_REFRESH_S = 12 * 3600
+# After a restart, baselines loaded from disk are not restored during this time,
+# so retained/quick radon and TPS inputs can re-establish protection first (s).
+STARTUP_GRACE_S = 90.0
+# After NeuraCell-X restored a unit, the cloud may report the old protection
+# mode for a short while. Within this window a partial manual command fills its
+# unspecified attributes from the restored baseline instead (seconds).
+RESTORE_STALE_WINDOW_S = 120.0
+# Values that switch an optional MQTT input topic off (e.g. radon_alarm_topic).
+DISABLED_TOPIC_VALUES = ("none", "off", "disabled", "-")
+
 # Commands that arrive within this window for the same device are applied in a
 # SINGLE change_mode call. Home Assistant automations that set e.g. mode and fan
 # speed one after the other used to race: every command reads the current status
@@ -446,6 +465,11 @@ class BridgeConfig:
             v = _env(*names)
             if v:
                 setattr(self, attr, v)
+
+        # An optional input topic can be switched off explicitly (e.g. so a
+        # stale retained "ON" on the alarm topic can never hold radon protection).
+        if str(self.radon_alarm_topic or "").strip().lower() in DISABLED_TOPIC_VALUES:
+            self.radon_alarm_topic = ""
 
         mp = _env("MQTT_PORT")
         if mp:
@@ -922,6 +946,21 @@ class NeuraCellXController:
 
         self._saved_modes: dict = {}  # serial -> {operating_mode, fan_speed, humidity_level}
         self._pending_manual: dict = {}  # serial -> partial baseline from manual cmds while offline
+        self._from_disk: set = set()     # serials whose baseline was loaded from NEURACELL_STATE_FILE
+        # serial -> (operating_mode, fan_speed) protection last applied to the unit;
+        # persisted with the baseline so a restart can tell "still in protection"
+        # from "changed by hand while the bridge was down".
+        self._applied: dict = {}
+        self._orphans: dict = {}         # persisted entries of units not discovered at this start
+        self._unit_locks: dict = {}      # serial -> asyncio.Lock (per-unit serialisation)
+        self._started = time.monotonic()
+        self._persisted_at = 0.0
+        # serial -> (baseline dict, monotonic time) of the last successful restore.
+        # The cloud can report the old (protection) mode for a while after a
+        # restore; a partial manual command must not copy that stale mode back.
+        self._recent_restore: dict = {}
+        self._persisted: Optional[str] = None
+        self._persist_warned = False
         self._lock = asyncio.Lock()
 
     # ----- convenience -----
@@ -1110,86 +1149,333 @@ class NeuraCellXController:
     def _desired(self, status: dict):
         """Return (operating_mode, fan_speed, humidity_level) or None to restore."""
         if self.radon_active:
-            return (RADON_PROTECTION_MODE, self.cfg.radon_protection_fan_speed, status["humidity_level"])
+            return (RADON_PROTECTION_MODE, self.cfg.radon_protection_fan_speed,
+                    self._api_value(HumidityLevel, status["humidity_level"], HumidityLevel.Normal))
         if self.dewpoint_block:
-            return (DEWPOINT_BLOCK_MODE, status["fan_speed"], status["humidity_level"])
+            return (DEWPOINT_BLOCK_MODE,
+                    self._api_value(FanSpeed, status["fan_speed"], FanSpeed.Low),
+                    self._api_value(HumidityLevel, status["humidity_level"], HumidityLevel.Normal))
         return None
 
     # ----- reconciliation -----
+    def unit_lock(self, serial: str) -> asyncio.Lock:
+        """Per-unit lock: a protection change, a restore and a manual command for
+        the SAME unit never interleave; different units never wait on each other."""
+        lk = self._unit_locks.get(serial)
+        if lk is None:
+            lk = self._unit_locks[serial] = asyncio.Lock()
+        return lk
+
+    @staticmethod
+    def _api_value(enum_cls, value, fallback):
+        """Compatibility enum members (e.g. FanSpeed 'Night') are read-only: the
+        API does not accept them back, so never put them into a command."""
+        name = getattr(value, "name", None)
+        if name is not None and name in COMPAT_ENUM_MEMBERS.get(enum_cls, ()):
+            return fallback
+        return value
+
+    def _still_protected(self, serial: str, status: dict) -> bool:
+        """Is the unit still in the protection state we put it in (restart check)?"""
+        applied = self._applied.get(serial)
+        if applied is not None:
+            return (status["operating_mode"] == applied[0]
+                    and (applied[0] != RADON_PROTECTION_MODE or status["fan_speed"] == applied[1]))
+        return status["operating_mode"] in (RADON_PROTECTION_MODE, DEWPOINT_BLOCK_MODE)
+
+    async def _restore_one(self, serial: str, device: Any) -> bool:
+        """Give one unit its saved baseline back. True when the baseline is done.
+
+        Retry-safe: the baseline is only dropped after the restore succeeded AND
+        nobody changed it meanwhile; otherwise it is kept for the next poll.
+        Caller holds unit_lock(serial).
+        """
+        saved = self._saved_modes.get(serial)
+        if saved is None:
+            return True
+        if serial in self._from_disk:
+            # Baseline survived a restart. Give the protection inputs (radon meter,
+            # TPS) a moment to report before undoing protection, and only restore
+            # if the unit is still in the state protection put it in - if someone
+            # changed it meanwhile (app, wall panel), their choice wins.
+            if time.monotonic() - self._started < STARTUP_GRACE_S:
+                return False
+            status = await self.bridge.read_status(device)
+            if status is None:
+                return False
+            if not self._still_protected(serial, status):
+                log.info("NeuraCell-X: %s was changed while the bridge was down; "
+                         "dropping its saved baseline.", serial)
+                self._saved_modes.pop(serial, None)
+                self._applied.pop(serial, None)
+                self._from_disk.discard(serial)
+                return True
+        snapshot = dict(saved)
+        applied = self._applied.get(serial)
+        ok = await self.bridge.set_device_mode(
+            device, snapshot["operating_mode"], snapshot["fan_speed"], snapshot["humidity_level"])
+        if not ok:
+            return False
+        self._recent_restore[serial] = (snapshot, time.monotonic(),
+                                        applied[0] if applied else None)
+        if self._saved_modes.get(serial) == snapshot:
+            del self._saved_modes[serial]
+            self._applied.pop(serial, None)
+            self._from_disk.discard(serial)
+            return True
+        return False    # changed during the restore -> apply the newer baseline next poll
+
+    async def _apply_pending_manual(self, serial: str, device: Any) -> None:
+        """Apply a manual command that was deferred while the unit was protected
+        but unreachable, once the unit is no longer under protection control.
+        Caller holds unit_lock(serial)."""
+        pm = self._pending_manual.get(serial)
+        if not pm:
+            self._pending_manual.pop(serial, None)
+            return
+        status = await self.bridge.read_status(device)
+        if status is None:
+            return
+        snapshot = dict(pm)
+        ok = await self.bridge.set_device_mode(
+            device,
+            snapshot.get("operating_mode", status["operating_mode"]),
+            snapshot.get("fan_speed", self._api_value(FanSpeed, status["fan_speed"], FanSpeed.Low)),
+            snapshot.get("humidity_level", self._api_value(HumidityLevel, status["humidity_level"],
+                                                           HumidityLevel.Normal)))
+        if ok and self._pending_manual.get(serial) == snapshot:
+            del self._pending_manual[serial]
+            log.info("NeuraCell-X: deferred manual change applied to %s.", serial)
+
+    async def _protect_one(self, serial: str, device: Any, force: bool) -> None:
+        """Put one controlled unit into the protection state. Caller holds its lock."""
+        status = await self.bridge.read_status(device)
+        if status is None:
+            log.warning("NeuraCell-X: %s unreachable; will retry on next poll.", serial)
+            return
+        desired = self._desired(status)
+        if desired is None:
+            return
+        # Capture the pre-protection baseline exactly once per device,
+        # honouring any manual change made while it was overridden.
+        # Only devices we actually control get a baseline, so a
+        # targeted dew-point block never disturbs the other units.
+        if serial not in self._saved_modes:
+            base = {
+                "operating_mode": status["operating_mode"],
+                "fan_speed": self._api_value(FanSpeed, status["fan_speed"], FanSpeed.Low),
+                "humidity_level": self._api_value(HumidityLevel, status["humidity_level"],
+                                                  HumidityLevel.Normal),
+            }
+            base.update(self._pending_manual.pop(serial, {}))
+            self._saved_modes[serial] = base
+        mode, fan, hum = desired
+        if (force or status["operating_mode"] != mode
+                or status["fan_speed"] != fan
+                or status["humidity_level"] != hum):
+            if await self.bridge.set_device_mode(device, mode, fan, hum):
+                self._applied[serial] = (mode, fan)
+        else:
+            self._applied[serial] = (mode, fan)
+
     async def reconcile(self, force: bool = False) -> None:
         """Bring every device in line with the current protection state.
 
         Serialised with a lock so signal-triggered and poll-triggered
-        reconciles can never interleave and corrupt the saved baseline.
+        reconciles can never interleave and corrupt the saved baseline; each
+        unit is additionally handled under its own unit_lock, which manual
+        commands for that unit take as well.
         """
         async with self._lock:
             if self.override_active:
                 for serial, device in list(self.bridge.devices.items()):
-                    # Only touch devices the active protection actually controls.
-                    # Radon protects every unit; a dew-point block can be limited
-                    # to selected units (cfg.dewpoint_block_devices).
-                    if not self._device_under_control(serial, device):
-                        # Not (or no longer) controlled by the active protection.
-                        # Typical case: radon cleared while the dew-point block
-                        # still holds the OFFICE units - the other units were in
-                        # radon Intake and must get their own baseline back now,
-                        # not only once the dew-point block is released too.
-                        if serial in self._saved_modes:
-                            saved = self._saved_modes[serial]
-                            ok = await self.bridge.set_device_mode(
-                                device, saved["operating_mode"], saved["fan_speed"],
-                                saved["humidity_level"])
-                            if ok:
-                                del self._saved_modes[serial]
+                    async with self.unit_lock(serial):
+                        # Only touch devices the active protection actually controls.
+                        # Radon protects every unit; a dew-point block can be limited
+                        # to selected units (cfg.dewpoint_block_devices).
+                        if self._device_under_control(serial, device):
+                            await self._protect_one(serial, device, force)
+                        elif serial in self._saved_modes:
+                            # Not (or no longer) controlled by the active protection.
+                            # Typical case: radon cleared while the dew-point block
+                            # still holds the OFFICE units - the other units were in
+                            # radon Intake and must get their own baseline back now,
+                            # not only once the dew-point block is released too.
+                            if await self._restore_one(serial, device):
                                 log.info("NeuraCell-X: %s released from protection -> restored.", serial)
-                        continue
-                    status = await self.bridge.read_status(device)
-                    if status is None:
-                        log.warning("NeuraCell-X: %s unreachable; will retry on next poll.", serial)
-                        continue
-                    desired = self._desired(status)
-                    if desired is None:
-                        continue
-                    # Capture the pre-protection baseline exactly once per device,
-                    # honouring any manual change made while it was overridden.
-                    # Only devices we actually control get a baseline, so a
-                    # targeted dew-point block never disturbs the other units.
-                    if serial not in self._saved_modes:
-                        base = {
-                            "operating_mode": status["operating_mode"],
-                            "fan_speed": status["fan_speed"],
-                            "humidity_level": status["humidity_level"],
-                        }
-                        base.update(self._pending_manual.pop(serial, {}))
-                        self._saved_modes[serial] = base
-                    mode, fan, hum = desired
-                    if (force or status["operating_mode"] != mode
-                            or status["fan_speed"] != fan
-                            or status["humidity_level"] != hum):
-                        await self.bridge.set_device_mode(device, mode, fan, hum)
-            elif self._saved_modes:
+                        elif serial in self._pending_manual:
+                            await self._apply_pending_manual(serial, device)
+            elif self._saved_modes or self._pending_manual:
                 # All protections cleared: restore each device, retry-safe.
                 # Keep a device's baseline until its restore actually succeeds,
                 # so an offline device is not left stuck in protection mode.
+                had_saved = bool(self._saved_modes)
                 for serial in list(self._saved_modes.keys()):
                     device = self.bridge.devices.get(serial)
                     if device is None:
-                        del self._saved_modes[serial]
+                        self._saved_modes.pop(serial, None)
+                        self._applied.pop(serial, None)
+                        self._from_disk.discard(serial)
                         continue
-                    saved = self._saved_modes[serial]
-                    ok = await self.bridge.set_device_mode(
-                        device, saved["operating_mode"], saved["fan_speed"], saved["humidity_level"]
-                    )
-                    if ok:
-                        del self._saved_modes[serial]
-                if not self._saved_modes:
+                    async with self.unit_lock(serial):
+                        await self._restore_one(serial, device)
+                for serial in list(self._pending_manual.keys()):
+                    if serial in self._saved_modes:
+                        continue
+                    device = self.bridge.devices.get(serial)
+                    if device is None:
+                        self._pending_manual.pop(serial, None)
+                        continue
+                    async with self.unit_lock(serial):
+                        await self._apply_pending_manual(serial, device)
+                if had_saved and not self._saved_modes:
                     log.warning("NeuraCell-X: all protections cleared -> devices restored.")
             self.bridge.publish_neuracell_state()
 
     async def enforce(self) -> None:
         """Called every poll: re-assert an active override, or finish a pending restore."""
-        if self.override_active or self._saved_modes:
+        if self.override_active or self._saved_modes or self._pending_manual:
             await self.reconcile(force=False)
+
+    # ----- persistence of baselines (survives add-on restart / update) -----
+    # Only the baselines are persisted (plus which protection was applied). The
+    # protection inputs themselves (radon value, TPS block) are NOT: they are
+    # re-reported by the meter/TPS, and a stale persisted alarm could otherwise
+    # hold units in protection forever. Deferred manual commands of unreachable
+    # units are not persisted either (they could be outdated after a restart).
+    @staticmethod
+    def _enum_by_name(enum_cls, name):
+        return dict.get(enum_cls._member_map_, name) if isinstance(name, str) else None
+
+    def _serialise_state(self) -> str:
+        def enc(d):
+            return {k: getattr(v, "name", v) for k, v in d.items()}
+        saved = {s: o["saved"] for s, o in self._orphans.items()}
+        applied = {s: o["applied"] for s, o in self._orphans.items() if isinstance(o.get("applied"), dict)}
+        saved.update({s: enc(v) for s, v in self._saved_modes.items()})
+        applied.update({s: {"operating_mode": v[0].name, "fan_speed": v[1].name}
+                        for s, v in self._applied.items() if s in self._saved_modes})
+        state = {"saved_modes": saved, "applied": applied}
+        if self._orphans:
+            state["orphans_since"] = {s: o.get("since", 0) for s, o in self._orphans.items()}
+        return json.dumps(state, sort_keys=True)
+
+    def persist(self) -> None:
+        """Write baselines to disk when they changed (and refresh the timestamp
+        twice a day while protection is active). Never raises."""
+        if not (self.cfg.neuracell_enabled or self.cfg.dewpoint_enabled):
+            return
+        try:
+            data = self._serialise_state()
+        except Exception as e:     # pragma: no cover - defensive
+            log.debug("NeuraCell-X: could not serialise state: %s", e)
+            return
+        now = time.time()
+        if data == self._persisted and (not self._saved_modes
+                                        or now - self._persisted_at < NEURACELL_STATE_REFRESH_S):
+            return
+        if self._persisted is None and not self._saved_modes and not self._orphans:
+            self._persisted = data     # nothing to remember yet - no need to create the file
+            return
+        try:
+            payload = json.loads(data)
+            payload["ts"] = now
+            d = os.path.dirname(NEURACELL_STATE_FILE)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            tmp = NEURACELL_STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp, NEURACELL_STATE_FILE)
+            self._persisted = data
+            self._persisted_at = now
+        except Exception as e:
+            if not self._persist_warned:
+                self._persist_warned = True
+                log.warning("NeuraCell-X: could not persist baselines to %s (%s). "
+                            "Protection works, but a restart during active protection "
+                            "cannot restore the previous modes.", NEURACELL_STATE_FILE, e)
+
+    def load_persisted(self) -> None:
+        """Load baselines saved before a restart (only for known devices). Never raises."""
+        try:
+            self._load_persisted()
+        except Exception as e:
+            log.warning("NeuraCell-X: ignoring unreadable %s: %s", NEURACELL_STATE_FILE, e)
+            self._saved_modes.clear()
+            self._applied.clear()
+            self._from_disk.clear()
+            self._orphans.clear()
+            self._persisted = ""       # force a clean rewrite on the next change
+        self._started = time.monotonic()
+
+    def _load_persisted(self) -> None:
+        try:
+            with open(NEURACELL_STATE_FILE, encoding="utf-8") as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            return
+        if not isinstance(raw, dict):
+            raise ValueError("unexpected content")
+        try:
+            age = time.time() - float(raw.get("ts", 0))
+        except (TypeError, ValueError):
+            age = NEURACELL_STATE_MAX_AGE + 1
+        if age > NEURACELL_STATE_MAX_AGE:
+            log.info("NeuraCell-X: saved baselines are older than 7 days - ignored.")
+            self._persisted = ""       # overwrite the outdated file on the next change
+            self.persist()
+            return
+        saved = raw.get("saved_modes") or {}
+        applied = raw.get("applied") or {}
+        orphan_since = raw.get("orphans_since") or {}
+        if not isinstance(saved, dict) or not isinstance(applied, dict) or not isinstance(orphan_since, dict):
+            raise ValueError("unexpected content")
+        skipped = 0
+        for serial, d in saved.items():
+            if not isinstance(d, dict):
+                skipped += 1
+                continue
+            if serial not in self.bridge.devices:
+                # Unit not discovered this time (e.g. a cloud hiccup): keep its entry
+                # in the file so a later restart can still restore it - but not for
+                # more than NEURACELL_STATE_MAX_AGE (unit removed from the account).
+                try:
+                    since = float(orphan_since.get(serial, raw.get("ts", 0)))
+                except (TypeError, ValueError):
+                    since = 0.0
+                if time.time() - since <= NEURACELL_STATE_MAX_AGE:
+                    self._orphans[serial] = {"saved": d, "applied": applied.get(serial), "since": since}
+                else:
+                    skipped += 1
+                continue
+            op = self._enum_by_name(OperatingMode, d.get("operating_mode"))
+            if op is None:
+                skipped += 1
+                continue
+            fan = self._enum_by_name(FanSpeed, d.get("fan_speed"))
+            hum = self._enum_by_name(HumidityLevel, d.get("humidity_level"))
+            self._saved_modes[serial] = {
+                "operating_mode": op,
+                "fan_speed": self._api_value(FanSpeed, fan if fan is not None else FanSpeed.Low,
+                                             FanSpeed.Low),
+                "humidity_level": self._api_value(HumidityLevel,
+                                                  hum if hum is not None else HumidityLevel.Normal,
+                                                  HumidityLevel.Normal),
+            }
+            self._from_disk.add(serial)
+            a = applied.get(serial)
+            if isinstance(a, dict):
+                aop = self._enum_by_name(OperatingMode, a.get("operating_mode"))
+                afan = self._enum_by_name(FanSpeed, a.get("fan_speed"))
+                if aop is not None and afan is not None:
+                    self._applied[serial] = (aop, afan)
+        self._persisted = "" if skipped else self._serialise_state()
+        if skipped:
+            self.persist()             # drop entries that no longer apply from the file
+        if self._saved_modes:
+            log.warning("NeuraCell-X: resumed %d saved baseline(s) from before the restart: %s",
+                        len(self._saved_modes), ", ".join(sorted(self._saved_modes)))
 
 
 # ---------------------------------------------------------------------------
@@ -1818,23 +2104,39 @@ class AmbientikaBridge:
         if task is not None and not task.done():
             return          # a flush is already scheduled; it will pick this up
         async def _later():
+            cancelled = False
             try:
                 await asyncio.sleep(COMMAND_COALESCE_S)
                 await self._flush_commands(device)
             except asyncio.CancelledError:
+                cancelled = True
                 raise
             except Exception as e:
                 log.exception("command flush for %s crashed: %s", serial, e)
             finally:
                 self._cmd_timers.pop(serial, None)
+                # Attributes that arrived while this flush waited/ran would
+                # otherwise sit in the queue until the next command.
+                if (not cancelled and self._pending_cmds.get(serial)
+                        and (self._stop_event is None or not self._stop_event.is_set())):
+                    self._cmd_timers[serial] = asyncio.create_task(_later())
         self._cmd_timers[serial] = asyncio.create_task(_later())
 
     async def _flush_commands(self, device) -> None:
         """Apply every pending attribute of one device in a single change_mode."""
         serial = device.serial_number
-        parsed = self._pending_cmds.pop(serial, None)
-        if not parsed:
-            return
+        # Serialise with NeuraCell-X for THIS unit only: a command must never
+        # interleave with a protection change or restore of the same unit
+        # (otherwise it could write the protection mode back after a restore).
+        # The queue is read inside the lock, so attributes that arrive while
+        # waiting are sent in this same call.
+        async with self.neuracell.unit_lock(serial):
+            parsed = self._pending_cmds.pop(serial, None)
+            if not parsed:
+                return
+            await self._flush_commands_locked(device, serial, parsed)
+
+    async def _flush_commands_locked(self, device, serial: str, parsed: dict) -> None:
         if len(parsed) > 1:
             log.info("Applying %d attributes for %s in one call: %s",
                      len(parsed), serial, ", ".join(sorted(parsed)))
@@ -1858,16 +2160,22 @@ class AmbientikaBridge:
                     "NeuraCell-X active: deferring manual %s change on %s until protection clears.",
                     ", ".join(sorted(deferred)), serial,
                 )
+                nc.persist()
             parsed = {a: v for a, v in parsed.items() if a not in self._BASELINE_ATTRS}
             if not parsed:
                 return
-        elif serial in self.neuracell._saved_modes:
-            # Released from protection but its restore is still pending (e.g. the
-            # unit was offline). The user's newer choice becomes the baseline, so
-            # a later restore retry cannot overwrite it with the old values.
-            for attr in parsed:
-                if attr in self._BASELINE_ATTRS:
-                    self.neuracell._saved_modes[serial][attr] = parsed[attr]
+        else:
+            # Released from protection but its restore (or a deferred manual
+            # change) is still pending, e.g. the unit was offline. The user's
+            # newer choice becomes that baseline, so a later retry cannot
+            # overwrite it with older values.
+            nc = self.neuracell
+            for store in (nc._saved_modes, nc._pending_manual):
+                if serial in store:
+                    for attr in parsed:
+                        if attr in self._BASELINE_ATTRS:
+                            store[serial][attr] = parsed[attr]
+        self.neuracell.persist()
 
         # Live change: read current status ONCE to fill the unchanged attributes.
         status = await self.read_status(device)
@@ -1879,6 +2187,32 @@ class AmbientikaBridge:
         fan = status["fan_speed"]
         hum = status["humidity_level"]
         light = status["light_sensor_level"]
+        # Right after NeuraCell-X restored this unit the cloud may still report
+        # the protection mode. Fill unspecified attributes from the restored
+        # baseline then, so a partial command cannot re-apply the protection mode.
+        nc = self.neuracell
+        pending_base = None
+        if not nc._device_under_control(serial, device):
+            pending_base = nc._saved_modes.get(serial) or None
+            if pending_base is not None:
+                op = pending_base["operating_mode"]
+                fan = pending_base["fan_speed"]
+                hum = pending_base["humidity_level"]
+            else:
+                # Deferred manual change still waiting (unit was unreachable while
+                # protected): it is part of what the user asked for, send it too.
+                pm = nc._pending_manual.get(serial) or {}
+                op = pm.get("operating_mode", op)
+                fan = pm.get("fan_speed", fan)
+                hum = pm.get("humidity_level", hum)
+        rr = nc._recent_restore.get(serial)
+        if (pending_base is None and not nc._pending_manual.get(serial) and rr is not None and time.monotonic() - rr[1] < RESTORE_STALE_WINDOW_S
+                and cur_mode == (rr[2] if rr[2] is not None else cur_mode)
+                and cur_mode in (RADON_PROTECTION_MODE, DEWPOINT_BLOCK_MODE)
+                and not self.neuracell._device_under_control(serial, device)):
+            op = rr[0]["operating_mode"]
+            fan = rr[0]["fan_speed"]
+            hum = rr[0]["humidity_level"]
         # A powered-off unit reports a default light-sensor level (e.g. Medium),
         # not the user's setting. Re-sending that on the next change would
         # silently overwrite the user's dusk-sensor choice (e.g. Off). So while
@@ -1910,6 +2244,18 @@ class AmbientikaBridge:
             log.error("change_mode failed for %s: %s", serial, res)
         else:
             log.info("change_mode OK for %s", serial)
+            # The user's own command is now the reference, not the last restore.
+            nc._recent_restore.pop(serial, None)
+            if pending_base is not None and not nc._device_under_control(serial, device):
+                # This command carried the full (merged) baseline: restore done.
+                # (If protection started meanwhile, the kept baseline already holds
+                # exactly what the user sent - keep it for the later restore.)
+                nc._saved_modes.pop(serial, None)
+                nc._applied.pop(serial, None)
+                nc._from_disk.discard(serial)
+                nc.persist()
+            if not nc._device_under_control(serial, device) and serial in nc._pending_manual:
+                nc._pending_manual.pop(serial, None)
 
     async def _handle_command(self, serial: str, attr: str, value: str) -> None:
         """Single-attribute command: <prefix>/<serial>/set/<attr>."""
@@ -1945,6 +2291,8 @@ class AmbientikaBridge:
         nc = self.neuracell
         payload = {
             "radon_protection": nc.radon_active,
+            "radon_value_alarm": nc._radon_value_alarm,
+            "radon_signal_alarm": nc._radon_signal_alarm,
             "radon": nc.last_radon,
             "radon_threshold": self.cfg.radon_threshold,
             "dewpoint_block": nc.dewpoint_block,
@@ -1955,6 +2303,13 @@ class AmbientikaBridge:
         }
         self.client.publish(neuracell_state_topic(self.cfg.topic_prefix),
                             json.dumps(payload), qos=0, retain=True)
+        # File writes only from the event loop (on_connect runs in paho's thread).
+        try:
+            asyncio.get_running_loop()
+            nc.persist()
+        except RuntimeError:
+            if self.loop is not None and self.loop.is_running():
+                self.loop.call_soon_threadsafe(nc.persist)
 
     # ----- Ambientika -----
     async def _login(self) -> None:
@@ -2137,6 +2492,8 @@ class AmbientikaBridge:
 
         await self._login()
         await self._discover_devices()
+        if self.cfg.neuracell_enabled or self.cfg.dewpoint_enabled:
+            self.neuracell.load_persisted()
         self._mqtt_connect()
         # Subscriptions, discovery and NeuraCell-X status are (re)published from
         # the on_connect callback once the CONNACK is received (see _on_mqtt_connect).
