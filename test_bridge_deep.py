@@ -183,6 +183,109 @@ async def test_neuracell():
     check("neuracell: radon has priority (desired=Intake)", d[0] == bridge.RADON_PROTECTION_MODE, d)
 
 
+async def test_neuracell_scoped():
+    """Radon + Taupunktsperre nur fuer die Keller-OFFICE (Praxisfall).
+
+    Radon hat Vorrang. Endet der Radonschutz, waehrend die TPS noch sperrt,
+    muessen die uebrigen Geraete sofort auf ihren eigenen Betrieb zurueck -
+    nicht erst, wenn auch die TPS freigibt.
+    """
+    from returns.result import Failure
+
+    def setup():
+        cfg = bridge.BridgeConfig()
+        cfg.radon_threshold = 100
+        cfg.radon_hysteresis = 10
+        cfg.dewpoint_block_devices = "OFF1,OFF2"
+        b = bridge.AmbientikaBridge(cfg)
+        b.client = FakeClient()
+        b.loop = asyncio.get_running_loop()
+        o1 = FakeDevice("OFF1", "Keller links", 1, mkstatus(op=OM.Smart))
+        o2 = FakeDevice("OFF2", "Keller rechts", 1, mkstatus(op=OM.Smart))
+        sm = FakeDevice("SM1", "Eltern", 3, mkstatus(op=OM.ManualHeatRecovery, fan=FS.Low))
+        b.devices = {d.serial_number: d for d in (o1, o2, sm)}
+        return b, b.neuracell, o1, o2, sm
+
+    def mode(d):
+        return d._status["operating_mode"]
+
+    RP = bridge.RADON_PROTECTION_MODE
+
+    # A: TPS sperrt -> Radon -> Radon weg -> TPS frei
+    b, nc, o1, o2, sm = setup()
+    await nc.on_dewpoint_block("ON")
+    check("scoped A: TPS-Sperre nur OFFICE aus", mode(o1) == OM.Off and mode(o2) == OM.Off)
+    check("scoped A: SMART bleibt unberuehrt", mode(sm) == OM.ManualHeatRecovery and not sm.mode_calls)
+    await nc.on_radon_value("150")
+    check("scoped A: Radon -> alle Zuluft (Vorrang vor TPS)",
+          mode(o1) == RP and mode(o2) == RP and mode(sm) == RP)
+    await nc.on_radon_value("50")
+    check("scoped A: Radon weg, TPS sperrt -> OFFICE aus", mode(o1) == OM.Off and mode(o2) == OM.Off)
+    check("scoped A: Radon weg -> SMART sofort zurueck",
+          mode(sm) == OM.ManualHeatRecovery and sm._status["fan_speed"] == FS.Low, sm._status)
+    check("scoped A: nur OFFICE-Baseline bleibt gemerkt", set(nc._saved_modes) == {"OFF1", "OFF2"})
+    await nc.on_dewpoint_block("OFF")
+    check("scoped A: TPS frei -> OFFICE zurueck auf Smart", mode(o1) == OM.Smart and mode(o2) == OM.Smart)
+    check("scoped A: keine Baseline mehr offen", not nc._saved_modes)
+
+    # B: Radon -> TPS sperrt -> TPS frei (waehrend Radon) -> Radon weg
+    b, nc, o1, o2, sm = setup()
+    await nc.on_radon_value("150")
+    await nc.on_dewpoint_block("ON")
+    check("scoped B: TPS-Sperre waehrend Radon aendert nichts",
+          mode(o1) == RP and mode(o2) == RP and mode(sm) == RP)
+    await nc.on_dewpoint_block("OFF")
+    check("scoped B: TPS-Freigabe waehrend Radon aendert nichts",
+          mode(o1) == RP and mode(o2) == RP and mode(sm) == RP)
+    await nc.on_radon_value("50")
+    check("scoped B: Radon weg -> alle auf ihren Betrieb",
+          mode(o1) == OM.Smart and mode(o2) == OM.Smart and mode(sm) == OM.ManualHeatRecovery)
+
+    # C: Radon -> TPS sperrt -> Radon weg -> TPS frei
+    b, nc, o1, o2, sm = setup()
+    await nc.on_radon_value("150")
+    await nc.on_dewpoint_block("ON")
+    await nc.on_radon_value("50")
+    check("scoped C: Radon weg -> OFFICE aus, SMART zurueck",
+          mode(o1) == OM.Off and mode(o2) == OM.Off and mode(sm) == OM.ManualHeatRecovery)
+    await nc.on_dewpoint_block("OFF")
+    check("scoped C: TPS frei -> OFFICE Smart (Baseline von vor Radon)",
+          mode(o1) == OM.Smart and mode(o2) == OM.Smart)
+
+    # D: Wert-Alarm und expliziter Alarm schalten sich nicht gegenseitig ab
+    b, nc, o1, o2, sm = setup()
+    await nc.on_radon_value("150")
+    await nc.on_radon_alarm("OFF")
+    check("scoped D: Alarm OFF hebt Wert-Alarm nicht auf", nc.radon_active and mode(sm) == RP)
+    await nc.on_radon_alarm("ON")
+    await nc.on_radon_value("50")
+    check("scoped D: Wert sicher hebt Alarm ON nicht auf", nc.radon_active and mode(sm) == RP)
+    await nc.on_radon_alarm("OFF")
+    check("scoped D: beide aus -> Radonschutz aus, alle zurueck",
+          not nc.radon_active and mode(sm) == OM.ManualHeatRecovery and mode(o1) == OM.Smart)
+
+    # E: Restore schlaegt fehl (offline) -> Retry beim naechsten Poll,
+    #    ein neuer Benutzerbefehl wird dabei nicht ueberschrieben
+    b, nc, o1, o2, sm = setup()
+    await nc.on_dewpoint_block("ON")
+    await nc.on_radon_value("150")
+    orig = sm.change_mode
+
+    async def offline(m):
+        return Failure("offline")
+    sm.change_mode = offline
+    await nc.on_radon_value("50")
+    check("scoped E: SMART offline -> Baseline bleibt fuer Retry", "SM1" in nc._saved_modes)
+    sm.change_mode = orig
+    await b._queue_command(sm, {"operating_mode": OM.Night})
+    await asyncio.sleep(0.05)
+    check("scoped E: Benutzerbefehl live angewandt", mode(sm) == OM.Night, sm._status)
+    await nc.enforce()
+    check("scoped E: Retry setzt Benutzerwahl, nicht alten Modus", mode(sm) == OM.Night, sm._status)
+    check("scoped E: Baseline nach Retry erledigt", "SM1" not in nc._saved_modes)
+    check("scoped E: OFFICE weiter gesperrt", mode(o1) == OM.Off and mode(o2) == OM.Off)
+
+
 async def test_payload():
     cfg = bridge.BridgeConfig()
     cfg.neuracell_enabled = False
@@ -302,6 +405,7 @@ async def test_command_coalescing():
 
 async def _async_suite():
     await test_neuracell()
+    await test_neuracell_scoped()
     await test_payload()
     await test_command()
     await test_command_coalescing()
