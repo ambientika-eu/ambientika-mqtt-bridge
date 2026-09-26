@@ -90,6 +90,7 @@ Ambientika radon meter and dew-point control (Taupunktsteuerung) with your venti
 - **Dew-point control:** ventilating would raise indoor humidity &rarr; units switch **off**; conditions favourable again &rarr; ventilation released.
 - **Exact restore:** when all protections clear, every unit returns to the exact mode it had before.
 - **Radon first, dew point scoped:** radon protection always covers every unit and overrides the dew-point block. When radon clears while the dew-point block (e.g. limited to the basement units via `dewpoint_block_devices`) is still active, all other units return to their own mode right away. A radon value (`radon_topic`) and an explicit alarm (`radon_alarm_topic`) are combined: either one keeps radon protection on.
+- **Robust restore:** the pre-protection modes are saved to `/data/ambientika_neuracell_state.json`, so an add-on restart or update during active protection still returns every unit to its previous mode (a unit that was changed by hand in the meantime keeps that change). Manual commands sent while a unit is protected or offline are applied once protection ends. Set `radon_alarm_topic: none` if you only use the radon value and want the alarm topic ignored.
 
 The live status is published to `ambientika/neuracell/state` and surfaced natively on every platform:
 
