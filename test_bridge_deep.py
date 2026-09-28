@@ -621,7 +621,8 @@ async def test_radon_meter():
     check("meter: Startwert 0 ignoriert", MT not in nc._radon_values)
     await mq(MT, '{"mittelwert":150}')
     check("meter: 150 vom Messgeraet -> Radonschutz", nc.radon_active and dev._status["operating_mode"] == bridge.RADON_PROTECTION_MODE)
-    nc._meter_online[MT] = (True, 0.0)            # Start liegt lange zurueck
+    # Start liegt lange zurueck (relativ, denn auf frischen CI-Maschinen ist monotonic() klein)
+    nc._meter_online[MT] = (True, __import__("time").monotonic() - bridge.RADON_METER_BOOT_IGNORE_S - 1)
     await mq(MT, '{"mittelwert":0}')
     check("meter: echte 0 spaeter zaehlt -> Schutz aus", not nc.radon_active and dev._status["operating_mode"] == OM.Smart)
     # zwei Quellen: hoechster aktueller Wert zaehlt
