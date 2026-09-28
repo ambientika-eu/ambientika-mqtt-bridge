@@ -49,6 +49,8 @@ After installation, configure the add-on via the **Configuration** tab:
 | `radon_device_serial` | Radon meter serial number (only for `radon_source: device`; see the add-on log) | `` |
 | `radon_device_alarm_field` | Which status field of the radon meter carries the alarm (`device` source) | `air_quality` |
 | `radon_device_alarm_values` | Values of that field that mean "radon alarm" (comma-separated) | `Bad,Poor,Very Bad,Alarm,Alert` |
+| `radon_meter_topic` | Topic of the Ambientika radon meter in MQTT mode 4 (JSON `{"mittelwert": …}`), read directly; `none` = off | `radon/+/state` |
+| `radon_value_key` | JSON key of the radon value in JSON payloads | `mittelwert` |
 | `radon_threshold` | Radon alarm threshold in Bq/m³ (numeric source) | `300` |
 | `radon_protection_fan` | Fan level during radon protection (`Low` / `Medium` / `High`) | `Low` |
 | `dewpoint_source` | Dew-point trigger: `signal` (MQTT), `computed` (from sensors) or `device` (read the TPS from the cloud) | `signal` |
