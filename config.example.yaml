@@ -29,7 +29,12 @@ bridge:
 neuracell:
   neuracell_enabled: true
   radon_topic: "ambientika/radon/value"       # numeric Bq/m3
-  radon_alarm_topic: "ambientika/radon/alarm"  # explicit ON/OFF
+  radon_alarm_topic: "ambientika/radon/alarm"  # explicit ON/OFF ("none" = off)
+  # Ambientika radon meter in MQTT mode 4 publishes {"mittelwert": <Bq/m3>} on
+  # radon/<meter-id>/state - read directly ("none" = off). With several sources
+  # the highest current value decides.
+  radon_meter_topic: "radon/+/state"
+  radon_value_key: "mittelwert"                 # JSON key of the radon value
   radon_threshold: 300                          # Bq/m3 (DE reference value; WHO = 100)
   radon_hysteresis: 50                          # Bq/m3
   radon_protection_fan: "Low"
@@ -51,6 +56,7 @@ dewpoint:
   dewpoint_source: "signal"                     # "signal", "computed" or "device"
   # signal source (external ON/OFF; truthy = block ventilation):
   dewpoint_block_topic: "ambientika/dewpoint/block"
+  dewpoint_block_key: ""                        # JSON key if the payload is a JSON object
   # Limit the block to specific units (device name or serial, comma-separated).
   # Empty = all units. Example for two named units: "SMART,OFFICE".
   dewpoint_block_devices: ""

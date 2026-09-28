@@ -570,6 +570,107 @@ async def test_neuracell_robust():
     bridge.STARTUP_GRACE_S = grace
 
 
+async def test_radon_meter():
+    """1.4.24: Ambientika Radon-Meter (MQTT-Modus 4) direkt, JSON, Wildcards, mehrere Quellen."""
+    pn, pt = bridge._payload_number, bridge._payload_truthy
+    check("meter: Zahl", pn("62") == 62.0 and pn("62,5") == 62.5)
+    check("meter: JSON mittelwert", pn('{"mittelwert":62}', "mittelwert") == 62.0)
+    check("meter: JSON Text-Zahl", pn('{"x":1,"mittelwert":"97"}', "mittelwert") == 97.0)
+    check("meter: JSON einziger Zahlenwert", pn('{"wert":34}', "mittelwert") == 34.0)
+    check("meter: JSON mehrdeutig -> None", pn('{"a":1,"b":2}', "mittelwert") is None)
+    check("meter: Unsinn -> None", pn("abc") is None and pn('{"mittelwert":null}', "mittelwert") is None)
+    check("meter: truthy klassisch", pt("ON") and pt("true") and pt("1") and not pt("OFF") and not pt("0"))
+    check("meter: truthy JSON", pt('{"block":true}', "block") and not pt('{"block":false}', "block")
+          and pt('{"sperre":1}') and not pt('{"a":1,"b":0}'))
+    check("meter: Wildcard", bridge._topic_match("radon/+/state", "radon/Radon_D48C4958ECCC/state")
+          and not bridge._topic_match("radon/+/state", "radon/Radon_D48C4958ECCC/availability/state"))
+    check("meter: Availability-Filter", bridge._availability_filter("radon/+/state") == "radon/+/availability/state")
+    c = bridge.BridgeConfig()
+    c._apply_extras({"radon_meter_topic": "none"}.get)
+    c.apply_env_overrides()
+    check("meter: abschaltbar", c.radon_meter_topic == "")
+    c2 = bridge.BridgeConfig()
+    c2._apply_extras({}.get)
+    c2.apply_env_overrides()
+    check("meter: Standard aktiv", c2.radon_meter_topic == "radon/+/state" and c2.radon_value_key == "mittelwert")
+
+    cfg = bridge.BridgeConfig()
+    cfg.radon_threshold, cfg.radon_hysteresis = 100, 10
+    b = bridge.AmbientikaBridge(cfg)
+    b.client = FakeClient()
+    b.loop = asyncio.get_running_loop()
+    dev = FakeDevice(status=mkstatus(op=OM.Smart))
+    b.devices = {dev.serial_number: dev}
+    nc = b.neuracell
+    pending = []
+    b._dispatch = lambda coro: pending.append(coro)
+
+    class Msg:
+        def __init__(self, t, p):
+            self.topic, self.payload = t, p.encode()
+
+    async def mq(t, p):
+        b._on_mqtt_message(None, None, Msg(t, p))
+        while pending:
+            await pending.pop(0)
+
+    MT = "radon/Radon_D48C4958ECCC/state"
+    AV = "radon/Radon_D48C4958ECCC/availability/state"
+    await mq(AV, "online")
+    await mq(MT, '{"mittelwert":0}')
+    check("meter: Startwert 0 ignoriert", MT not in nc._radon_values)
+    await mq(MT, '{"mittelwert":150}')
+    check("meter: 150 vom Messgeraet -> Radonschutz", nc.radon_active and dev._status["operating_mode"] == bridge.RADON_PROTECTION_MODE)
+    nc._meter_online[MT] = (True, 0.0)            # Start liegt lange zurueck
+    await mq(MT, '{"mittelwert":0}')
+    check("meter: echte 0 spaeter zaehlt -> Schutz aus", not nc.radon_active and dev._status["operating_mode"] == OM.Smart)
+    # zwei Quellen: hoechster aktueller Wert zaehlt
+    await mq(MT, '{"mittelwert":50}')
+    await mq("ambientika/radon/value", "150")
+    check("meter: zweite Quelle hoeher -> Schutz an", nc.radon_active)
+    await mq(MT, '{"mittelwert":40}')
+    check("meter: hoeherer Wert der anderen Quelle zaehlt weiter", nc.radon_active and nc.last_radon == 150)
+    v, t = nc._radon_values["value"]
+    nc._radon_values["value"] = (v, t - bridge.RADON_VALUE_MAX_AGE_S - 1)   # veraltet
+    await mq(MT, '{"mittelwert":40}')
+    check("meter: veralteter Wert zaehlt nicht mehr -> Schutz aus", not nc.radon_active and nc.last_radon == 40)
+    await mq(AV, "offline")
+    check("meter: offline -> Wert entfernt", MT not in nc._radon_values)
+    st = [json.loads(p) for t, p in b.client.pub if t.endswith("neuracell/state")][-1]
+    check("meter: Status mit Quellen", "radon_sources" in st, st)
+
+    # Pruefer-Funde: NaN/Inf/Riesenzahlen, strenge Wahrheitswerte, Schluessel am Messgeraet
+    check("meter: NaN/Inf abgelehnt", pn("nan") is None and pn("inf") is None
+          and pn('{"mittelwert": NaN}', "mittelwert") is None and pn('{"mittelwert": Infinity}', "mittelwert") is None)
+    check("meter: Riesenzahl abgelehnt", pn('{"mittelwert": ' + "9" * 400 + '}', "mittelwert") is None)
+    check("meter: truthy wie frueher", not pt("2") and not pt("1.0") and not pt("-1") and not pt("NaN") and pt("1"))
+    await mq(MT, '{"co2":800}')
+    check("meter: fremdes JSON ohne mittelwert ignoriert", not nc.radon_active)
+    await mq("ambientika/radon/value", "nan")
+    await mq(MT, '{"mittelwert":400}')
+    check("meter: NaN verdeckt keinen hohen Wert", nc.radon_active and nc.last_radon == 400)
+    await mq(MT, '{"mittelwert":20}')
+    # radon_topic versehentlich auf das Messgeraet gesetzt -> trotzdem Messgeraet-Regeln
+    cfg.radon_topic = MT
+    await mq(AV, "online")
+    await mq(MT, '{"mittelwert":0}')
+    check("meter: Routing - Messgeraet vor radon_topic (Startwert ignoriert)",
+          nc._radon_values.get(MT, (None,))[0] != 0)
+    cfg.radon_topic = "radon/#"
+    await mq(AV, "offline")
+    check("meter: radon/# verschluckt Availability nicht", nc._meter_online.get(MT, (None,))[0] is False)
+    cfg.radon_topic = "ambientika/radon/value"
+    # JSON auf Alarm- und Sperr-Topic
+    await mq("ambientika/radon/alarm", '{"alarm":true}')
+    check("meter: Alarm als JSON", nc._radon_signal_alarm)
+    await mq("ambientika/radon/alarm", "OFF")
+    cfg.dewpoint_block_key = "block"
+    await mq("ambientika/dewpoint/block", '{"block":true,"temp":12.5}')
+    check("meter: Sperre als JSON mit Schluessel", nc.dewpoint_block)
+    await mq("ambientika/dewpoint/block", '{"block":false,"temp":12.5}')
+    check("meter: Sperre JSON aus", not nc.dewpoint_block)
+
+
 async def test_payload():
     cfg = bridge.BridgeConfig()
     cfg.neuracell_enabled = False
@@ -691,6 +792,7 @@ async def _async_suite():
     await test_neuracell()
     await test_neuracell_scoped()
     await test_neuracell_robust()
+    await test_radon_meter()
     await test_payload()
     await test_command()
     await test_command_coalescing()

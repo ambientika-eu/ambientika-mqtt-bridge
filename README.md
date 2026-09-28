@@ -91,6 +91,7 @@ Ambientika radon meter and dew-point control (Taupunktsteuerung) with your venti
 - **Exact restore:** when all protections clear, every unit returns to the exact mode it had before.
 - **Radon first, dew point scoped:** radon protection always covers every unit and overrides the dew-point block. When radon clears while the dew-point block (e.g. limited to the basement units via `dewpoint_block_devices`) is still active, all other units return to their own mode right away. A radon value (`radon_topic`) and an explicit alarm (`radon_alarm_topic`) are combined: either one keeps radon protection on.
 - **Robust restore:** the pre-protection modes are saved to `/data/ambientika_neuracell_state.json`, so an add-on restart or update during active protection still returns every unit to its previous mode (a unit that was changed by hand in the meantime keeps that change). Manual commands sent while a unit is protected or offline are applied once protection ends. Set `radon_alarm_topic: none` if you only use the radon value and want the alarm topic ignored.
+- **Ambientika radon meter built in:** a radon meter in MQTT mode 4 publishes `{"mittelwert": …}` on `radon/<meter-id>/state`; the bridge reads it directly (`radon_meter_topic`, default `radon/+/state`) — no Home Assistant automation needed. Its start-up value 0 is ignored, and when the meter goes offline its last value stops counting. With several radon sources (e.g. a second meter on `radon_topic`) the highest current value decides. Radon and dew-point topics accept plain values or JSON (`radon_value_key`, `dewpoint_block_key`) and MQTT wildcards.
 
 The live status is published to `ambientika/neuracell/state` and surfaced natively on every platform:
 
@@ -124,6 +125,9 @@ See [`homebridge-plugin/README.md`](homebridge-plugin/README.md)
 
 ### Apple Home + Google Home + Alexa + SmartThings (Matter – native, no bridge app needed)
 See [`matter-bridge/README.md`](matter-bridge/README.md)
+
+### Home Assistant: ready-made package (evening/night programme, radon priority)
+See [`examples/home-assistant-schlafetage/README.md`](examples/home-assistant-schlafetage/README.md)
 
 ### Node-RED
 See [`examples/node-red/README.md`](examples/node-red/README.md)
