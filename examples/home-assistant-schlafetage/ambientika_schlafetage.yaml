@@ -1,0 +1,241 @@
+# =====================================================================
+# Ambientika - Home Assistant Paket Schlafetage + NeuraCell-X
+# SUEDWIND - AIR SYSTEMS, www.ambientika.eu
+#
+# Einbindung (unveraendert):
+#   configuration.yaml:
+#     homeassistant:
+#       packages: !include_dir_named packages
+#   Diese Datei in den Ordner config/packages/ legen.
+#   Danach: Entwicklerwerkzeuge > YAML > Konfiguration pruefen, neu starten.
+#
+# EINZIGE ANPASSUNG: die Liste "master" im Skript unten.
+#   Dort stehen die MASTER-Geraete der Schlafetage, geschrieben wie der
+#   Anfang ihrer Entitaets-ID. Kontrolle: Entwicklerwerkzeuge > Zustaende,
+#   Filter "_mode" -> z. B. select.buro_l_mode  =>  Eintrag "buro_l".
+#   Wichtig: Home Assistant behaelt die Entitaets-ID, auch wenn das Geraet
+#   in der App umbenannt wird - massgeblich ist die ID, nicht der Name.
+#   Slaves gehoeren NICHT in die Liste, sie folgen ihrem Master automatisch.
+#
+# Radonvorrang:
+#   Der Radonschutz laeuft in der Bridge (NeuraCell-X, ab 1.4.24 liest sie das
+#   Ambientika Radon-Messgeraet im MQTT-Modus 4 direkt) und hat immer Vorrang.
+#   Solange er aktiv ist, pausieren die Automationen hier.
+# =====================================================================
+
+# Uhrzeiten: "initial" gilt nach jedem Neustart. Wer die Zeiten im Dashboard
+# dauerhaft aendern moechte, loescht nach dem ersten Start die "initial"-Zeilen,
+# Home Assistant merkt sich dann den zuletzt eingestellten Wert.
+input_datetime:
+  lueftung_abend_werktag:
+    name: "Lüftung Durchlüften Beginn (Mo-Fr)"
+    has_date: false
+    has_time: true
+    initial: "20:30"
+  lueftung_morgen_werktag:
+    name: "Lüftung Tagbetrieb ab (Mo-Fr)"
+    has_date: false
+    has_time: true
+    initial: "06:30"
+  lueftung_abend_wochenende:
+    name: "Lüftung Durchlüften Beginn (Sa-So)"
+    has_date: false
+    has_time: true
+    initial: "21:30"
+  lueftung_morgen_wochenende:
+    name: "Lüftung Tagbetrieb ab (Sa-So)"
+    has_date: false
+    has_time: true
+    initial: "08:00"
+
+script:
+  # Baustein: setzt Modus und Stufe fuer alle Master der Schlafetage.
+  # Wird von den Automationen und dem Button aufgerufen (nicht direkt starten).
+  lueftung_schlafetage_setzen:
+    alias: "Lüftung Schlafetage setzen"
+    mode: queued
+    fields:
+      modus:
+        description: "Smart, Auto, ManualHeatRecovery, Night, AwayHome, Expulsion, Intake, MasterSlaveFlow, SlaveMasterFlow"
+        example: "ManualHeatRecovery"
+        required: true
+        selector:
+          select:
+            options: [Smart, Auto, ManualHeatRecovery, Night, AwayHome, Expulsion, Intake, MasterSlaveFlow, SlaveMasterFlow]
+      stufe:
+        description: "Low, Medium, High"
+        example: "Low"
+        required: true
+        selector:
+          select:
+            options: [Low, Medium, High]
+    variables:
+      # >>> HIER ANPASSEN: Master-Geraete der Schlafetage (Anfang der Entitaets-ID)
+      master: ["buro_l", "eltern", "kind_schlafen"]
+      modus_entities: "{{ master | map('regex_replace', '$', '_mode') | map('regex_replace', '^', 'select.') | list }}"
+      stufe_entities: "{{ master | map('regex_replace', '$', '_fan_speed') | map('regex_replace', '^', 'select.') | list }}"
+    sequence:
+      - if:
+          - condition: template
+            value_template: >-
+              {{ modus not in ['Smart','Auto','ManualHeatRecovery','Night','AwayHome','Expulsion','Intake','MasterSlaveFlow','SlaveMasterFlow']
+                 or stufe not in ['Low','Medium','High'] }}
+        then:
+          - stop: "Bitte Modus und Stufe angeben (Skript ist ein Baustein für Automationen und Button)."
+            error: true
+      - service: select.select_option
+        target:
+          entity_id: "{{ modus_entities }}"
+        data:
+          option: "{{ modus }}"
+      - service: select.select_option
+        target:
+          entity_id: "{{ stufe_entities }}"
+        data:
+          option: "{{ stufe }}"
+
+  # Button fuer alle Familienmitglieder: 20 Minuten kraeftig querlueften,
+  # danach automatisch zurueck auf den vorherigen Betrieb.
+  lueftung_schlafetage_stosslueften:
+    alias: "Schlafetage 20 min durchlüften"
+    icon: mdi:weather-windy
+    mode: single
+    variables:
+      master: ["buro_l", "eltern", "kind_schlafen"]      # gleiche Liste wie oben
+    sequence:
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: binary_sensor.neuracell_x_radon_protection_active
+            state: "on"
+      - service: scene.create
+        data:
+          scene_id: schlafetage_vorher
+          snapshot_entities: >-
+            {{ (master | map('regex_replace', '$', '_mode') | map('regex_replace', '^', 'select.') | list)
+               + (master | map('regex_replace', '$', '_fan_speed') | map('regex_replace', '^', 'select.') | list) }}
+      - service: script.lueftung_schlafetage_setzen
+        data:
+          modus: MasterSlaveFlow
+          stufe: High
+      - delay: "00:20:00"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: binary_sensor.neuracell_x_radon_protection_active
+            state: "on"
+      - service: scene.turn_on
+        target:
+          entity_id: scene.schlafetage_vorher
+
+automation:
+  # Vor dem Schlafengehen 30 min Querlueftung, danach die ganze Nacht
+  # gleichmaessig Waermerueckgewinnung Stufe Low. Mo-Fr und Sa-So getrennt.
+  - id: ambientika_schlafetage_abend
+    alias: "Ambientika Schlafetage – Abend und Nacht"
+    mode: restart
+    trigger:
+      - platform: time
+        at: input_datetime.lueftung_abend_werktag
+        id: werktag
+      - platform: time
+        at: input_datetime.lueftung_abend_wochenende
+        id: wochenende
+    condition:
+      - condition: or
+        conditions:
+          - condition: and
+            conditions:
+              - condition: trigger
+                id: werktag
+              - condition: time
+                weekday: [mon, tue, wed, thu, fri]
+          - condition: and
+            conditions:
+              - condition: trigger
+                id: wochenende
+              - condition: time
+                weekday: [sat, sun]
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: binary_sensor.neuracell_x_radon_protection_active
+            state: "on"
+    action:
+      - service: script.lueftung_schlafetage_setzen
+        data:
+          modus: MasterSlaveFlow
+          stufe: High
+      - delay: "00:30:00"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: binary_sensor.neuracell_x_radon_protection_active
+            state: "on"
+      - service: script.lueftung_schlafetage_setzen
+        data:
+          modus: ManualHeatRecovery
+          stufe: Low
+
+  # Morgens zurueck in den sensorgefuehrten SMART-Betrieb. Mo-Fr und Sa-So getrennt.
+  - id: ambientika_schlafetage_morgen
+    alias: "Ambientika Schlafetage – Tagbetrieb"
+    mode: single
+    trigger:
+      - platform: time
+        at: input_datetime.lueftung_morgen_werktag
+        id: werktag
+      - platform: time
+        at: input_datetime.lueftung_morgen_wochenende
+        id: wochenende
+    condition:
+      - condition: or
+        conditions:
+          - condition: and
+            conditions:
+              - condition: trigger
+                id: werktag
+              - condition: time
+                weekday: [mon, tue, wed, thu, fri]
+          - condition: and
+            conditions:
+              - condition: trigger
+                id: wochenende
+              - condition: time
+                weekday: [sat, sun]
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: binary_sensor.neuracell_x_radon_protection_active
+            state: "on"
+    action:
+      - service: script.lueftung_schlafetage_setzen
+        data:
+          modus: Smart
+          stufe: Medium
+
+  # Hinweis aufs Handy, wenn der Radonschutz anspringt bzw. endet.
+  - id: ambientika_radon_hinweis
+    alias: "Ambientika NeuraCell-X – Radonschutz Hinweis"
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.neuracell_x_radon_protection_active
+        from: "off"
+        to: "on"
+        id: "an"
+      - platform: state
+        entity_id: binary_sensor.neuracell_x_radon_protection_active
+        from: "on"
+        to: "off"
+        id: "aus"
+    action:
+      - service: notify.notify
+        data:
+          title: "NeuraCell-X"
+          message: >
+            {% if trigger.id == 'an' %}
+            Radonschutz aktiv ({{ states('sensor.neuracell_x_radon_level') }} Bq/m³) – alle Geräte laufen in Zuluft.
+            {% else %}
+            Radonwert wieder im grünen Bereich – Lüftung läuft wie vorher.
+            {% endif %}
