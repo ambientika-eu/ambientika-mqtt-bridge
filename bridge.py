@@ -123,6 +123,14 @@ STARTUP_GRACE_S = 90.0
 # mode for a short while. Within this window a partial manual command fills its
 # unspecified attributes from the restored baseline instead (seconds).
 RESTORE_STALE_WINDOW_S = 120.0
+# A radon value from one source (topic) counts for this long; with several
+# sources (e.g. Ambientika radon meter + a second meter) the highest value that
+# is still current decides (seconds). The Ambientika meter reports every 10 min.
+RADON_VALUE_MAX_AGE_S = 1800.0
+# The Ambientika radon meter publishes "mittelwert": 0 right after it (re)starts,
+# before its first 10-minute measurement. A 0 within this time after the meter
+# came online is ignored (seconds).
+RADON_METER_BOOT_IGNORE_S = 180.0
 # Values that switch an optional MQTT input topic off (e.g. radon_alarm_topic).
 DISABLED_TOPIC_VALUES = ("none", "off", "disabled", "-")
 
@@ -252,6 +260,88 @@ def _to_float(raw: str) -> Optional[float]:
         return None
 
 
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _finite(v) -> Optional[float]:
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _payload_number(raw: str, key: str = "", require_key: bool = False) -> Optional[float]:
+    """Finite number from an MQTT payload: plain ("62"), JSON number, or a JSON
+    object ({"mittelwert": 62}) - by `key`, or (unless require_key) its only
+    numeric value. NaN/Infinity and absurd values are rejected (None)."""
+    v = _to_float(raw)
+    if v is not None:
+        return v if math.isfinite(v) else None
+    try:
+        obj = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if _is_num(obj):
+        return None if require_key else _finite(obj)
+    if isinstance(obj, dict):
+        if key and key in obj:
+            x = obj[key]
+            if _is_num(x):
+                return _finite(x)
+            if isinstance(x, str):
+                f = _to_float(x)
+                return f if f is not None and math.isfinite(f) else None
+            return None
+        if require_key:
+            return None
+        nums = [x for x in obj.values() if _is_num(x)]
+        if len(nums) == 1:
+            return _finite(nums[0])
+    return None
+
+
+def _payload_truthy(raw: str, key: str = "") -> bool:
+    """Boolean from an MQTT payload: ON/OFF/true/1 ... or a JSON object
+    ({"block": true}) - by `key`, or its only value."""
+    try:
+        obj = json.loads(raw)
+    except (TypeError, ValueError):
+        return _truthy(raw)
+    if isinstance(obj, dict):
+        if key and key in obj:
+            obj = obj[key]
+        elif len(obj) == 1:
+            obj = next(iter(obj.values()))
+        else:
+            return False
+    if isinstance(obj, bool):
+        return obj
+    if _is_num(obj):
+        return isinstance(obj, int) and obj == 1     # same rule as plain "1"
+    if isinstance(obj, str):
+        return _truthy(obj)
+    return False
+
+
+def _topic_match(sub: str, topic: str) -> bool:
+    """MQTT topic filter match (supports + and # wildcards)."""
+    if not sub:
+        return False
+    try:
+        return mqtt.topic_matches_sub(sub, topic)
+    except Exception:
+        return sub == topic
+
+
+def _availability_filter(state_filter: str) -> str:
+    """radon/+/state -> radon/+/availability/state (Ambientika radon meter)."""
+    if state_filter.endswith("/state"):
+        return state_filter[:-len("/state")] + "/availability/state"
+    return ""
+
+
 def dew_point_c(temp_c: float, rh_pct: float) -> float:
     """Dew point in °C from temperature (°C) and relative humidity (%) - Magnus formula."""
     a, b = 17.625, 243.04
@@ -304,6 +394,12 @@ class BridgeConfig:
         self.neuracell_enabled = True
         self.radon_topic = "ambientika/radon/value"       # numeric Bq/m3
         self.radon_alarm_topic = "ambientika/radon/alarm"  # explicit ON/OFF
+        # Native topic of the Ambientika radon meter (MQTT mode 4): JSON
+        # {"mittelwert": <Bq/m3>} on radon/<meter-id>/state. Read directly, no
+        # Home Assistant automation needed. "none" switches it off.
+        self.radon_meter_topic = "radon/+/state"
+        # JSON key of the radon value in JSON payloads (radon_topic / meter topic).
+        self.radon_value_key = "mittelwert"
         self.radon_threshold = 300                          # Bq/m3 (DE reference value)
         self.radon_hysteresis = 50                          # Bq/m3
         self.radon_protection_fan = "Low"
@@ -324,6 +420,8 @@ class BridgeConfig:
         self.dewpoint_source = "signal"
         # signal source:
         self.dewpoint_block_topic = "ambientika/dewpoint/block"  # truthy = block ventilation
+        # JSON key of the block flag if the block topic carries a JSON object.
+        self.dewpoint_block_key = ""
         # device source: read a TPS device's status from the Ambientika cloud
         # (no extra hardware). Requires the TPS serial; block when its operating
         # mode is one of dewpoint_device_block_modes (default: Off).
@@ -394,6 +492,8 @@ class BridgeConfig:
         self.neuracell_enabled = cast_bool(get("neuracell_enabled", self.neuracell_enabled))
         self.radon_topic = get("radon_topic", self.radon_topic) or self.radon_topic
         self.radon_alarm_topic = get("radon_alarm_topic", self.radon_alarm_topic) or self.radon_alarm_topic
+        self.radon_meter_topic = get("radon_meter_topic", self.radon_meter_topic) or self.radon_meter_topic
+        self.radon_value_key = get("radon_value_key", self.radon_value_key) or self.radon_value_key
         try:
             self.radon_threshold = int(get("radon_threshold", self.radon_threshold))
         except (TypeError, ValueError):
@@ -416,6 +516,8 @@ class BridgeConfig:
         self.dewpoint_enabled = cast_bool(get("dewpoint_enabled", self.dewpoint_enabled))
         self.dewpoint_source = get("dewpoint_source", self.dewpoint_source) or self.dewpoint_source
         self.dewpoint_block_topic = get("dewpoint_block_topic", self.dewpoint_block_topic) or self.dewpoint_block_topic
+        dbk = get("dewpoint_block_key", self.dewpoint_block_key)
+        self.dewpoint_block_key = "" if dbk is None else str(dbk).strip()
         self.dewpoint_indoor_temp_topic = get("dewpoint_indoor_temp_topic", self.dewpoint_indoor_temp_topic) or self.dewpoint_indoor_temp_topic
         self.dewpoint_indoor_humidity_topic = get("dewpoint_indoor_humidity_topic", self.dewpoint_indoor_humidity_topic) or self.dewpoint_indoor_humidity_topic
         self.dewpoint_outdoor_temp_topic = get("dewpoint_outdoor_temp_topic", self.dewpoint_outdoor_temp_topic) or self.dewpoint_outdoor_temp_topic
@@ -451,6 +553,9 @@ class BridgeConfig:
             ("log_level", ("LOG_LEVEL",)),
             ("radon_topic", ("RADON_TOPIC",)),
             ("radon_alarm_topic", ("RADON_ALARM_TOPIC",)),
+            ("radon_meter_topic", ("RADON_METER_TOPIC",)),
+            ("radon_value_key", ("RADON_VALUE_KEY",)),
+            ("dewpoint_block_key", ("DEWPOINT_BLOCK_KEY",)),
             ("radon_protection_fan", ("RADON_PROTECTION_FAN",)),
             ("radon_source", ("RADON_SOURCE",)),
             ("radon_device_serial", ("RADON_DEVICE_SERIAL",)),
@@ -470,6 +575,8 @@ class BridgeConfig:
         # stale retained "ON" on the alarm topic can never hold radon protection).
         if str(self.radon_alarm_topic or "").strip().lower() in DISABLED_TOPIC_VALUES:
             self.radon_alarm_topic = ""
+        if str(self.radon_meter_topic or "").strip().lower() in DISABLED_TOPIC_VALUES:
+            self.radon_meter_topic = ""
 
         mp = _env("MQTT_PORT")
         if mp:
@@ -937,6 +1044,8 @@ class NeuraCellXController:
         # each other off. Either one keeps radon protection on (safety first).
         self._radon_value_alarm = False
         self._radon_signal_alarm = False
+        self._radon_values: dict = {}    # source -> (value, monotonic time)
+        self._meter_online: dict = {}    # meter state topic -> (online bool, monotonic time)
         self.dewpoint_block = False
         self.last_radon: Optional[float] = None
 
@@ -998,13 +1107,44 @@ class NeuraCellXController:
         return False
 
     # ----- radon signals -----
-    async def on_radon_value(self, raw: str) -> None:
+    def _effective_radon(self) -> Optional[float]:
+        """Highest radon value that is still current across all sources."""
+        now = time.monotonic()
+        fresh = [v for v, t in self._radon_values.values() if now - t <= RADON_VALUE_MAX_AGE_S]
+        return max(fresh) if fresh else None
+
+    async def on_radon_meter_availability(self, state_topic: str, raw: str) -> None:
+        """Availability of an Ambientika radon meter (radon/<id>/availability/state)."""
+        online = raw.strip().lower() == "online"
+        prev = self._meter_online.get(state_topic, (None, 0.0))[0]
+        self._meter_online[state_topic] = (online, time.monotonic())
+        if online and prev is not True:
+            log.info("NeuraCell-X: radon meter %s online.", state_topic)
+        elif not online and prev is not False:
+            log.warning("NeuraCell-X: radon meter %s offline - its last value is not used for new "
+                        "decisions (current protection state is kept).", state_topic)
+            self._radon_values.pop(state_topic, None)
+            self.bridge.publish_neuracell_state()
+
+    async def on_radon_value(self, raw: str, source: str = "value") -> None:
         if not self.cfg.neuracell_enabled:
             return
-        value = _to_float(raw)
-        if value is None:
-            log.warning("NeuraCell-X: could not parse radon value %r", raw)
+        is_meter = source not in ("value", "device")
+        v = _payload_number(raw, self.cfg.radon_value_key, require_key=is_meter)
+        if v is None:
+            log.warning("NeuraCell-X: could not parse radon value %r%s", raw,
+                        (" (expected key %r)" % self.cfg.radon_value_key) if is_meter else "")
             return
+        if v == 0:
+            st = self._meter_online.get(source)
+            if st is not None and st[0] and time.monotonic() - st[1] < RADON_METER_BOOT_IGNORE_S:
+                log.info("NeuraCell-X: radon meter %s just started (0 Bq/m3, no measurement yet) - ignored.",
+                         source)
+                return
+        self._radon_values[source] = (v, time.monotonic())
+        value = self._effective_radon()
+        if value is None:
+            value = v
         self.last_radon = value
         before = self.radon_active
         if not self._radon_value_alarm and value >= self.cfg.radon_threshold:
@@ -1026,7 +1166,7 @@ class NeuraCellXController:
     async def on_radon_alarm(self, raw: str) -> None:
         if not self.cfg.neuracell_enabled:
             return
-        on = _truthy(raw)
+        on = _payload_truthy(raw)
         await self._set_radon_signal_alarm(on, "explicit radon alarm %s." % ("ON" if on else "OFF"))
 
     async def _set_radon_signal_alarm(self, on: bool, msg: str) -> None:
@@ -1073,7 +1213,7 @@ class NeuraCellXController:
             on = raw
         elif isinstance(raw, (int, float)):
             # Numeric field -> reuse the threshold/hysteresis path (does reconcile).
-            await self.on_radon_value(str(raw))
+            await self.on_radon_value(str(raw), source="device")
             return
         else:
             value = getattr(raw, "name", raw)   # enum -> its name, else the value itself
@@ -1089,14 +1229,14 @@ class NeuraCellXController:
         """External ON/OFF block signal (source='signal')."""
         if not self.cfg.dewpoint_enabled:
             return
-        block = _truthy(raw)
+        block = _payload_truthy(raw, self.cfg.dewpoint_block_key)
         await self._set_dewpoint_block(block)
 
     async def on_dewpoint_sensor(self, which: str, raw: str) -> None:
         """One of the four sensor inputs (source='computed')."""
         if not self.cfg.dewpoint_enabled:
             return
-        val = _to_float(raw)
+        val = _payload_number(raw)
         if val is None:
             log.warning("NeuraCell-X: could not parse dew-point sensor %s=%r", which, raw)
             return
@@ -1951,8 +2091,16 @@ class AmbientikaBridge:
                     client.subscribe(self.cfg.radon_topic)
                 if self.cfg.radon_alarm_topic:
                     client.subscribe(self.cfg.radon_alarm_topic)
-                log.info("NeuraCell-X: radon topics subscribed (%s / %s).",
-                         self.cfg.radon_topic, self.cfg.radon_alarm_topic)
+                if self.cfg.radon_meter_topic:
+                    # availability first, so retained "online" is known before the
+                    # retained start-up value arrives
+                    avail = _availability_filter(self.cfg.radon_meter_topic)
+                    if avail:
+                        client.subscribe(avail)
+                    client.subscribe(self.cfg.radon_meter_topic)
+                log.info("NeuraCell-X: radon topics subscribed (%s / %s / meter %s).",
+                         self.cfg.radon_topic, self.cfg.radon_alarm_topic,
+                         self.cfg.radon_meter_topic or "off")
         if self.cfg.dewpoint_enabled:
             if self.cfg.dewpoint_source == "computed":
                 for topic in self._dewpoint_sensor_map():
@@ -1992,16 +2140,27 @@ class AmbientikaBridge:
             topic = msg.topic
 
             if self.cfg.neuracell_enabled and self.cfg.radon_source != "device":
-                if topic == self.cfg.radon_topic:
-                    self._dispatch(self.neuracell.on_radon_value(payload)); return
-                if topic == self.cfg.radon_alarm_topic:
+                avail = _availability_filter(self.cfg.radon_meter_topic) if self.cfg.radon_meter_topic else ""
+                if avail and _topic_match(avail, topic):
+                    state_topic = topic[:-len("/availability/state")] + "/state"
+                    self._dispatch(self.neuracell.on_radon_meter_availability(state_topic, payload)); return
+                if _topic_match(self.cfg.radon_meter_topic, topic):
+                    self._dispatch(self.neuracell.on_radon_value(payload, source=topic)); return
+                if _topic_match(self.cfg.radon_topic, topic):
+                    self._dispatch(self.neuracell.on_radon_value(payload, source="value")); return
+                if _topic_match(self.cfg.radon_alarm_topic, topic):
                     self._dispatch(self.neuracell.on_radon_alarm(payload)); return
 
             if self.cfg.dewpoint_enabled:
-                if self.cfg.dewpoint_source == "signal" and topic == self.cfg.dewpoint_block_topic:
+                if self.cfg.dewpoint_source == "signal" and _topic_match(self.cfg.dewpoint_block_topic, topic):
                     self._dispatch(self.neuracell.on_dewpoint_block(payload)); return
                 if self.cfg.dewpoint_source == "computed":
                     which = self._dewpoint_sensor_map().get(topic)
+                    if which is None:
+                        for sub, w in self._dewpoint_sensor_map().items():
+                            if _topic_match(sub, topic):
+                                which = w
+                                break
                     if which:
                         self._dispatch(self.neuracell.on_dewpoint_sensor(which, payload)); return
 
@@ -2294,6 +2453,7 @@ class AmbientikaBridge:
             "radon_value_alarm": nc._radon_value_alarm,
             "radon_signal_alarm": nc._radon_signal_alarm,
             "radon": nc.last_radon,
+            "radon_sources": {s: v for s, (v, _t) in sorted(nc._radon_values.items())},
             "radon_threshold": self.cfg.radon_threshold,
             "dewpoint_block": nc.dewpoint_block,
             "dewpoint_block_devices": sorted(self.cfg.dewpoint_block_device_tokens) or "all",
