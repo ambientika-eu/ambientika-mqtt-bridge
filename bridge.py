@@ -992,6 +992,15 @@ def build_neuracell_discovery(cfg: BridgeConfig):
             "unit_of_measurement": "Bq/m³", "icon": "mdi:radioactive",
             "device": device_info,
         }),
+        (f"{base}/binary_sensor/neuracell_radon_meter_connected/config", {
+            "name": "Radon Meter Connected",
+            "unique_id": "neuracell_radon_meter_connected",
+            "state_topic": state,
+            "value_template": "{{ value_json.radon_meter_connected }}",
+            "payload_on": "True", "payload_off": "False",
+            "device_class": "connectivity", "icon": "mdi:access-point-network",
+            "device": device_info,
+        }),
         (f"{base}/binary_sensor/neuracell_dewpoint_block/config", {
             "name": "Ventilation Blocked (Dew Point)",
             "unique_id": "neuracell_dewpoint_block",
@@ -1113,6 +1122,12 @@ class NeuraCellXController:
         fresh = [v for v, t in self._radon_values.values() if now - t <= RADON_VALUE_MAX_AGE_S]
         return max(fresh) if fresh else None
 
+    def radon_meter_connected(self) -> Optional[bool]:
+        """True if every known radon meter is online, False if one is offline, None if none seen."""
+        if not self._meter_online:
+            return None
+        return all(online for online, _t in self._meter_online.values())
+
     async def on_radon_meter_availability(self, state_topic: str, raw: str) -> None:
         """Availability of an Ambientika radon meter (radon/<id>/availability/state)."""
         online = raw.strip().lower() == "online"
@@ -1120,6 +1135,7 @@ class NeuraCellXController:
         self._meter_online[state_topic] = (online, time.monotonic())
         if online and prev is not True:
             log.info("NeuraCell-X: radon meter %s online.", state_topic)
+            self.bridge.publish_neuracell_state()
         elif not online and prev is not False:
             log.warning("NeuraCell-X: radon meter %s offline - its last value is not used for new "
                         "decisions (current protection state is kept).", state_topic)
@@ -2455,6 +2471,10 @@ class AmbientikaBridge:
             "radon": nc.last_radon,
             "radon_sources": {s: v for s, (v, _t) in sorted(nc._radon_values.items())},
             "radon_threshold": self.cfg.radon_threshold,
+            # Ambientika radon meter(s) on radon_meter_topic: True = all online,
+            # False = at least one offline, None = no meter seen yet.
+            "radon_meter_connected": nc.radon_meter_connected(),
+            "radon_value_current": nc._effective_radon() is not None,
             "dewpoint_block": nc.dewpoint_block,
             "dewpoint_block_devices": sorted(self.cfg.dewpoint_block_device_tokens) or "all",
             "indoor_dew_point": round(nc.indoor_dew_point, 1) if nc.indoor_dew_point is not None else None,
@@ -2699,8 +2719,16 @@ class AmbientikaBridge:
             self.loop.call_soon_threadsafe(self._stop_event.set)
         if self.client is not None:
             try:
-                self.client.loop_stop()
+                # A clean DISCONNECT suppresses the Last Will, so announce
+                # "offline" ourselves - otherwise HA keeps showing the bridge online.
+                info = self.client.publish(bridge_avail_topic(self.cfg.topic_prefix),
+                                           "offline", qos=1, retain=True)
+                info.wait_for_publish(timeout=2.0)
+            except Exception:
+                pass
+            try:
                 self.client.disconnect()
+                self.client.loop_stop()
             except Exception:
                 pass
 
