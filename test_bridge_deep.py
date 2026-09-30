@@ -639,6 +639,12 @@ async def test_radon_meter():
     check("meter: offline -> Wert entfernt", MT not in nc._radon_values)
     st = [json.loads(p) for t, p in b.client.pub if t.endswith("neuracell/state")][-1]
     check("meter: Status mit Quellen", "radon_sources" in st, st)
+    check("meter: Verbindung offline im Status", st.get("radon_meter_connected") is False, st)
+    await mq(AV, "online")
+    st = [json.loads(p) for t, p in b.client.pub if t.endswith("neuracell/state")][-1]
+    check("meter: Verbindung wieder online im Status", st.get("radon_meter_connected") is True, st)
+    disc = [t for t, _c in bridge.build_neuracell_discovery(b.cfg)]
+    check("meter: HA-Sensor Radon Meter Connected", any("neuracell_radon_meter_connected" in t for t in disc))
 
     # Pruefer-Funde: NaN/Inf/Riesenzahlen, strenge Wahrheitswerte, Schluessel am Messgeraet
     check("meter: NaN/Inf abgelehnt", pn("nan") is None and pn("inf") is None
