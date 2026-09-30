@@ -214,6 +214,25 @@ automation:
           modus: Smart
           stufe: Medium
 
+  # Hinweis aufs Handy, wenn das Radon-Messgeraet laenger als 20 Minuten keine
+  # Verbindung hat (ab Bridge 1.4.25). Solange es offline ist, arbeitet der
+  # Radonschutz ohne aktuellen Messwert.
+  - id: ambientika_radon_messgeraet_offline
+    alias: "Ambientika NeuraCell-X – Radon-Messgerät offline"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.neuracell_x_radon_meter_connected
+        to: "off"
+        for: "00:20:00"
+    action:
+      - service: notify.notify
+        data:
+          title: "NeuraCell-X"
+          message: >
+            Das Radon-Messgerät ist seit 20 Minuten nicht verbunden. Bitte kurz
+            vom Strom nehmen und wieder einstecken.
+
   # Hinweis aufs Handy, wenn der Radonschutz anspringt bzw. endet.
   - id: ambientika_radon_hinweis
     alias: "Ambientika NeuraCell-X – Radonschutz Hinweis"
