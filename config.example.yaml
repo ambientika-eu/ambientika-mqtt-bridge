@@ -72,3 +72,9 @@ dewpoint:
   dewpoint_outdoor_humidity_topic: "ambientika/dewpoint/outdoor_humidity"
   dewpoint_margin: 1.0                          # °C
   dewpoint_hysteresis: 0.5                      # °C
+  # Connection watch for the Taupunktsteuerung (TPS). A TPS that hangs stops
+  # sending; without a watch its last block state would stay in force unnoticed.
+  # The HA sensor "Dew Point Controller Connected" shows the result.
+  dewpoint_availability_topic: ""   # its availability topic with Last Will (online/offline); "" = off
+  dewpoint_signal_timeout: 0        # minutes without any TPS message -> disconnected; 0 = off (only without Last Will; pauses while the bridge is off the broker)
+  dewpoint_lost_action: "keep"      # when disconnected: "keep" | "release" (ventilate) | "block" (units off)

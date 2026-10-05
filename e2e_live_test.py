@@ -79,6 +79,23 @@ class Meter:
     def clean_stop(self):
         self.c.loop_stop(); self.c.disconnect()
 
+class Tps:
+    """Taupunktsteuerung in MQTT mode, assumed with Last Will like the radon meter."""
+    ID = "TP_D48C4956EC10"
+    def __init__(self, keepalive=3, announce=True):
+        self.c = mqtt.Client(client_id=self.ID)
+        self.c.will_set(f"taupunkt/{self.ID}/availability/state", "offline", retain=True)
+        self.c.connect("127.0.0.1", PORT, keepalive=keepalive); self.c.loop_start()
+        time.sleep(0.3)
+        if announce:
+            self.online()
+    def online(self):
+        self.c.publish(f"taupunkt/{self.ID}/availability/state", "online", retain=True)
+    def block(self, v):
+        self.c.publish("ambientika/dewpoint/block", v, retain=True)
+    def hang(self):
+        self.c.loop_stop()
+
 def retained(topic, timeout=3):
     """Read what a NEW subscriber (e.g. HA after restart) gets for a topic."""
     got = {}
@@ -102,6 +119,8 @@ async def run_bridge(devs, stop_after):
     cfg.mqtt_host, cfg.mqtt_port, cfg.poll_interval = "127.0.0.1", PORT, 2
     cfg.radon_threshold, cfg.radon_hysteresis = 50, 10
     cfg.dewpoint_block_devices = "FCB467C4B1E4,FCB467C6EABC"
+    cfg.dewpoint_availability_topic = "taupunkt/+/availability/state"
+    cfg.dewpoint_lost_action = "release"
     b = bridge.AmbientikaBridge(cfg)
     async def login(): b.api = object()
     async def discover(): b.devices = devs
@@ -190,6 +209,33 @@ async def scenario():
         spy.c.publish("ambientika/dewpoint/block", "OFF", retain=True)
         check("block released -> everything exactly as before", await aw(lambda: modes(devs) == before), modes(devs))
 
+        print("\n[9b] Taupunktsteuerung with Last Will hangs -> release (1.4.26)")
+        tps = await loop.run_in_executor(None, Tps)
+        check("TPS connected = True", await aw(lambda: spy.nc().get("dewpoint_controller_connected") is True), spy.nc())
+        disc = retained("homeassistant/binary_sensor/neuracell_dewpoint_controller_connected/config")
+        check("HA discovery 'Dew Point Controller Connected' retained", disc[1] == 1, disc)
+        tps.block("ON")
+        check("TPS block -> both OFFICE Off", await aw(lambda: all(devs[s]._s["operating_mode"] == OM.Off for s in OFFICE)), modes(devs))
+        t0 = time.time(); tps.hang()
+        ok = await aw(lambda: spy.nc().get("dewpoint_controller_connected") is False, 20)
+        check("TPS connected = False after LWT (%.1f s)" % (time.time() - t0), ok, spy.nc())
+        check("lost action release -> OFFICE back, everything as before", await aw(lambda: modes(devs) == before), modes(devs))
+        check("block flag released", spy.nc().get("dewpoint_block") is False, spy.nc())
+
+        print("\n[9c] TPS back, sends a LIVE block before its 'online' (Last Will stays authoritative)")
+        tps2 = await loop.run_in_executor(None, lambda: Tps(announce=False))
+        tps2.block("ON")
+        check("live ON while LWT offline -> applied, OFFICE Off", await aw(lambda: all(devs[s]._s["operating_mode"] == OM.Off for s in OFFICE)), modes(devs))
+        check("live ON while LWT offline -> status still disconnected", spy.nc().get("dewpoint_controller_connected") is False, spy.nc())
+        tps2.online()
+        check("'online' -> connected True, block kept", await aw(lambda: spy.nc().get("dewpoint_controller_connected") is True) and spy.nc().get("dewpoint_block") is True, spy.nc())
+        tps2.block("OFF")
+        check("OFF -> everything exactly as before", await aw(lambda: modes(devs) == before), modes(devs))
+        tps2.block("ON")
+        check("ON again before the restart test", await aw(lambda: all(devs[s]._s["operating_mode"] == OM.Off for s in OFFICE)))
+        tps2.hang()
+        check("tps2 LWT offline", await aw(lambda: spy.nc().get("dewpoint_controller_connected") is False, 20), spy.nc())
+
         print("\n[10] Clean meter disconnect (no LWT) keeps last availability")
         m2.clean_stop(); await asyncio.sleep(1)
         check("still online (clean disconnect sends no LWT)", spy.nc().get("radon_meter_connected") is True)
@@ -207,6 +253,9 @@ async def scenario():
         ok = await loop.run_in_executor(None, wait, lambda: spy.nc().get("radon_meter_connected") is False, 15)
         check("after restart: retained offline seen -> connected False", ok, spy.nc())
         check("retained old value not used while offline", spy.nc().get("radon_protection") is False, spy.nc())
+        check("after restart: TPS retained offline -> connected False", spy.nc().get("dewpoint_controller_connected") is False, spy.nc())
+        check("after restart: stale retained block ON of dead TPS not applied",
+              await loop.run_in_executor(None, wait, lambda: all(devs2[s]._s["operating_mode"] != OM.Off for s in OFFICE), 5), modes(devs2))
     await run_bridge(devs2, steps2)
 
     spy.c.loop_stop()

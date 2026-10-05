@@ -678,6 +678,313 @@ async def test_radon_meter():
     check("meter: Sperre JSON aus", not nc.dewpoint_block)
 
 
+async def test_dewpoint_watch():
+    """1.4.26: Verbindungsueberwachung der Taupunktsteuerung (LWT, Zeitgrenze, Cloud)."""
+    import time as _t
+    # Config: Standard aus, Werte, Abschalten, ungueltig
+    c = bridge.BridgeConfig()
+    c._apply_extras({}.get)
+    c.apply_env_overrides()
+    check("tps: Standard aus", c.dewpoint_availability_topic == "" and c.dewpoint_signal_timeout == 0
+          and c.dewpoint_lost_action == "keep")
+    c._apply_extras({"dewpoint_availability_topic": "taupunkt/TP_X/availability/state",
+                     "dewpoint_signal_timeout": "15", "dewpoint_lost_action": "Release"}.get)
+    check("tps: Werte uebernommen", c.dewpoint_availability_topic == "taupunkt/TP_X/availability/state"
+          and c.dewpoint_signal_timeout == 15 and c.dewpoint_lost_action == "release")
+    c._apply_extras({"dewpoint_availability_topic": "none", "dewpoint_signal_timeout": -5,
+                     "dewpoint_lost_action": "explode"}.get)
+    check("tps: none/negativ/ungueltig abgefangen", c.dewpoint_availability_topic == ""
+          and c.dewpoint_signal_timeout == 0 and c.dewpoint_lost_action == "keep")
+    os.environ["DEWPOINT_SIGNAL_TIMEOUT"] = "20"
+    os.environ["DEWPOINT_LOST_ACTION"] = "block"
+    os.environ["DEWPOINT_AVAILABILITY_TOPIC"] = "tp/+/availability/state"
+    c3 = bridge.BridgeConfig.from_env()
+    for k in ("DEWPOINT_SIGNAL_TIMEOUT", "DEWPOINT_LOST_ACTION", "DEWPOINT_AVAILABILITY_TOPIC"):
+        del os.environ[k]
+    check("tps: Umgebungsvariablen", c3.dewpoint_signal_timeout == 20 and c3.dewpoint_lost_action == "block"
+          and c3.dewpoint_availability_topic == "tp/+/availability/state")
+    import tempfile as _tf
+    with _tf.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump({"ambientika_username": "u", "dewpoint_availability_topic": "taupunkt/+/availability/state",
+                   "dewpoint_signal_timeout": 0, "dewpoint_lost_action": "release"}, fh)
+    c4 = bridge.BridgeConfig.from_ha_options(fh.name)
+    os.unlink(fh.name)
+    check("tps: Add-on-Optionen (options.json)", c4.dewpoint_availability_topic == "taupunkt/+/availability/state"
+          and c4.dewpoint_lost_action == "release" and c4.dewpoint_signal_timeout == 0)
+    disc = [t for t, _c in bridge.build_neuracell_discovery(c)]
+    check("tps: HA-Sensor Dew Point Controller Connected",
+          any("neuracell_dewpoint_controller_connected" in t for t in disc))
+
+    class Msg:
+        def __init__(self, t, p, retain=False):
+            self.topic, self.payload, self.retain = t, p.encode(), retain
+
+    def mkbridge(**kw):
+        cfg = bridge.BridgeConfig()
+        cfg.dewpoint_block_devices = "OFF-1"
+        for k, v in kw.items():
+            setattr(cfg, k, v)
+        b = bridge.AmbientikaBridge(cfg)
+        b.client = FakeClient()
+        b.loop = asyncio.get_running_loop()
+        office = FakeDevice(serial="OFF-1", name="Office", status=mkstatus(op=OM.Smart))
+        smart = FakeDevice(serial="SM-1", name="Eltern", status=mkstatus(op=OM.Night))
+        b.devices = {office.serial_number: office, smart.serial_number: smart}
+        pending = []
+        b._dispatch = lambda coro: pending.append(coro)
+
+        async def mq(t, p, retain=False):
+            b._on_mqtt_message(None, None, Msg(t, p, retain))
+            while pending:
+                await pending.pop(0)
+        return b, office, smart, mq
+
+    def state(b):
+        return [json.loads(p) for t, p in b.client.pub if t.endswith("neuracell/state")][-1]
+
+    def silent_for(nc, minutes):
+        """Die TPS hat seit `minutes` nichts gesendet (Verbindungsaufbau lag davor)."""
+        nc._tps_last_seen = _t.monotonic() - minutes * 60
+        nc._tps_watch_start = min(nc._tps_watch_start, nc._tps_last_seen)
+
+    BT, AV = "ambientika/dewpoint/block", "taupunkt/TP_D48C4956EC10/availability/state"
+
+    # A) ohne Ueberwachung: Verhalten wie bisher, Status None
+    b, office, smart, mq = mkbridge()
+    await mq(BT, "ON")
+    check("tps: ohne Watch Sperre wirkt", office._status["operating_mode"] == OM.Off)
+    check("tps: ohne Watch Status None", state(b).get("dewpoint_controller_connected") is None, state(b))
+
+    # B) LWT, Standard keep: Sperre bleibt, Status False, wieder online -> True
+    b, office, smart, mq = mkbridge(dewpoint_availability_topic=AV)
+    await mq(AV, "online")
+    check("tps: LWT online -> True", state(b).get("dewpoint_controller_connected") is True, state(b))
+    await mq(BT, "ON")
+    await mq(AV, "offline")
+    check("tps: LWT offline -> False", state(b).get("dewpoint_controller_connected") is False, state(b))
+    check("tps: keep -> Sperre bleibt", b.neuracell.dewpoint_block and office._status["operating_mode"] == OM.Off)
+    await mq(AV, "online")
+    check("tps: wieder online -> True", state(b).get("dewpoint_controller_connected") is True, state(b))
+    await mq(BT, "OFF")
+    check("tps: danach normale Freigabe, exakt wie vorher", office._status["operating_mode"] == OM.Smart
+          and smart._status["operating_mode"] == OM.Night)
+
+    # C) LWT + release: Sperre wird freigegeben, OFFICE zurueck
+    b, office, smart, mq = mkbridge(dewpoint_availability_topic=AV, dewpoint_lost_action="release")
+    await mq(AV, "online")
+    await mq(BT, "ON")
+    check("tps: release - Sperre aktiv", office._status["operating_mode"] == OM.Off)
+    await mq(AV, "offline")
+    check("tps: release - bei Verlust freigegeben", not b.neuracell.dewpoint_block
+          and office._status["operating_mode"] == OM.Smart, office._status)
+    check("tps: release - Schlafetage unberuehrt", smart._status["operating_mode"] == OM.Night)
+    await mq(BT, "ON", retain=True)
+    check("tps: release - gespeicherte Sperre bei offline ignoriert", not b.neuracell.dewpoint_block
+          and office._status["operating_mode"] == OM.Smart)
+    check("tps: release - Status bleibt getrennt", state(b).get("dewpoint_controller_connected") is False)
+    await mq(BT, "ON")
+    check("tps: release - LIVE-Nachricht bei LWT offline wird angewendet, Status bleibt getrennt",
+          b.neuracell.dewpoint_block and office._status["operating_mode"] == OM.Off
+          and state(b).get("dewpoint_controller_connected") is False, state(b))
+    await mq(AV, "online")
+    check("tps: release - online -> verbunden, Sperre bleibt", b.neuracell.dewpoint_block
+          and state(b).get("dewpoint_controller_connected") is True)
+    await mq(BT, "OFF")
+    check("tps: release - OFF gibt frei", not b.neuracell.dewpoint_block and office._status["operating_mode"] == OM.Smart)
+    # Neustart-Fall: Broker liefert erst LWT offline, dann die alte gespeicherte Sperre (retain)
+    b, office, smart, mq = mkbridge(dewpoint_availability_topic=AV, dewpoint_lost_action="release")
+    await mq(AV, "offline")
+    await mq(BT, "ON", retain=True)
+    check("tps: Neustart - gespeicherte Sperre einer toten TPS greift nicht",
+          not b.neuracell.dewpoint_block and office._status["operating_mode"] == OM.Smart)
+    await mq(AV, "online")
+    check("tps: Neustart - TPS wieder online -> ihre gespeicherte Sperre gilt",
+          b.neuracell.dewpoint_block and office._status["operating_mode"] == OM.Off)
+    # Neustart mit block: gespeicherte Freigabe einer toten TPS -> trotzdem gesperrt
+    b, office, smart, mq = mkbridge(dewpoint_availability_topic=AV, dewpoint_lost_action="block")
+    await mq(AV, "offline")
+    await mq(BT, "OFF", retain=True)
+    check("tps: Neustart block - tote TPS -> gesperrt", b.neuracell.dewpoint_block and office._status["operating_mode"] == OM.Off)
+    await mq(AV, "online")
+    check("tps: Neustart block - wieder online -> gespeicherte Freigabe gilt",
+          not b.neuracell.dewpoint_block and office._status["operating_mode"] == OM.Smart)
+    # Ueberlappende Filter: Sperr-Topic exakt, Verfuegbarkeit als Wildcard -> Sperre gewinnt
+    b, office, smart, mq = mkbridge(dewpoint_availability_topic="ambientika/#", dewpoint_lost_action="release")
+    b._subscribe_all(FakeClient())
+    await mq("ambientika/tps/availability", "online")
+    await mq(BT, "OFF")
+    check("tps: Ueberlappung - OFF ist Freigabe, nicht offline",
+          b.neuracell._tps_avail is True and not b.neuracell.dewpoint_block)
+    await mq(BT, "ON")
+    check("tps: Ueberlappung - ON sperrt", b.neuracell.dewpoint_block and office._status["operating_mode"] == OM.Off)
+    check("tps: exakter Filter erkannt", bridge._is_exact_filter("a/b/c") and not bridge._is_exact_filter("a/+/c")
+          and not bridge._is_exact_filter("a/#") and not bridge._is_exact_filter(""))
+    # Payload-Varianten der Verfuegbarkeit
+    pa = bridge.NeuraCellXController._parse_availability
+    check("tps: Verfuegbarkeit Varianten", pa("online") is True and pa("true") is True and pa("1") is True
+          and pa('{"state":"online"}') is True and pa("offline") is False and pa("false") is False
+          and pa('{"state":"offline"}') is False and pa("kaputt") is None)
+    b, office, smart, mq = mkbridge(dewpoint_availability_topic=AV, dewpoint_lost_action="release")
+    await mq(AV, "kaputt")
+    check("tps: unbekannte Verfuegbarkeit aendert nichts", b.neuracell._tps_avail is None)
+    await mq(AV, "true")
+    check("tps: 'true' zaehlt als online", b.neuracell.dewpoint_controller_connected() is True)
+    # LWT online + Zeitgrenze: Zeitgrenze greift nicht, solange LWT online
+    b, office, smart, mq = mkbridge(dewpoint_availability_topic=AV, dewpoint_signal_timeout=10,
+                                    dewpoint_lost_action="release")
+    await mq(AV, "online")
+    await mq(BT, "ON")
+    silent_for(b.neuracell, 60)
+    await b.neuracell.check_dewpoint_link()
+    check("tps: LWT online schlaegt Zeitgrenze", b.neuracell.dewpoint_block
+          and b.neuracell.dewpoint_controller_connected() is True)
+    # keep: wie bisher, Nachricht zaehlt (gespeichert und live)
+    b, office, smart, mq = mkbridge(dewpoint_availability_topic=AV)
+    await mq(AV, "offline")
+    await mq(BT, "ON", retain=True)
+    check("tps: keep - gespeicherte Sperre wirkt wie bisher", b.neuracell.dewpoint_block
+          and state(b).get("dewpoint_controller_connected") is False)
+    await mq(BT, "OFF")
+    check("tps: keep - live-Nachricht wirkt, LWT bleibt massgeblich", not b.neuracell.dewpoint_block
+          and state(b).get("dewpoint_controller_connected") is False)
+    # Zeitgrenze: gespeicherte Nachricht beim Start zaehlt nicht als Lebenszeichen
+    b, office, smart, mq = mkbridge(dewpoint_signal_timeout=10)
+    await mq(BT, "ON", retain=True)
+    check("tps: Zeitgrenze - gespeicherte Nachricht -> Status unbekannt, Sperre wirkt",
+          b.neuracell.dewpoint_controller_connected() is None and b.neuracell.dewpoint_block)
+
+    # D) LWT + block: bei Verlust Sperre an
+    b, office, smart, mq = mkbridge(dewpoint_availability_topic=AV, dewpoint_lost_action="block")
+    await mq(AV, "online")
+    await mq(BT, "OFF")
+    await mq(AV, "offline")
+    check("tps: block - bei Verlust gesperrt", b.neuracell.dewpoint_block and office._status["operating_mode"] == OM.Off)
+    check("tps: block - Schlafetage unberuehrt", smart._status["operating_mode"] == OM.Night)
+
+    # E) Radon hat Vorrang auch bei Verlust mit block
+    await mq("ambientika/radon/value", str(b.cfg.radon_threshold + 50))
+    check("tps: Radon vor Verlust-Sperre", office._status["operating_mode"] == bridge.RADON_PROTECTION_MODE)
+    await mq("ambientika/radon/value", "0")
+
+    # F) Zeitgrenze ohne LWT
+    b, office, smart, mq = mkbridge(dewpoint_signal_timeout=10)
+    nc = b.neuracell
+    check("tps: Zeitgrenze - am Anfang unbekannt", nc.dewpoint_controller_connected() is None)
+    await mq(BT, "ON")
+    check("tps: Zeitgrenze - Nachricht -> True", state(b).get("dewpoint_controller_connected") is True, state(b))
+    silent_for(nc, 11)
+    await nc.check_dewpoint_link()
+    check("tps: Zeitgrenze abgelaufen -> False", state(b).get("dewpoint_controller_connected") is False, state(b))
+    check("tps: Zeitgrenze keep -> Sperre bleibt", nc.dewpoint_block)
+    await mq(BT, "ON")
+    check("tps: neue Nachricht -> wieder True", state(b).get("dewpoint_controller_connected") is True, state(b))
+    # nie gemeldet: ab Bridge-Start gerechnet
+    b, office, smart, mq = mkbridge(dewpoint_signal_timeout=10)
+    b.neuracell._tps_watch_start = _t.monotonic() - 11 * 60
+    await b.neuracell.check_dewpoint_link()
+    check("tps: nie gemeldet -> nach Zeitgrenze False", b.neuracell.dewpoint_controller_connected() is False)
+
+    # G) Poll-Schleife prueft die Zeitgrenze selbst
+    b, office, smart, mq = mkbridge(dewpoint_signal_timeout=10, dewpoint_lost_action="release")
+    b.cfg.poll_interval = 1
+    await mq(BT, "ON")
+    silent_for(b.neuracell, 11)
+    b._stop_event = asyncio.Event()
+    task = asyncio.create_task(b._poll_loop())
+    await asyncio.sleep(0.4)
+    b._stop_event.set()
+    await task
+    check("tps: Poll-Schleife erkennt Verlust und gibt frei", not b.neuracell.dewpoint_block
+          and office._status["operating_mode"] == OM.Smart, office._status)
+
+    # I) Zeitgrenze: nach Verlust liefert der Broker beim Reconnect die alte Sperre nach (retain)
+    b, office, smart, mq = mkbridge(dewpoint_signal_timeout=10, dewpoint_lost_action="release")
+    nc = b.neuracell
+    await mq(BT, "ON")
+    silent_for(nc, 11)
+    await nc.check_dewpoint_link()
+    check("tps: Zeitgrenze - Verlust gibt frei", not nc.dewpoint_block and office._status["operating_mode"] == OM.Smart)
+    b._on_mqtt_connect(b.client, None, None, 0)          # Reconnect zum Broker
+    await mq(BT, "ON", retain=True)
+    check("tps: Zeitgrenze - nachgelieferte alte Sperre nach Reconnect greift nicht",
+          not nc.dewpoint_block and office._status["operating_mode"] == OM.Smart
+          and state(b).get("dewpoint_controller_connected") is False, state(b))
+    await mq(BT, "ON")
+    check("tps: Zeitgrenze - live-Nachricht -> verbunden und Sperre gilt",
+          nc.dewpoint_block and state(b).get("dewpoint_controller_connected") is True)
+    # Zeitgrenze + block: nachgelieferte alte Freigabe greift nicht
+    b, office, smart, mq = mkbridge(dewpoint_signal_timeout=10, dewpoint_lost_action="block")
+    nc = b.neuracell
+    await mq(BT, "OFF")
+    silent_for(nc, 11)
+    await nc.check_dewpoint_link()
+    check("tps: Zeitgrenze block - Verlust sperrt", nc.dewpoint_block)
+    await mq(BT, "OFF", retain=True)
+    check("tps: Zeitgrenze block - nachgelieferte Freigabe greift nicht", nc.dewpoint_block)
+
+    # J) Verfuegbarkeits-Topic + Zeitgrenze: Verlust ueber Zeitgrenze, dann meldet sich die TPS online
+    b, office, smart, mq = mkbridge(dewpoint_availability_topic=AV, dewpoint_signal_timeout=10,
+                                    dewpoint_lost_action="release")
+    nc = b.neuracell
+    await mq(BT, "ON")
+    silent_for(nc, 11)
+    await nc.check_dewpoint_link()
+    check("tps: Zeitgrenze ohne LWT - Verlust gibt frei", not nc.dewpoint_block)
+    await mq(AV, "online")
+    check("tps: online nach Zeitgrenzen-Verlust -> gespeicherte Sperre gilt wieder",
+          nc.dewpoint_block and office._status["operating_mode"] == OM.Off
+          and state(b).get("dewpoint_controller_connected") is True, state(b))
+
+    # K) Broker-Ausfall der Bridge selbst darf die Zeitgrenze nicht ausloesen
+    b, office, smart, mq = mkbridge(dewpoint_signal_timeout=10, dewpoint_lost_action="block")
+    nc = b.neuracell
+    await mq(BT, "OFF")
+    check("tps: Broker - vorher verbunden", nc.dewpoint_controller_connected() is True)
+    b.client.is_connected = lambda: False
+    silent_for(nc, 60)
+    await nc.check_dewpoint_link()
+    check("tps: Broker weg - Status eingefroren, keine Sperre", nc.dewpoint_controller_connected() is True
+          and not nc.dewpoint_block and office._status["operating_mode"] == OM.Smart)
+    b.client.is_connected = lambda: True
+    b._on_mqtt_connect(b.client, None, None, 0)          # Reconnect: neue Frist
+    check("tps: Broker zurueck - volle Frist, weiter verbunden", nc.dewpoint_controller_connected() is True)
+    nc._tps_watch_start = _t.monotonic() - 11 * 60
+    await nc.check_dewpoint_link()
+    check("tps: nach Frist ohne Nachricht -> getrennt und gesperrt", nc.dewpoint_controller_connected() is False
+          and nc.dewpoint_block)
+    b._on_mqtt_connect(b.client, None, None, 0)
+    check("tps: Reconnect weckt eine verlorene TPS nicht auf", nc.dewpoint_controller_connected() is False)
+    # nie gemeldet: Reconnect verschiebt den Start der Frist
+    b, office, smart, mq = mkbridge(dewpoint_signal_timeout=10)
+    b.neuracell._tps_watch_start = _t.monotonic() - 9 * 60
+    b._on_mqtt_connect(b.client, None, None, 0)
+    b.neuracell._tps_watch_start -= 5 * 60     # 5 min nach dem Reconnect
+    check("tps: nie gemeldet - Frist zaehlt ab Reconnect", b.neuracell.dewpoint_controller_connected() is None)
+
+    # H) Quelle device (Cloud): Fehlversuche wie bei den Lueftern
+    b, office, smart, mq = mkbridge(dewpoint_source="device", availability_failure_threshold=3)
+    tps = FakeDevice(serial="TPS-1", name="TPS", status=mkstatus(op=OM.Smart))
+    calls = {"fail": False}
+    real = b.read_status
+
+    async def rs(dev):
+        return None if (dev is tps and calls["fail"]) else await real(dev)
+    b.read_status = rs
+    nc = b.neuracell
+    check("tps: device - vor erstem Poll None", nc.dewpoint_controller_connected() is None)
+    await nc.poll_dewpoint_device(tps)
+    check("tps: device - erreichbar -> True", nc.dewpoint_controller_connected() is True)
+    calls["fail"] = True
+    await nc.poll_dewpoint_device(tps)
+    await nc.poll_dewpoint_device(tps)
+    check("tps: device - 2 Fehlversuche noch True", nc.dewpoint_controller_connected() is True)
+    await nc.poll_dewpoint_device(tps)
+    check("tps: device - 3 Fehlversuche -> False", state(b).get("dewpoint_controller_connected") is False, state(b))
+    calls["fail"] = False
+    await nc.poll_dewpoint_device(tps)
+    check("tps: device - wieder erreichbar -> True", state(b).get("dewpoint_controller_connected") is True)
+
+
 async def test_payload():
     cfg = bridge.BridgeConfig()
     cfg.neuracell_enabled = False
@@ -800,6 +1107,7 @@ async def _async_suite():
     await test_neuracell_scoped()
     await test_neuracell_robust()
     await test_radon_meter()
+    await test_dewpoint_watch()
     await test_payload()
     await test_command()
     await test_command_coalescing()

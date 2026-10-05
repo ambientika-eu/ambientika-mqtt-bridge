@@ -1,6 +1,6 @@
 name: "Ambientika MQTT Bridge"
 description: "MQTT bridge for Ambientika ventilation units. Connects the Ambientika Cloud API to your local MQTT broker with Home Assistant Auto-Discovery support. Includes NeuraCell-X radon protection + dew-point control (Taupunktsteuerung)."
-version: "1.4.25"
+version: "1.4.26"
 slug: "ambientika_mqtt_bridge"
 init: false
 arch:
@@ -53,6 +53,9 @@ options:
   dewpoint_outdoor_humidity_topic: "ambientika/dewpoint/outdoor_humidity"
   dewpoint_margin: 1.0
   dewpoint_hysteresis: 0.5
+  dewpoint_availability_topic: ""
+  dewpoint_signal_timeout: 0
+  dewpoint_lost_action: "keep"
   # --- Kommandos zusammenfassen (0 = sofort ausfuehren) ---
   command_coalesce_ms: 800
   # --- Filter-Wartungsquittung fuer Slave-Einheiten ---
@@ -96,6 +99,9 @@ schema:
   dewpoint_outdoor_humidity_topic: str?
   dewpoint_margin: float
   dewpoint_hysteresis: float
+  dewpoint_availability_topic: str?
+  dewpoint_signal_timeout: int(0,1440)?
+  dewpoint_lost_action: list(keep|release|block)?
   # --- Kommandos zusammenfassen ---
   command_coalesce_ms: int(0,10000)
   # --- Filter-Wartungsquittung ---

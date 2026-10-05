@@ -54,6 +54,9 @@ After installation, configure the add-on via the **Configuration** tab:
 | `radon_threshold` | Radon alarm threshold in Bq/m³ (numeric source) | `300` |
 | `radon_protection_fan` | Fan level during radon protection (`Low` / `Medium` / `High`) | `Low` |
 | `dewpoint_source` | Dew-point trigger: `signal` (MQTT), `computed` (from sensors) or `device` (read the TPS from the cloud) | `signal` |
+| `dewpoint_availability_topic` | Availability topic of the dew-point controller with Last Will (`online`/`offline`); empty = not used | `` |
+| `dewpoint_signal_timeout` | Minutes without any message from the dew-point controller before it counts as disconnected; `0` = off | `0` |
+| `dewpoint_lost_action` | Dew-point block while the controller is disconnected: `keep`, `release` (ventilate) or `block` (units off). Radon keeps priority | `keep` |
 
 > **MQTT credentials are required for most brokers.** The official Home Assistant Mosquitto add-on and most production setups disable anonymous MQTT access. If `mqtt_username` / `mqtt_password` are empty the bridge cannot connect (`Not authorized`). Create a dedicated MQTT user for the bridge (e.g. via the Mosquitto add-on's `logins` option) and set both fields. Only leave them empty if you have explicitly configured your broker to allow anonymous access.
 >

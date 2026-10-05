@@ -155,3 +155,17 @@ Hinweis zu den Gerätenamen: Der Abgleich ist **groß/klein egal** und trifft **
 - **Wiederherstellung:** Die Bridge merkt sich den Modus vor dem Block und stellt ihn bei Freigabe wieder her (inkl. zwischenzeitlicher manueller Änderungen an den Zielgeräten).
 - **Retained:** Alle Signale werden „retained" gesendet, damit Bridge und Eingang nach einem Neustart synchron sind.
 - 230-V-Anschluss (Relaisspule) nur durch eine Elektrofachkraft; der Steuer-Eingang bleibt potenzialfrei.
+
+## Verbindung der Taupunktsteuerung überwachen (ab Bridge 1.4.26)
+
+Bleibt die Taupunktsteuerung hängen, schickt sie nichts mehr, und ohne Überwachung gilt ihre letzte Sperre unbemerkt weiter. Die Bridge erkennt das auf zwei Wegen, je nachdem, was die Steuerung sendet:
+
+```yaml
+dewpoint_availability_topic: "<Verfügbarkeits-Topic der TPS>"   # exaktes Topic mit Last Will, Payload online/offline
+dewpoint_signal_timeout: 0        # oder: Minuten ohne Nachricht, nur wenn die TPS regelmäßig sendet
+dewpoint_lost_action: "keep"      # keep = letzte Sperre bleibt, release = lüften, block = Geräte aus
+```
+
+Mit `dewpoint_source: "device"` braucht es nichts davon, dort zählen die fehlgeschlagenen Abfragen aus der Cloud wie bei den Lüftern (`availability_failure_threshold`).
+
+Den Zustand zeigt der Sensor **Dew Point Controller Connected**. Radon hat auch bei einer ausgefallenen Taupunktsteuerung Vorrang. Im Schlafetagen-Paket steckt eine Automation, die nach 20 Minuten ohne Verbindung einen Hinweis aufs Handy schickt.

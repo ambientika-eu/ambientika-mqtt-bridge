@@ -335,6 +335,11 @@ def _topic_match(sub: str, topic: str) -> bool:
         return sub == topic
 
 
+def _is_exact_filter(sub: str) -> bool:
+    """True if the MQTT topic filter has no wildcards."""
+    return bool(sub) and "+" not in sub and "#" not in sub
+
+
 def _availability_filter(state_filter: str) -> str:
     """radon/+/state -> radon/+/availability/state (Ambientika radon meter)."""
     if state_filter.endswith("/state"):
@@ -439,6 +444,20 @@ class BridgeConfig:
         # serial number, comma-separated). Empty = all devices (default,
         # backward compatible). Example: "SMART,OFFICE".
         self.dewpoint_block_devices = ""
+        # Connection watch for the Taupunktsteuerung (TPS). A TPS that hangs
+        # stops sending, and without a watch its last block state would stay in
+        # force unnoticed.
+        # - dewpoint_availability_topic: the TPS's own availability topic with
+        #   Last Will (payload online/offline). Empty/"none" = not used.
+        # - dewpoint_signal_timeout: minutes without any message from the TPS
+        #   (block topic or availability topic) before it counts as
+        #   disconnected. 0 = off. Only useful if the TPS sends regularly.
+        # - dewpoint_lost_action: what happens to the block when the TPS is
+        #   disconnected: "keep" (last state stays, default), "release"
+        #   (ventilate) or "block" (units off). Radon keeps priority either way.
+        self.dewpoint_availability_topic = ""
+        self.dewpoint_signal_timeout = 0
+        self.dewpoint_lost_action = "keep"
 
     # ----- helpers -----
     @property
@@ -535,9 +554,26 @@ class BridgeConfig:
             self.dewpoint_hysteresis = float(get("dewpoint_hysteresis", self.dewpoint_hysteresis))
         except (TypeError, ValueError):
             pass
+        dat = get("dewpoint_availability_topic", self.dewpoint_availability_topic)
+        self.dewpoint_availability_topic = "" if dat is None else str(dat).strip()
+        try:
+            self.dewpoint_signal_timeout = max(0, int(get("dewpoint_signal_timeout",
+                                                          self.dewpoint_signal_timeout)))
+        except (TypeError, ValueError):
+            pass
+        self.dewpoint_lost_action = str(get("dewpoint_lost_action", self.dewpoint_lost_action)
+                                        or self.dewpoint_lost_action).strip().lower()
+        self._normalise_dewpoint_watch()
         if self.dewpoint_source not in ("signal", "computed", "device"):
             log.warning("Invalid dewpoint_source %r, using 'signal'.", self.dewpoint_source)
             self.dewpoint_source = "signal"
+
+    def _normalise_dewpoint_watch(self) -> None:
+        if str(self.dewpoint_availability_topic or "").strip().lower() in DISABLED_TOPIC_VALUES:
+            self.dewpoint_availability_topic = ""
+        if self.dewpoint_lost_action not in ("keep", "release", "block"):
+            log.warning("Invalid dewpoint_lost_action %r, using 'keep'.", self.dewpoint_lost_action)
+            self.dewpoint_lost_action = "keep"
 
     def apply_env_overrides(self) -> None:
         """Override any field with matching env vars (HA add-on uses these)."""
@@ -566,6 +602,8 @@ class BridgeConfig:
             ("dewpoint_block_devices", ("DEWPOINT_BLOCK_DEVICES",)),
             ("dewpoint_device_serial", ("DEWPOINT_DEVICE_SERIAL",)),
             ("dewpoint_device_block_modes", ("DEWPOINT_DEVICE_BLOCK_MODES",)),
+            ("dewpoint_availability_topic", ("DEWPOINT_AVAILABILITY_TOPIC",)),
+            ("dewpoint_lost_action", ("DEWPOINT_LOST_ACTION",)),
         ):
             v = _env(*names)
             if v:
@@ -577,6 +615,15 @@ class BridgeConfig:
             self.radon_alarm_topic = ""
         if str(self.radon_meter_topic or "").strip().lower() in DISABLED_TOPIC_VALUES:
             self.radon_meter_topic = ""
+
+        dst = _env("DEWPOINT_SIGNAL_TIMEOUT")
+        if dst:
+            try:
+                self.dewpoint_signal_timeout = max(0, int(dst))
+            except ValueError:
+                pass
+        self.dewpoint_lost_action = str(self.dewpoint_lost_action or "keep").strip().lower()
+        self._normalise_dewpoint_watch()
 
         mp = _env("MQTT_PORT")
         if mp:
@@ -1001,6 +1048,15 @@ def build_neuracell_discovery(cfg: BridgeConfig):
             "device_class": "connectivity", "icon": "mdi:access-point-network",
             "device": device_info,
         }),
+        (f"{base}/binary_sensor/neuracell_dewpoint_controller_connected/config", {
+            "name": "Dew Point Controller Connected",
+            "unique_id": "neuracell_dewpoint_controller_connected",
+            "state_topic": state,
+            "value_template": "{{ value_json.dewpoint_controller_connected }}",
+            "payload_on": "True", "payload_off": "False",
+            "device_class": "connectivity", "icon": "mdi:access-point-network",
+            "device": device_info,
+        }),
         (f"{base}/binary_sensor/neuracell_dewpoint_block/config", {
             "name": "Ventilation Blocked (Dew Point)",
             "unique_id": "neuracell_dewpoint_block",
@@ -1055,6 +1111,14 @@ class NeuraCellXController:
         self._radon_signal_alarm = False
         self._radon_values: dict = {}    # source -> (value, monotonic time)
         self._meter_online: dict = {}    # meter state topic -> (online bool, monotonic time)
+        # Taupunktsteuerung connection watch (see BridgeConfig.dewpoint_*).
+        self._tps_avail: Optional[bool] = None       # from its availability topic (LWT)
+        self._tps_last_seen: Optional[float] = None  # last message / successful cloud poll
+        self._tps_poll_failures = 0                  # dewpoint_source='device'
+        self._tps_polled = False
+        self._tps_connected_reported: Optional[bool] = None
+        self._tps_watch_start = time.monotonic()
+        self._tps_last_block_raw: Optional[str] = None  # last block payload, also while offline
         self.dewpoint_block = False
         self.last_radon: Optional[float] = None
 
@@ -1240,11 +1304,141 @@ class NeuraCellXController:
             on, "radon meter %s -> radon protection %s." % (getattr(device, "serial_number", "?"),
                                                           "ON" if on else "OFF"))
 
-    # ----- dew-point signals -----
-    async def on_dewpoint_block(self, raw: str) -> None:
-        """External ON/OFF block signal (source='signal')."""
+    # ----- Taupunktsteuerung connection watch -----
+    def dewpoint_controller_connected(self) -> Optional[bool]:
+        """True = TPS connected, False = disconnected, None = not watched / unknown yet."""
+        cfg = self.cfg
+        if not cfg.dewpoint_enabled or cfg.dewpoint_source == "computed":
+            return None
+        if cfg.dewpoint_source == "device":
+            if not self._tps_polled:
+                return None
+            return self._tps_poll_failures < max(1, cfg.availability_failure_threshold)
+        if self._tps_avail is False:
+            return False
+        if self._tps_avail is True:
+            # The broker publishes the Last Will when the TPS stops answering
+            # its keepalive, so a known "online" is current; the time limit only
+            # covers controllers without a Last Will.
+            return True
+        if cfg.dewpoint_signal_timeout > 0:
+            if not self.bridge.mqtt_connected():
+                # The bridge itself is cut off from the broker: nothing can arrive,
+                # so the time limit must not count. Keep the last known status.
+                return self._tps_connected_reported
+            ref = max(x for x in (self._tps_last_seen, self._tps_watch_start) if x is not None)
+            if time.monotonic() - ref > cfg.dewpoint_signal_timeout * 60:
+                return False
+            if self._tps_last_seen is not None:
+                return True
+        return None
+
+    def on_broker_connected(self) -> None:
+        """Called from the MQTT on_connect callback (paho thread), also on reconnects.
+
+        A controller that was still counted as connected (or not judged yet) gets
+        a full time limit after the bridge is back on the broker; a controller
+        already lost stays lost until it sends again.
+        """
+        if self._tps_connected_reported is not False:
+            self._tps_watch_start = time.monotonic()
+
+    @staticmethod
+    def _parse_availability(raw: str) -> Optional[bool]:
+        """online/offline, true/false, 1/0, on/off, connected/disconnected or a
+        JSON object with "state"/"status"/"availability". None = not recognised."""
+        val: Any = raw.strip()
+        try:
+            obj = json.loads(val)
+        except (TypeError, ValueError):
+            obj = val
+        if isinstance(obj, dict):
+            for k in ("state", "status", "availability", "online"):
+                if k in obj:
+                    obj = obj[k]
+                    break
+        if isinstance(obj, bool):
+            return obj
+        if _is_num(obj) and obj in (0, 1):
+            return obj == 1
+        t = str(obj).strip().lower()
+        if t in ("online", "true", "1", "on", "connected", "available", "up"):
+            return True
+        if t in ("offline", "false", "0", "off", "disconnected", "unavailable", "down", "lost"):
+            return False
+        return None
+
+    def _tps_seen(self) -> None:
+        self._tps_last_seen = time.monotonic()
+
+    async def on_dewpoint_availability(self, raw: str) -> None:
+        """Availability of the Taupunktsteuerung (its Last Will topic)."""
         if not self.cfg.dewpoint_enabled:
             return
+        avail = self._parse_availability(raw)
+        if avail is None:
+            log.warning("NeuraCell-X: unrecognised Taupunktsteuerung availability %r - ignored.", raw)
+            return
+        was_connected = self._tps_connected_reported
+        self._tps_avail = avail
+        self._tps_seen()
+        await self.check_dewpoint_link()
+        if (avail and was_connected is False and self.cfg.dewpoint_lost_action != "keep"
+                and self._tps_last_block_raw is not None):
+            # Back online (after a Last Will "offline" or an expired time limit):
+            # its block topic is retained and only sent on change, so the value
+            # that arrived while it was lost is the current one.
+            await self._set_dewpoint_block(
+                _payload_truthy(self._tps_last_block_raw, self.cfg.dewpoint_block_key))
+
+    async def check_dewpoint_link(self) -> None:
+        """Log and act on a change of the TPS connection (called on messages and every poll)."""
+        now = self.dewpoint_controller_connected()
+        prev = self._tps_connected_reported
+        if now == prev:
+            return
+        self._tps_connected_reported = now
+        if now is False:
+            action = self.cfg.dewpoint_lost_action
+            log.warning("NeuraCell-X: Taupunktsteuerung disconnected - dew-point block %s.",
+                        {"release": "released (dewpoint_lost_action=release)",
+                         "block": "set ON (dewpoint_lost_action=block)"}.get(
+                            action, "kept as it is (%s)" % ("ON" if self.dewpoint_block else "OFF")))
+            if action in ("release", "block"):
+                await self._set_dewpoint_block(action == "block")
+                return
+        elif now is True and prev is False:
+            log.info("NeuraCell-X: Taupunktsteuerung connected again.")
+        self.bridge.publish_neuracell_state()
+
+    # ----- dew-point signals -----
+    async def on_dewpoint_block(self, raw: str, retained: bool = False) -> None:
+        """External ON/OFF block signal (source='signal').
+
+        `retained` is the flag the broker sets on a message it delivers from its
+        store (on subscribe); a live publish never carries it (MQTT 3.1.1 §3.3.1.3).
+        """
+        if not self.cfg.dewpoint_enabled:
+            return
+        self._tps_last_block_raw = raw
+        if retained:
+            # From the broker's store (delivered on subscribe, i.e. after a bridge
+            # restart or reconnect): says nothing about the controller being alive
+            # now. While the controller counts as lost (Last Will or time limit),
+            # such a value is stale and the lost action decides instead.
+            if (self.dewpoint_controller_connected() is False
+                    and self.cfg.dewpoint_lost_action != "keep"):
+                log.info("NeuraCell-X: stored dew-point block %r ignored - Taupunktsteuerung "
+                         "disconnected (dewpoint_lost_action=%s).", raw, self.cfg.dewpoint_lost_action)
+                await self._set_dewpoint_block(self.cfg.dewpoint_lost_action == "block")
+                return
+        else:
+            # A live message is a sign of life for the time limit. The Last Will
+            # stays authoritative: while it says offline, the message is still
+            # applied (it may come from a Home Assistant test), but the status
+            # only changes when the controller announces itself online.
+            self._tps_seen()
+            await self.check_dewpoint_link()
         block = _payload_truthy(raw, self.cfg.dewpoint_block_key)
         await self._set_dewpoint_block(block)
 
@@ -1291,10 +1485,16 @@ class NeuraCellXController:
         if not self.cfg.dewpoint_enabled:
             return
         status = await self.bridge.read_status(device)
+        self._tps_polled = True
         if status is None:
+            self._tps_poll_failures += 1
             log.warning("NeuraCell-X: dew-point source device %s unreachable this poll; keeping last state.",
                         getattr(device, "serial_number", "?"))
+            await self.check_dewpoint_link()
             return
+        self._tps_poll_failures = 0
+        self._tps_seen()
+        await self.check_dewpoint_link()
         mode = status["operating_mode"]
         block = mode in self.cfg.dewpoint_device_block_mode_set
         log.debug("NeuraCell-X: TPS %s operating_mode=%s -> %s",
@@ -2127,6 +2327,14 @@ class AmbientikaBridge:
                 log.info("NeuraCell-X: dew-point read from TPS device %s (Ambientika cloud, no MQTT input).",
                          self.cfg.dewpoint_device_serial)
             else:
+                if self.cfg.dewpoint_availability_topic:
+                    at, bt = self.cfg.dewpoint_availability_topic, self.cfg.dewpoint_block_topic
+                    if bt and (_topic_match(at, bt) or _topic_match(bt, at)):
+                        log.warning("NeuraCell-X: dewpoint_availability_topic %r overlaps "
+                                    "dewpoint_block_topic %r - use the exact availability topic "
+                                    "of the Taupunktsteuerung.", at, bt)
+                    # availability first, like the radon meter
+                    client.subscribe(at)
                 if self.cfg.dewpoint_block_topic:
                     client.subscribe(self.cfg.dewpoint_block_topic)
                 log.info("NeuraCell-X: dew-point block topic subscribed (%s).",
@@ -2137,6 +2345,7 @@ class AmbientikaBridge:
             log.info("Connected to MQTT broker.")
             self.client.publish(bridge_avail_topic(self.cfg.topic_prefix),
                                 "online", qos=0, retain=True)
+            self.neuracell.on_broker_connected()
             self._subscribe_all(client)
             # Publish discovery + NeuraCell-X status here (after CONNACK) so the
             # retained messages are never lost to a not-yet-connected socket.
@@ -2149,6 +2358,17 @@ class AmbientikaBridge:
     def _dispatch(self, coro) -> None:
         if self.loop is not None:
             asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    def mqtt_connected(self) -> bool:
+        """Whether the bridge currently has a live session with the broker.
+        True when unknown (no client yet / client without is_connected)."""
+        fn = getattr(self.client, "is_connected", None)
+        if fn is None:
+            return True
+        try:
+            return bool(fn())
+        except Exception:
+            return True
 
     def _on_mqtt_message(self, client, userdata, msg) -> None:
         try:
@@ -2168,8 +2388,20 @@ class AmbientikaBridge:
                     self._dispatch(self.neuracell.on_radon_alarm(payload)); return
 
             if self.cfg.dewpoint_enabled:
-                if self.cfg.dewpoint_source == "signal" and _topic_match(self.cfg.dewpoint_block_topic, topic):
-                    self._dispatch(self.neuracell.on_dewpoint_block(payload)); return
+                if self.cfg.dewpoint_source == "signal":
+                    at, bt = self.cfg.dewpoint_availability_topic, self.cfg.dewpoint_block_topic
+                    is_avail = bool(at) and _topic_match(at, topic)
+                    is_block = bool(bt) and _topic_match(bt, topic)
+                    if is_avail and is_block:
+                        # Overlapping filters: the exact one wins, otherwise the block
+                        # signal (its payload must never be read as online/offline).
+                        is_avail = _is_exact_filter(at) and not _is_exact_filter(bt)
+                        is_block = not is_avail
+                    if is_avail:
+                        self._dispatch(self.neuracell.on_dewpoint_availability(payload)); return
+                    if is_block:
+                        self._dispatch(self.neuracell.on_dewpoint_block(
+                            payload, retained=bool(getattr(msg, "retain", False)))); return
                 if self.cfg.dewpoint_source == "computed":
                     which = self._dewpoint_sensor_map().get(topic)
                     if which is None:
@@ -2476,6 +2708,9 @@ class AmbientikaBridge:
             "radon_meter_connected": nc.radon_meter_connected(),
             "radon_value_current": nc._effective_radon() is not None,
             "dewpoint_block": nc.dewpoint_block,
+            # Taupunktsteuerung: True = connected, False = disconnected,
+            # None = not watched (see dewpoint_availability_topic / _signal_timeout).
+            "dewpoint_controller_connected": nc.dewpoint_controller_connected(),
             "dewpoint_block_devices": sorted(self.cfg.dewpoint_block_device_tokens) or "all",
             "indoor_dew_point": round(nc.indoor_dew_point, 1) if nc.indoor_dew_point is not None else None,
             "outdoor_dew_point": round(nc.outdoor_dew_point, 1) if nc.outdoor_dew_point is not None else None,
@@ -2655,6 +2890,13 @@ class AmbientikaBridge:
                 except Exception as e:
                     log.exception("NeuraCell-X dew-point device poll error: %s", e)
 
+            # Taupunktsteuerung connection watch (timeout runs out without a message).
+            if self.cfg.dewpoint_enabled:
+                try:
+                    await self.neuracell.check_dewpoint_link()
+                except Exception as e:
+                    log.exception("NeuraCell-X dew-point watch error: %s", e)
+
             # Keep asserting the active protection state.
             try:
                 await self.neuracell.enforce()
@@ -2711,6 +2953,14 @@ class AmbientikaBridge:
                     self.cfg.dewpoint_device_serial or "?", block_modes)
             log.info("NeuraCell-X dew point: source=%s, scope=%s -> block => Off (radon has priority).",
                      src, scope)
+            if self.cfg.dewpoint_source == "signal":
+                watch = []
+                if self.cfg.dewpoint_availability_topic:
+                    watch.append("availability %s" % self.cfg.dewpoint_availability_topic)
+                if self.cfg.dewpoint_signal_timeout > 0:
+                    watch.append("timeout %d min" % self.cfg.dewpoint_signal_timeout)
+                log.info("NeuraCell-X dew point: connection watch %s, when lost -> %s.",
+                         " + ".join(watch) or "off", self.cfg.dewpoint_lost_action)
         await self._poll_loop()
 
     def stop(self) -> None:

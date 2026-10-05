@@ -233,6 +233,26 @@ automation:
             Das Radon-Messgerät ist seit 20 Minuten nicht verbunden. Bitte kurz
             vom Strom nehmen und wieder einstecken.
 
+  # Hinweis aufs Handy, wenn die Taupunktsteuerung laenger als 20 Minuten keine
+  # Verbindung hat (ab Bridge 1.4.26, braucht in der Bridge
+  # dewpoint_availability_topic oder dewpoint_signal_timeout). Solange sie
+  # offline ist, gilt fuer die Sperre im Keller dewpoint_lost_action.
+  - id: ambientika_taupunktsteuerung_offline
+    alias: "Ambientika NeuraCell-X – Taupunktsteuerung offline"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.neuracell_x_dew_point_controller_connected
+        to: "off"
+        for: "00:20:00"
+    action:
+      - service: notify.notify
+        data:
+          title: "NeuraCell-X"
+          message: >
+            Die Taupunktsteuerung ist seit 20 Minuten nicht verbunden. Bitte kurz
+            vom Strom nehmen und wieder einstecken.
+
   # Hinweis aufs Handy, wenn der Radonschutz anspringt bzw. endet.
   - id: ambientika_radon_hinweis
     alias: "Ambientika NeuraCell-X – Radonschutz Hinweis"
