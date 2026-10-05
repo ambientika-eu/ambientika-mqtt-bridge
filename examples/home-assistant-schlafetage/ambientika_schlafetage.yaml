@@ -9,13 +9,16 @@
 #   Diese Datei in den Ordner config/packages/ legen.
 #   Danach: Entwicklerwerkzeuge > YAML > Konfiguration pruefen, neu starten.
 #
-# EINZIGE ANPASSUNG: die Liste "master" im Skript unten.
-#   Dort stehen die MASTER-Geraete der Schlafetage, geschrieben wie der
-#   Anfang ihrer Entitaets-ID. Kontrolle: Entwicklerwerkzeuge > Zustaende,
-#   Filter "_mode" -> z. B. select.buro_l_mode  =>  Eintrag "buro_l".
-#   Wichtig: Home Assistant behaelt die Entitaets-ID, auch wenn das Geraet
-#   in der App umbenannt wird - massgeblich ist die ID, nicht der Name.
+# EINZIGE ANPASSUNG: die Liste "master_serials" im Skript unten.
+#   Dort stehen die Seriennummern der MASTER-Geraete der Schlafetage, so wie
+#   sie im Log der Bridge stehen, z. B. "Device: Eltern  (serial: 441BF633FDD4)".
+#   Die Geraete werden ueber die Seriennummer gefunden, nicht ueber den Namen.
+#   Umbenennen in der Ambientika-App oder in Home Assistant aendert nichts.
 #   Slaves gehoeren NICHT in die Liste, sie folgen ihrem Master automatisch.
+#
+# Kontrolle: Entwicklerwerkzeuge > Aktionen > "Lüftung Schlafetage setzen",
+#   Haken bei "nur_pruefen". Es erscheint eine Benachrichtigung mit den
+#   gefundenen Geraeten, es werden keine Befehle gesendet.
 #
 # Radonvorrang:
 #   Der Radonschutz laeuft in der Bridge (NeuraCell-X, ab 1.4.24 liest sie das
@@ -50,39 +53,117 @@ input_datetime:
 
 script:
   # Baustein: setzt Modus und Stufe fuer alle Master der Schlafetage.
-  # Wird von den Automationen und dem Button aufgerufen (nicht direkt starten).
+  # Wird von den Automationen und dem Button aufgerufen. Direkt gestartet
+  # nur zur Kontrolle mit "nur_pruefen".
   lueftung_schlafetage_setzen:
     alias: "Lüftung Schlafetage setzen"
     mode: queued
     fields:
       modus:
-        description: "Smart, Auto, ManualHeatRecovery, Night, AwayHome, Expulsion, Intake, MasterSlaveFlow, SlaveMasterFlow"
+        description: "Smart, Auto, ManualHeatRecovery, Night, AwayHome, Surveillance, TimedExpulsion, Expulsion, Intake, MasterSlaveFlow (Pflicht, ausser bei nur_pruefen)"
         example: "ManualHeatRecovery"
-        required: true
+        required: false
         selector:
           select:
-            options: [Smart, Auto, ManualHeatRecovery, Night, AwayHome, Expulsion, Intake, MasterSlaveFlow, SlaveMasterFlow]
+            options: [Smart, Auto, ManualHeatRecovery, Night, AwayHome, Surveillance, TimedExpulsion, Expulsion, Intake, MasterSlaveFlow]
       stufe:
-        description: "Low, Medium, High"
+        description: "Low, Medium, High (Pflicht, ausser bei nur_pruefen)"
         example: "Low"
-        required: true
+        required: false
         selector:
           select:
             options: [Low, Medium, High]
+      nur_pruefen:
+        description: "Nur anzeigen, welche Geräte gefunden werden, keine Befehle senden"
+        required: false
+        selector:
+          boolean:
+      snapshot_szene:
+        description: "Vorher den aktuellen Betrieb in dieser Szene sichern (nutzt der Button)"
+        example: "schlafetage_vorher"
+        required: false
+        selector:
+          text:
     variables:
-      # >>> HIER ANPASSEN: Master-Geraete der Schlafetage (Anfang der Entitaets-ID)
-      master: ["buro_l", "eltern", "kind_schlafen"]
-      modus_entities: "{{ master | map('regex_replace', '$', '_mode') | map('regex_replace', '^', 'select.') | list }}"
-      stufe_entities: "{{ master | map('regex_replace', '$', '_fan_speed') | map('regex_replace', '^', 'select.') | list }}"
+      # >>> HIER ANPASSEN: Seriennummern der Master-Geraete der Schlafetage,
+      #     aus dem Log der Bridge: "Device: <Name>  (serial: <Seriennummer>)"
+      master_serials: ["AABBCCDDEE01", "AABBCCDDEE02", "AABBCCDDEE03"]
+      # Ab hier nichts aendern: sucht zu jeder Seriennummer die Auswahl-Entitaeten
+      # "Mode" und "Fan Speed" des Geraets, unabhaengig von Namen und Entitaets-ID.
+      master_info: >-
+        {%- set wanted = master_serials | map('string') | map('upper') | list -%}
+        {%- set ns = namespace(modus=[], stufe=[], found=[], names=[]) -%}
+        {%- for e in integration_entities('mqtt') | sort if e.startswith('select.') -%}
+          {%- set d = device_id(e) -%}
+          {%- if d -%}
+            {%- set idents = device_attr(d, 'identifiers') | string | upper -%}
+            {%- set opts = state_attr(e, 'options') or [] -%}
+            {%- for s in wanted if s in idents -%}
+              {%- if 'MasterSlaveFlow' in opts -%}
+                {%- set ns.modus = ns.modus + [e] -%}
+                {%- set ns.found = ns.found + [s] -%}
+                {%- set ns.names = ns.names + [(device_attr(d, 'name_by_user') or device_attr(d, 'name') or s) | string] -%}
+              {%- elif opts | list == ['Low', 'Medium', 'High'] -%}
+                {%- set ns.stufe = ns.stufe + [e] -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {{ {'modus': ns.modus, 'stufe': ns.stufe, 'names': ns.names,
+            'fehlend': wanted | reject('in', ns.found) | list} }}
+      modus_entities: "{{ master_info.modus }}"
+      stufe_entities: "{{ master_info.stufe }}"
     sequence:
       - if:
           - condition: template
+            value_template: "{{ master_info.modus | count == 0 }}"
+        then:
+          - service: persistent_notification.create
+            data:
+              notification_id: ambientika_schlafetage_master
+              title: "Ambientika Schlafetage"
+              message: >-
+                Kein Master-Gerät gefunden. Bitte die Seriennummern in der Liste
+                master_serials im Skript "Lüftung Schlafetage setzen" prüfen
+                (Log der Bridge: "Device: … (serial: …)").
+                Gesucht: {{ master_info.fehlend | join(', ') }}
+          - stop: "Kein Master-Gerät der Schlafetage gefunden – Seriennummern in master_serials prüfen."
+            error: true
+      - if:
+          - condition: template
+            value_template: "{{ nur_pruefen | default(false) | bool }}"
+        then:
+          - service: persistent_notification.create
+            data:
+              notification_id: ambientika_schlafetage_master
+              title: "Ambientika Schlafetage – gefundene Master"
+              message: >-
+                {%- set ns = namespace(lines=[]) -%}
+                {%- for n in master_info.names -%}
+                  {%- set ns.lines = ns.lines + [n ~ ': ' ~ master_info.modus[loop.index0]] -%}
+                {%- endfor -%}
+                {%- if master_info.fehlend -%}
+                  {%- set ns.lines = ns.lines + ['Nicht gefunden: ' ~ (master_info.fehlend | join(', '))] -%}
+                {%- endif -%}
+                {{ ns.lines | join('\n\n') }}
+          - stop: "Nur Prüfung, es wurden keine Befehle gesendet."
+      - if:
+          - condition: template
             value_template: >-
-              {{ modus not in ['Smart','Auto','ManualHeatRecovery','Night','AwayHome','Expulsion','Intake','MasterSlaveFlow','SlaveMasterFlow']
+              {{ modus is not defined or stufe is not defined
+                 or modus not in ['Smart','Auto','ManualHeatRecovery','Night','AwayHome','Surveillance','TimedExpulsion','Expulsion','Intake','MasterSlaveFlow']
                  or stufe not in ['Low','Medium','High'] }}
         then:
           - stop: "Bitte Modus und Stufe angeben (Skript ist ein Baustein für Automationen und Button)."
             error: true
+      - if:
+          - condition: template
+            value_template: "{{ snapshot_szene is defined and snapshot_szene | string | length > 0 }}"
+        then:
+          - service: scene.create
+            data:
+              scene_id: "{{ snapshot_szene }}"
+              snapshot_entities: "{{ modus_entities + stufe_entities }}"
       - service: select.select_option
         target:
           entity_id: "{{ modus_entities }}"
@@ -100,24 +181,18 @@ script:
     alias: "Schlafetage 20 min durchlüften"
     icon: mdi:weather-windy
     mode: single
-    variables:
-      master: ["buro_l", "eltern", "kind_schlafen"]      # gleiche Liste wie oben
     sequence:
       - condition: not
         conditions:
           - condition: state
             entity_id: binary_sensor.neuracell_x_radon_protection_active
             state: "on"
-      - service: scene.create
-        data:
-          scene_id: schlafetage_vorher
-          snapshot_entities: >-
-            {{ (master | map('regex_replace', '$', '_mode') | map('regex_replace', '^', 'select.') | list)
-               + (master | map('regex_replace', '$', '_fan_speed') | map('regex_replace', '^', 'select.') | list) }}
+      # sichert den aktuellen Betrieb der Master in der Szene schlafetage_vorher
       - service: script.lueftung_schlafetage_setzen
         data:
           modus: MasterSlaveFlow
           stufe: High
+          snapshot_szene: schlafetage_vorher
       - delay: "00:20:00"
       - condition: not
         conditions:
