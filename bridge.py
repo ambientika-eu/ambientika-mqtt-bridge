@@ -1174,6 +1174,14 @@ def build_neuracell_discovery(cfg: BridgeConfig):
             "device": device_info,
         }),
     ]
+    # Tied to the bridge's own availability (Last Will), like the unit entities:
+    # while the bridge is down the status is "unavailable" in Home Assistant
+    # instead of the last retained value - an automation that reacts to
+    # "Radon Meter Connected: off" (e.g. a power-cycle through a smart plug)
+    # then pauses instead of acting on a stale state.
+    avail = bridge_avail_topic(cfg.topic_prefix)
+    for _topic, payload in entities:
+        payload["availability_topic"] = avail
     return entities
 
 

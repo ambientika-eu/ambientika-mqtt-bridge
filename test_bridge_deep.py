@@ -645,6 +645,9 @@ async def test_radon_meter():
     check("meter: Verbindung wieder online im Status", st.get("radon_meter_connected") is True, st)
     disc = [t for t, _c in bridge.build_neuracell_discovery(b.cfg)]
     check("meter: HA-Sensor Radon Meter Connected", any("neuracell_radon_meter_connected" in t for t in disc))
+    check("1.4.28: NeuraCell-Entitaeten an die Bridge-Verfuegbarkeit gebunden",
+          all(cfgp.get("availability_topic") == bridge.bridge_avail_topic(b.cfg.topic_prefix)
+              for _t, cfgp in bridge.build_neuracell_discovery(b.cfg)))
 
     # Pruefer-Funde: NaN/Inf/Riesenzahlen, strenge Wahrheitswerte, Schluessel am Messgeraet
     check("meter: NaN/Inf abgelehnt", pn("nan") is None and pn("inf") is None
