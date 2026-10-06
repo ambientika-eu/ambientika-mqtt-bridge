@@ -9,16 +9,29 @@
 #   Diese Datei in den Ordner config/packages/ legen.
 #   Danach: Entwicklerwerkzeuge > YAML > Konfiguration pruefen, neu starten.
 #
-# EINZIGE ANPASSUNG: die Liste "master_serials" im Skript unten.
+# ANPASSUNG 1: die Liste "master_serials" im Skript "Lüftung Schlafetage setzen".
 #   Dort stehen die Seriennummern der MASTER-Geraete der Schlafetage, so wie
 #   sie im Log der Bridge stehen, z. B. "Device: Eltern  (serial: 441BF633FDD4)".
 #   Die Geraete werden ueber die Seriennummer gefunden, nicht ueber den Namen.
 #   Umbenennen in der Ambientika-App oder in Home Assistant aendert nichts.
 #   Slaves gehoeren NICHT in die Liste, sie folgen ihrem Master automatisch.
 #
+# ANPASSUNG 2 (optional, Selbstheilung): die beiden Steckdosen im Skript
+#   "Ambientika Gerät über Steckdose neu starten". Haengen Radon-Messgeraet und
+#   Taupunktsteuerung an je einer schaltbaren Steckdose, startet das Paket das
+#   Geraet automatisch neu, wenn es 10 Minuten nicht verbunden ist (kurz aus,
+#   10 s warten, wieder an) - hoechstens einmal pro Stunde. Einschalten im
+#   Dashboard: "Radon-Messgerät automatisch neu starten" bzw.
+#   "Taupunktsteuerung automatisch neu starten". Solange ein Schalter an ist,
+#   schaltet Home Assistant die zugehoerige Steckdose wieder ein, falls sie
+#   laenger als 2 Minuten aus bleibt (Waechter) - zum Warten also zuerst den
+#   Schalter aus.
+#
 # Kontrolle: Entwicklerwerkzeuge > Aktionen > "Lüftung Schlafetage setzen",
 #   Haken bei "nur_pruefen". Es erscheint eine Benachrichtigung mit den
-#   gefundenen Geraeten, es werden keine Befehle gesendet.
+#   gefundenen Geraeten, es werden keine Befehle gesendet. Fuer die Steckdosen
+#   genauso: "Ambientika Gerät über Steckdose neu starten", geraet "radon"
+#   bzw. "taupunkt", Haken bei "nur_pruefen".
 #
 # Radonvorrang:
 #   Der Radonschutz laeuft in der Bridge (NeuraCell-X, ab 1.4.24 liest sie das
@@ -50,6 +63,31 @@ input_datetime:
     has_date: false
     has_time: true
     initial: "08:00"
+  # Selbstheilung: Datum des letzten Zaehler-Resets (kein "initial", bleibt erhalten).
+  ambientika_neustart_zaehler_datum:
+    name: "Neustart-Zähler zuletzt zurückgesetzt"
+    has_date: true
+    has_time: false
+
+# Selbstheilung: Schalter im Dashboard (nach dem Eintragen der Steckdosen
+# einschalten) und Zaehler der automatischen Neustarts des Tages.
+input_boolean:
+  ambientika_neustart_radon:
+    name: "Radon-Messgerät automatisch neu starten"
+    icon: mdi:restart
+  ambientika_neustart_taupunkt:
+    name: "Taupunktsteuerung automatisch neu starten"
+    icon: mdi:restart
+
+counter:
+  ambientika_neustarts_radon:
+    name: "Neustarts Radon-Messgerät heute"
+    icon: mdi:restart-alert
+    restore: true
+  ambientika_neustarts_taupunkt:
+    name: "Neustarts Taupunktsteuerung heute"
+    icon: mdi:restart-alert
+    restore: true
 
 script:
   # Baustein: setzt Modus und Stufe fuer alle Master der Schlafetage.
@@ -131,7 +169,7 @@ script:
             error: true
       - if:
           - condition: template
-            value_template: "{{ nur_pruefen | default(false) | bool }}"
+            value_template: "{{ nur_pruefen | default(false) | bool(true) }}"
         then:
           - service: persistent_notification.create
             data:
@@ -202,6 +240,232 @@ script:
       - service: scene.turn_on
         target:
           entity_id: scene.schlafetage_vorher
+
+  # Selbstheilung: ein Geraet ueber seine Steckdose neu starten (kurz aus,
+  # warten, wieder an). Wird von den Automationen unten aufgerufen; zum
+  # Ausprobieren auch von Hand ueber die beiden Skripte "... jetzt neu starten".
+  ambientika_geraet_neu_starten:
+    alias: "Ambientika Gerät über Steckdose neu starten"
+    icon: mdi:restart
+    mode: queued
+    fields:
+      geraet:
+        description: "radon = Radon-Messgerät, taupunkt = Taupunktsteuerung"
+        example: "radon"
+        required: true
+        selector:
+          select:
+            options: [radon, taupunkt]
+      nur_pruefen:
+        description: "Nur prüfen, ob die Steckdose gefunden wird, nicht schalten"
+        required: false
+        selector:
+          boolean:
+      automatisch:
+        description: "Von der Automation gesetzt: zählt den Neustart und meldet den ersten des Tages aufs Handy"
+        required: false
+        selector:
+          boolean:
+    variables:
+      # >>> HIER ANPASSEN: die Steckdosen der beiden Geraete, als Entitaets-ID
+      #     des Schalters in Home Assistant (Einstellungen > Geraete & Dienste >
+      #     Entitaeten, z. B. switch.fritz_dect_200_1 oder switch.shelly_plug_s_keller).
+      #     Die Marken (&steckdose_...) stehen lassen, der Waechter unten nutzt sie.
+      steckdosen:
+        radon: &steckdose_radon switch.steckdose_radon_messgeraet
+        taupunkt: &steckdose_taupunkt switch.steckdose_taupunktsteuerung
+      # Sekunden ohne Strom beim Neustart.
+      aus_sekunden: 10
+      # Ab hier nichts aendern.
+      namen:
+        radon: "Radon-Messgerät"
+        taupunkt: "Taupunktsteuerung"
+      zaehler:
+        radon: counter.ambientika_neustarts_radon
+        taupunkt: counter.ambientika_neustarts_taupunkt
+      schalter:
+        radon: input_boolean.ambientika_neustart_radon
+        taupunkt: input_boolean.ambientika_neustart_taupunkt
+      sensoren:
+        radon: binary_sensor.neuracell_x_radon_meter_connected
+        taupunkt: binary_sensor.neuracell_x_dew_point_controller_connected
+      welches: "{{ geraet | default('') | string | lower | trim }}"
+      steckdose: "{{ steckdosen.get(welches, '') }}"
+      name: "{{ namen.get(welches, welches) }}"
+      auto: "{{ automatisch | default(false) | bool(false) }}"
+    sequence:
+      - if:
+          - condition: template
+            value_template: "{{ steckdose | length == 0 }}"
+        then:
+          - stop: "Bitte geraet angeben: radon oder taupunkt."
+            error: true
+      # Direkt nach einem Neustart von Home Assistant kennt manche Integration den
+      # Zustand der Steckdose erst nach einem Moment.
+      - wait_template: "{{ states(steckdose) not in ['unknown', 'unavailable'] }}"
+        timeout: "00:01:00"
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: "{{ states(steckdose) in ['unknown', 'unavailable'] }}"
+        then:
+          - service: persistent_notification.create
+            data:
+              notification_id: "ambientika_steckdose_{{ welches }}"
+              title: "Ambientika Selbstheilung"
+              message: >-
+                {%- if states[steckdose] is none -%}
+                Die Steckdose {{ steckdose }} für {{ name }} gibt es in Home Assistant
+                nicht. Bitte die Entitäts-ID im Skript "Ambientika Gerät über Steckdose
+                neu starten" prüfen oder den Schalter "{{ name }} automatisch neu
+                starten" ausschalten.
+                {%- else -%}
+                Die Steckdose {{ steckdose }} für {{ name }} ist nicht erreichbar
+                (Zustand: {{ states(steckdose) }}). Es wurde nicht geschaltet. Bitte
+                Steckdose und deren Integration prüfen.
+                {%- endif %}
+          - stop: "Steckdose nicht gefunden oder nicht erreichbar (siehe Benachrichtigung)."
+            error: true
+      - if:
+          - condition: template
+            value_template: "{{ nur_pruefen | default(false) | bool(true) }}"
+        then:
+          - service: persistent_notification.create
+            data:
+              notification_id: "ambientika_steckdose_{{ welches }}"
+              title: "Ambientika Selbstheilung – Prüfung"
+              message: >-
+                {{ name }}: Steckdose {{ steckdose }} gefunden, Zustand "{{ states(steckdose) }}".
+                Automatischer Neustart: {{ 'ein' if is_state(schalter[welches], 'on') else 'aus' }}
+                ({{ schalter[welches] }}). Neustarts heute: {{ states(zaehler[welches]) }}.
+                Verbindung laut Bridge: {{ states(sensoren[welches]) }}.
+          - stop: "Nur Prüfung, es wurde nicht geschaltet."
+      # Automatisch: nicht mehr neu starten, wenn das Geraet inzwischen zurueck ist
+      # (z. B. wenn der Neustart in der Warteschlange stand).
+      - if:
+          - condition: template
+            value_template: "{{ auto and is_state(sensoren[welches], 'on') }}"
+        then:
+          - stop: "Gerät ist inzwischen wieder verbunden, kein Neustart nötig."
+      - service: homeassistant.turn_off
+        target:
+          entity_id: "{{ steckdose }}"
+        continue_on_error: true
+      # Erst wenn die Steckdose "aus" meldet, zaehlt der Neustart.
+      - wait_template: "{{ is_state(steckdose, 'off') }}"
+        timeout: "00:00:10"
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: "{{ not is_state(steckdose, 'off') }}"
+        then:
+          - service: homeassistant.turn_on
+            target:
+              entity_id: "{{ steckdose }}"
+            continue_on_error: true
+          - service: persistent_notification.create
+            data:
+              notification_id: "ambientika_steckdose_{{ welches }}"
+              title: "Ambientika Selbstheilung"
+              message: >-
+                Die Steckdose {{ steckdose }} für {{ name }} ließ sich nicht ausschalten
+                (Zustand: {{ states(steckdose) }}), kein Neustart. Bitte Steckdose und
+                deren Integration prüfen.
+          - stop: "Steckdose meldet nicht 'aus', kein Neustart (siehe Benachrichtigung)."
+            error: true
+      - delay:
+          seconds: "{{ aus_sekunden | int(10) }}"
+      # Wieder einschalten, zur Sicherheit bis zu dreimal, bis die Steckdose "an" meldet.
+      - repeat:
+          sequence:
+            - service: homeassistant.turn_on
+              target:
+                entity_id: "{{ steckdose }}"
+              continue_on_error: true
+            - wait_template: "{{ is_state(steckdose, 'on') }}"
+              timeout: "00:00:05"
+              continue_on_timeout: true
+          until:
+            - condition: template
+              value_template: "{{ is_state(steckdose, 'on') or repeat.index >= 3 }}"
+      # Manche Integration meldet den Zustand erst mit Verzoegerung.
+      - wait_template: "{{ is_state(steckdose, 'on') }}"
+        timeout: "00:00:20"
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: "{{ not is_state(steckdose, 'on') }}"
+        then:
+          - service: persistent_notification.create
+            data:
+              notification_id: "ambientika_steckdose_{{ welches }}"
+              title: "Ambientika Selbstheilung – Achtung"
+              message: >-
+                Die Steckdose {{ steckdose }} für {{ name }} meldet nach dem Neustart
+                nicht "an" (Zustand: {{ states(steckdose) }}). Bitte sofort prüfen und
+                von Hand einschalten.
+          - service: notify.notify
+            continue_on_error: true
+            data:
+              title: "NeuraCell-X – Achtung"
+              message: >-
+                Die Steckdose für {{ name }} meldet nach dem automatischen Neustart nicht
+                "an" ({{ steckdose }}: {{ states(steckdose) }}). Bitte sofort prüfen und von
+                Hand einschalten.
+          - stop: "Steckdose meldet nach dem Neustart nicht 'an' (siehe Benachrichtigung)."
+            error: true
+      # Von Hand gestartet: nur eine Benachrichtigung in Home Assistant, nicht gezaehlt.
+      - if:
+          - condition: template
+            value_template: "{{ not auto }}"
+        then:
+          - service: persistent_notification.create
+            data:
+              notification_id: "ambientika_steckdose_{{ welches }}"
+              title: "Ambientika Selbstheilung"
+              message: >-
+                {{ name }}: Neustart von Hand ausgeführt, die Steckdose {{ steckdose }}
+                war {{ aus_sekunden | int(10) }} s aus und ist wieder an.
+          - stop: "Neustart von Hand ausgeführt."
+      - service: counter.increment
+        target:
+          entity_id: "{{ zaehler[welches] }}"
+      # Eine Nachricht aufs Handy nur beim ersten automatischen Neustart des Tages;
+      # die weiteren zaehlt der Zaehler im Dashboard. Hilft ein Neustart nicht,
+      # meldet sich die Automation "... offline" nach 20 Minuten ohne Verbindung.
+      - if:
+          - condition: template
+            value_template: "{{ states(zaehler[welches]) | int(0) == 1 }}"
+        then:
+          - service: notify.notify
+            continue_on_error: true
+            data:
+              title: "NeuraCell-X"
+              message: >-
+                {{ name }} war nicht mehr verbunden und wurde automatisch über die
+                Steckdose neu gestartet. Weitere Neustarts heute zählt
+                "{{ state_attr(zaehler[welches], 'friendly_name') }}" im Dashboard;
+                eine Nachricht kommt nur, wenn ein Neustart nicht hilft.
+
+  ambientika_radon_messgeraet_neu_starten:
+    alias: "Radon-Messgerät jetzt neu starten"
+    icon: mdi:restart
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - service: script.ambientika_geraet_neu_starten
+        data:
+          geraet: radon
+
+  ambientika_taupunktsteuerung_neu_starten:
+    alias: "Taupunktsteuerung jetzt neu starten"
+    icon: mdi:restart
+    mode: single
+    max_exceeded: silent
+    sequence:
+      - service: script.ambientika_geraet_neu_starten
+        data:
+          geraet: taupunkt
 
 automation:
   # Vor dem Schlafengehen 30 min Querlueftung, danach die ganze Nacht
@@ -306,8 +570,17 @@ automation:
         data:
           title: "NeuraCell-X"
           message: >
-            Das Radon-Messgerät ist seit 20 Minuten nicht verbunden. Bitte kurz
-            vom Strom nehmen und wieder einstecken.
+            {%- set a = state_attr('automation.ambientika_neuracell_x_radon_messgerat_automatisch_neu_starten', 'last_triggered') %}
+            {%- set seit = states.binary_sensor.neuracell_x_radon_meter_connected.last_changed %}
+            Das Radon-Messgerät ist seit 20 Minuten nicht verbunden.
+            {%- if is_state('input_boolean.ambientika_neustart_radon', 'on') and a is not none and a > seit %} Der
+            automatische Neustart über die Steckdose hat nicht geholfen – bitte Gerät
+            und Steckdose prüfen.
+            {%- elif is_state('input_boolean.ambientika_neustart_radon', 'on') %} Der
+            automatische Neustart über die Steckdose steht noch aus (Sperrzeit) oder
+            war nicht möglich – siehe Benachrichtigungen in Home Assistant.
+            {%- else %} Bitte kurz vom Strom nehmen und wieder einstecken.
+            {%- endif %}
 
   # Hinweis aufs Handy, wenn die Taupunktsteuerung laenger als 20 Minuten keine
   # Verbindung hat (ab Bridge 1.4.26; die Ambientika-Taupunktsteuerung wird ab
@@ -327,8 +600,146 @@ automation:
         data:
           title: "NeuraCell-X"
           message: >
-            Die Taupunktsteuerung ist seit 20 Minuten nicht verbunden. Bitte kurz
-            vom Strom nehmen und wieder einstecken.
+            {%- set a = state_attr('automation.ambientika_neuracell_x_taupunktsteuerung_automatisch_neu_starten', 'last_triggered') %}
+            {%- set seit = states.binary_sensor.neuracell_x_dew_point_controller_connected.last_changed %}
+            Die Taupunktsteuerung ist seit 20 Minuten nicht verbunden.
+            {%- if is_state('input_boolean.ambientika_neustart_taupunkt', 'on') and a is not none and a > seit %} Der
+            automatische Neustart über die Steckdose hat nicht geholfen – bitte Gerät
+            und Steckdose prüfen.
+            {%- elif is_state('input_boolean.ambientika_neustart_taupunkt', 'on') %} Der
+            automatische Neustart über die Steckdose steht noch aus (Sperrzeit) oder
+            war nicht möglich – siehe Benachrichtigungen in Home Assistant.
+            {%- else %} Bitte kurz vom Strom nehmen und wieder einstecken.
+            {%- endif %}
+
+  # Selbstheilung: Radon-Messgeraet nach 10 Minuten ohne Verbindung ueber die
+  # Steckdose neu starten, hoechstens einmal pro Stunde. Kommt es danach nicht
+  # zurueck, wird alle 30 Minuten geprueft und nach Ablauf der Stunde erneut
+  # neu gestartet; die Automation "... offline" oben meldet den Fehlschlag.
+  - id: ambientika_radon_messgeraet_neustart
+    alias: "Ambientika NeuraCell-X – Radon-Messgerät automatisch neu starten"
+    mode: single
+    trace:
+      stored_traces: 25
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.neuracell_x_radon_meter_connected
+        to: "off"
+        for: "00:10:00"
+      - platform: time_pattern
+        minutes: "/30"
+    condition:
+      - condition: state
+        entity_id: input_boolean.ambientika_neustart_radon
+        state: "on"
+      - condition: template
+        value_template: "{{ has_value('binary_sensor.neuracell_x_radon_meter_connected') }}"
+      - condition: state
+        entity_id: binary_sensor.neuracell_x_radon_meter_connected
+        state: "off"
+        for: "00:09:30"
+      # Sperrzeit: hoechstens ein Neustart pro Stunde (3540 s, damit der
+      # 30-Minuten-Takt die volle Stunde nicht um Sekundenbruchteile verpasst).
+      - condition: template
+        value_template: >-
+          {{ this.attributes.last_triggered is none
+             or (now() - this.attributes.last_triggered).total_seconds() > 3540 }}
+    action:
+      - service: script.ambientika_geraet_neu_starten
+        data:
+          geraet: radon
+          automatisch: true
+
+  # Selbstheilung: dasselbe fuer die Taupunktsteuerung.
+  - id: ambientika_taupunktsteuerung_neustart
+    alias: "Ambientika NeuraCell-X – Taupunktsteuerung automatisch neu starten"
+    mode: single
+    trace:
+      stored_traces: 25
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.neuracell_x_dew_point_controller_connected
+        to: "off"
+        for: "00:10:00"
+      - platform: time_pattern
+        minutes: "/30"
+    condition:
+      - condition: state
+        entity_id: input_boolean.ambientika_neustart_taupunkt
+        state: "on"
+      - condition: template
+        value_template: "{{ has_value('binary_sensor.neuracell_x_dew_point_controller_connected') }}"
+      - condition: state
+        entity_id: binary_sensor.neuracell_x_dew_point_controller_connected
+        state: "off"
+        for: "00:09:30"
+      - condition: template
+        value_template: >-
+          {{ this.attributes.last_triggered is none
+             or (now() - this.attributes.last_triggered).total_seconds() > 3540 }}
+    action:
+      - service: script.ambientika_geraet_neu_starten
+        data:
+          geraet: taupunkt
+          automatisch: true
+
+  # Selbstheilung: Waechter. Bleibt eine Steckdose laenger als 2 Minuten aus
+  # (z. B. Neustart von Home Assistant mitten im Schaltvorgang), schaltet er sie
+  # wieder ein - solange der Schalter "automatisch neu starten" an ist.
+  - id: ambientika_steckdosen_waechter
+    alias: "Ambientika NeuraCell-X – Steckdose wieder einschalten"
+    mode: parallel
+    trigger:
+      - platform: state
+        entity_id: *steckdose_radon
+        to: "off"
+        for: "00:02:00"
+        id: radon
+      - platform: state
+        entity_id: *steckdose_taupunkt
+        to: "off"
+        for: "00:02:00"
+        id: taupunkt
+    condition:
+      - condition: template
+        value_template: "{{ is_state('input_boolean.ambientika_neustart_' ~ trigger.id, 'on') }}"
+    action:
+      - service: homeassistant.turn_on
+        target:
+          entity_id: "{{ trigger.entity_id }}"
+      - service: persistent_notification.create
+        data:
+          notification_id: "ambientika_steckdose_{{ trigger.id }}"
+          title: "Ambientika Selbstheilung"
+          message: >-
+            Die Steckdose {{ trigger.entity_id }} war länger als 2 Minuten aus und
+            wurde wieder eingeschaltet. Zum Warten zuerst den Schalter
+            "automatisch neu starten" ausschalten.
+
+  # Selbstheilung: Zaehler um Mitternacht auf null - oder beim ersten Start von
+  # Home Assistant an einem neuen Tag, falls es um Mitternacht nicht lief.
+  - id: ambientika_neustart_zaehler_reset
+    alias: "Ambientika NeuraCell-X – Neustart-Zähler zurücksetzen"
+    mode: single
+    trigger:
+      - platform: time
+        at: "00:00:00"
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: template
+        value_template: "{{ states('input_datetime.ambientika_neustart_zaehler_datum') != now().date() | string }}"
+    action:
+      - service: counter.reset
+        target:
+          entity_id:
+            - counter.ambientika_neustarts_radon
+            - counter.ambientika_neustarts_taupunkt
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.ambientika_neustart_zaehler_datum
+        data:
+          date: "{{ now().date() }}"
 
   # Hinweis aufs Handy, wenn der Radonschutz anspringt bzw. endet.
   - id: ambientika_radon_hinweis
