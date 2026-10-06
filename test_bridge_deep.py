@@ -1102,12 +1102,669 @@ async def test_command_coalescing():
         bridge.COMMAND_COALESCE_S = alt
 
 
+async def test_meter_watch():
+    """1.4.27: Radon-Messgeraet - Messwert als Lebenszeichen, Zeitgrenze, Liste ueber Neustart."""
+    import time as _t
+    c = bridge.BridgeConfig()
+    c._apply_extras({}.get)
+    c.apply_env_overrides()
+    check("mw: Standard 30 min", c.radon_meter_timeout == 30)
+    c._apply_extras({"radon_meter_timeout": "45"}.get)
+    check("mw: Wert uebernommen", c.radon_meter_timeout == 45)
+    c._apply_extras({"radon_meter_timeout": -3}.get)
+    check("mw: negativ -> 0 (aus)", c.radon_meter_timeout == 0)
+    c._apply_extras({"radon_meter_timeout": "abc"}.get)
+    check("mw: Unsinn -> unveraendert", c.radon_meter_timeout == 0)
+    os.environ["RADON_METER_TIMEOUT"] = "12"
+    c3 = bridge.BridgeConfig.from_env()
+    del os.environ["RADON_METER_TIMEOUT"]
+    check("mw: Umgebungsvariable", c3.radon_meter_timeout == 12)
+    import tempfile as _tf
+    with _tf.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump({"ambientika_username": "u", "radon_meter_timeout": 20}, fh)
+    c4 = bridge.BridgeConfig.from_ha_options(fh.name)
+    os.unlink(fh.name)
+    check("mw: Add-on-Option", c4.radon_meter_timeout == 20)
+    check("mw: Listen-Topic", bridge.neuracell_meters_topic("ambientika") == "ambientika/neuracell/meters")
+
+    class Msg:
+        def __init__(self, t, p, retain=False):
+            self.topic, self.payload, self.retain = t, p.encode(), retain
+
+    def mkbridge(**kw):
+        cfg = bridge.BridgeConfig()
+        cfg.radon_threshold, cfg.radon_hysteresis = 100, 10
+        for k, v in kw.items():
+            setattr(cfg, k, v)
+        b = bridge.AmbientikaBridge(cfg)
+        b.client = FakeClient()
+        b.loop = asyncio.get_running_loop()
+        dev = FakeDevice(status=mkstatus(op=OM.Smart))
+        b.devices = {dev.serial_number: dev}
+        pending = []
+        b._dispatch = lambda coro: pending.append(coro)
+
+        async def mq(t, p, retain=False):
+            b._on_mqtt_message(None, None, Msg(t, p, retain))
+            while pending:
+                await pending.pop(0)
+        return b, dev, mq
+
+    def state(b):
+        return [json.loads(p) for t, p in b.client.pub if t.endswith("neuracell/state")][-1]
+
+    def meters_list(b):
+        pubs = [p for t, p in b.client.pub if t.endswith("neuracell/meters")]
+        return json.loads(pubs[-1]) if pubs else None
+
+    MT = "radon/Radon_D48C4958ECCC/state"
+    AV = "radon/Radon_D48C4958ECCC/availability/state"
+    LT = "ambientika/neuracell/meters"
+
+    # A) kein Messgeraet bekannt -> None, Watch tut nichts
+    b, dev, mq = mkbridge()
+    b.publish_neuracell_state()
+    check("mw: kein Messgeraet -> None", state(b).get("radon_meter_connected") is None and state(b).get("radon_meters") == [])
+    await b.neuracell.check_radon_meter_link()
+    check("mw: Watch ohne Messgeraet ohne Wirkung", b.neuracell._meter_connected_reported is None)
+
+    # B) Messwert ohne Anmeldung = Lebenszeichen (z. B. Neustart der Bridge bei laufendem Messgeraet)
+    await mq(MT, '{"mittelwert":62}')
+    check("mw: Messwert ohne 'online' -> verbunden", state(b).get("radon_meter_connected") is True, state(b))
+    check("mw: Messgeraet in der Liste veroeffentlicht", meters_list(b) and MT in meters_list(b)["radon_meters"], meters_list(b))
+    check("mw: Liste retained", any(t.endswith("neuracell/meters") for t, _p in b.client.pub))
+    check("mw: Wert zaehlt", b.neuracell.last_radon == 62)
+    await mq(MT, '{"mittelwert":0}')
+    check("mw: erste 0 nach Lebenszeichen ignoriert", b.neuracell.last_radon == 62)
+
+    # C) laeuft, dann still: Zeitgrenze -> getrennt, Wert verworfen, Schutzzustand bleibt
+    await mq(MT, '{"mittelwert":150}')
+    check("mw: 150 -> Radonschutz", b.neuracell.radon_active)
+    nc = b.neuracell
+    nc._meter_seen[MT] = nc._meter_ref[MT] = _t.monotonic() - 31 * 60
+    nc._meter_online[MT] = (True, _t.monotonic() - 40 * 60)
+    await nc.check_radon_meter_link()
+    check("mw: 31 min still -> getrennt", state(b).get("radon_meter_connected") is False, state(b))
+    check("mw: Einzelstatus gemeldet", nc._meter_state_reported.get(MT) is False)
+    check("mw: Wert nach Zeitgrenze verworfen", MT not in nc._radon_values)
+    check("mw: Schutzzustand bleibt (sichere Seite)", nc.radon_active)
+    await nc.check_radon_meter_link()
+    check("mw: keine Doppelmeldung", state(b).get("radon_meter_connected") is False)
+    await mq(MT, '{"mittelwert":20}')
+    check("mw: neuer Wert -> wieder verbunden", state(b).get("radon_meter_connected") is True, state(b))
+    check("mw: 20 -> Schutz aus", not nc.radon_active)
+
+    # D) Last Will offline bleibt sofort wirksam; ein Wert danach zaehlt wieder als online
+    await mq(AV, "offline")
+    check("mw: LWT offline -> getrennt", state(b).get("radon_meter_connected") is False)
+    await mq(MT, '{"mittelwert":55}')
+    check("mw: Wert nach offline -> verbunden (altes offline ueberstimmt)", state(b).get("radon_meter_connected") is True
+          and nc._meter_online[MT][0] is True, state(b))
+    await mq(AV, "online")
+    check("mw: online bestaetigt", state(b).get("radon_meter_connected") is True)
+
+    # E) Neustart: nur die retained Liste bekannt, nichts kommt -> nach Zeitgrenze getrennt
+    b, dev, mq = mkbridge()
+    nc = b.neuracell
+    await mq(LT, json.dumps({"radon_meters": {MT: _t.time() - 3600}}), retain=True)
+    check("mw: Liste gelesen", MT in nc._meter_known and state(b).get("radon_meters") == [MT], state(b))
+    check("mw: vor Ablauf unbekannt (None)", state(b).get("radon_meter_connected") is None)
+    nc._meter_ref[MT] = _t.monotonic() - 31 * 60
+    await nc.check_radon_meter_link()
+    check("mw: Neustart + 31 min ohne Nachricht -> getrennt", state(b).get("radon_meter_connected") is False, state(b))
+    await mq(AV, "online")
+    check("mw: Anmeldung -> verbunden", state(b).get("radon_meter_connected") is True)
+    # eigene Liste kommt zurueck (wir sind selbst abonniert) -> keine Aenderung
+    await mq(LT, nc.known_meters_payload(), retain=True)
+    check("mw: eigene Liste unschaedlich", state(b).get("radon_meter_connected") is True and len(nc._meter_known) == 1)
+
+    # F) Liste: alte Eintraege, fremde Topics, Unsinn
+    b, dev, mq = mkbridge()
+    nc = b.neuracell
+    await mq(LT, json.dumps({"radon_meters": {MT: _t.time() - 8 * 86400, "radon/OLD/state": "x",
+                                               "other/Y/state": _t.time(), "radon/Z/foo": _t.time()}}), retain=True)
+    check("mw: >7 Tage alt / fremd / kaputt ignoriert", not nc._meter_known, nc._meter_known)
+    await mq(LT, "not json", retain=True)
+    await mq(LT, '{"radon_meters": [1,2]}', retain=True)
+    check("mw: Unsinn in der Liste ignoriert", not nc._meter_known)
+    nc._meter_known["radon/Q/state"] = _t.time() - 8 * 86400
+    nc._meter_known["radon/R/state"] = _t.time()
+    pl = json.loads(nc.known_meters_payload())
+    check("mw: Liste laesst alte Geraete fallen", list(pl["radon_meters"]) == ["radon/R/state"], pl)
+
+    # G) Zeitgrenze aus (0): nur der Last Will zaehlt
+    b, dev, mq = mkbridge(radon_meter_timeout=0)
+    nc = b.neuracell
+    await mq(LT, json.dumps({"radon_meters": {MT: _t.time()}}), retain=True)
+    nc._meter_ref[MT] = _t.monotonic() - 100 * 60
+    await nc.check_radon_meter_link()
+    check("mw: ohne Zeitgrenze bleibt None", state(b).get("radon_meter_connected") is None, state(b))
+    await mq(MT, '{"mittelwert":40}')
+    nc._meter_seen[MT] = nc._meter_ref[MT] = _t.monotonic() - 100 * 60
+    await nc.check_radon_meter_link()
+    check("mw: ohne Zeitgrenze bleibt verbunden", state(b).get("radon_meter_connected") is True)
+    await mq(AV, "offline")
+    check("mw: ohne Zeitgrenze LWT wirkt", state(b).get("radon_meter_connected") is False)
+
+    # H) Bridge selbst ohne Broker: Zeitgrenze pausiert
+    b, dev, mq = mkbridge()
+    nc = b.neuracell
+    await mq(MT, '{"mittelwert":40}')
+    nc._meter_seen[MT] = nc._meter_ref[MT] = _t.monotonic() - 100 * 60
+    b.client.is_connected = lambda: False
+    await nc.check_radon_meter_link()
+    check("mw: ohne Broker-Verbindung letzter Stand", state(b).get("radon_meter_connected") is True, state(b))
+    b.client.is_connected = lambda: True
+    nc.on_broker_connected()
+    check("mw: Reconnect startet die Zeit neu (noch verbunden)", _t.monotonic() - nc._meter_ref[MT] < 5)
+    await nc.check_radon_meter_link()
+    check("mw: nach Reconnect volle Zeitgrenze, solange verbunden", state(b).get("radon_meter_connected") is True, state(b))
+    nc._meter_ref[MT] = _t.monotonic() - 31 * 60
+    await nc.check_radon_meter_link()
+    check("mw: Zeitgrenze nach Reconnect abgelaufen -> getrennt", state(b).get("radon_meter_connected") is False, state(b))
+    nc.on_broker_connected()
+    check("mw: Reconnect bei getrennt startet nicht neu", _t.monotonic() - nc._meter_ref[MT] > 30 * 60)
+    await nc.check_radon_meter_link()
+    check("mw: bleibt getrennt bis eine Nachricht kommt", state(b).get("radon_meter_connected") is False)
+    await mq(MT, '{"mittelwert":41}')
+    check("mw: Nachricht -> wieder verbunden", state(b).get("radon_meter_connected") is True)
+
+    # I) zwei Messgeraete: eines still -> getrennt
+    b, dev, mq = mkbridge()
+    nc = b.neuracell
+    await mq(MT, '{"mittelwert":40}')
+    await mq("radon/Radon_B/state", '{"mittelwert":41}')
+    check("mw: zwei Messgeraete verbunden", state(b).get("radon_meter_connected") is True
+          and state(b).get("radon_meters") == sorted([MT, "radon/Radon_B/state"]))
+    nc._meter_seen["radon/Radon_B/state"] = nc._meter_ref["radon/Radon_B/state"] = _t.monotonic() - 31 * 60
+    await nc.check_radon_meter_link()
+    check("mw: eines still -> getrennt", state(b).get("radon_meter_connected") is False)
+    check("mw: nur das stille Geraet verworfen", "radon/Radon_B/state" not in nc._radon_values and MT in nc._radon_values)
+    nc._meter_seen[MT] = nc._meter_ref[MT] = _t.monotonic() - 31 * 60
+    await nc.check_radon_meter_link()
+    check("mw: zweites still -> auch verworfen (Einzelbeurteilung)",
+          MT not in nc._radon_values and nc._meter_state_reported.get(MT) is False)
+    await mq("radon/Radon_B/state", '{"mittelwert":42}')
+    check("mw: eines zurueck, anderes still -> weiter getrennt", state(b).get("radon_meter_connected") is False
+          and nc._meter_state_reported.get("radon/Radon_B/state") is True)
+    await mq(MT, '{"mittelwert":43}')
+    check("mw: beide zurueck -> verbunden", state(b).get("radon_meter_connected") is True)
+
+    # I2) Vergessen nach 7 Tagen (beide Uhren), Uhrensprung vergisst nicht
+    b, dev, mq = mkbridge()
+    nc = b.neuracell
+    await mq(MT, '{"mittelwert":40}')
+    await mq("radon/Radon_B/state", '{"mittelwert":41}')
+    nc._meter_known[MT] = _t.time() - 8 * 86400          # Epoch alt, monotonic frisch (Uhrensprung)
+    await nc.check_radon_meter_link()
+    check("mw: Uhrensprung allein vergisst nicht", MT in nc._meter_known and state(b).get("radon_meter_connected") is True)
+    nc._meter_heard[MT] = _t.monotonic() - 8 * 86400
+    await nc.check_radon_meter_link()
+    check("mw: 7 Tage nichts -> vergessen", MT not in nc._meter_topics() and MT not in nc._radon_values
+          and MT not in nc._meter_state_reported, nc._meter_topics())
+    check("mw: Liste ohne das vergessene Geraet", list(meters_list(b)["radon_meters"]) == ["radon/Radon_B/state"], meters_list(b))
+    check("mw: uebriges Geraet verbunden", state(b).get("radon_meter_connected") is True
+          and state(b).get("radon_meters") == ["radon/Radon_B/state"])
+    await mq(MT, '{"mittelwert":44}')
+    check("mw: vergessenes Geraet meldet sich -> wieder dabei", MT in meters_list(b)["radon_meters"]
+          and state(b).get("radon_meters") == sorted([MT, "radon/Radon_B/state"]))
+    # Zeitgrenze aus + taegliche Reconnects: Vergessen haengt nicht an der Zeitgrenzen-Referenz
+    b, dev, mq = mkbridge(radon_meter_timeout=0)
+    nc = b.neuracell
+    await mq(LT, json.dumps({"radon_meters": {MT: _t.time() - 6.9 * 86400}}), retain=True)
+    check("mw: Liste: 6,9 Tage alt -> uebernommen, Hoerzeit aus dem Alter",
+          MT in nc._meter_known and _t.monotonic() - nc._meter_heard[MT] > 6.8 * 86400)
+    nc.on_broker_connected()
+    nc._meter_known[MT] = _t.time() - 7.1 * 86400
+    nc._meter_heard[MT] = _t.monotonic() - 7.1 * 86400
+    await nc.check_radon_meter_link()
+    check("mw: trotz Reconnect nach 7 Tagen vergessen", MT not in nc._meter_topics()
+          and state(b).get("radon_meter_connected") is None)
+    # Last Will 'offline' kommt vom Broker: kein Lebenszeichen fuer die Hoerzeit
+    b, dev, mq = mkbridge()
+    nc = b.neuracell
+    await mq(MT, '{"mittelwert":40}')
+    nc._meter_heard[MT] = _t.monotonic() - 1000
+    await mq(AV, "offline")
+    check("mw: LWT offline aendert die Hoerzeit nicht", _t.monotonic() - nc._meter_heard[MT] > 990)
+    await mq(AV, "online")
+    check("mw: online ist ein Lebenszeichen", _t.monotonic() - nc._meter_heard[MT] < 5)
+    # Unsinn in der Liste: NaN / Infinity / Zukunft
+    b, dev, mq = mkbridge()
+    nc = b.neuracell
+    await mq(LT, '{"radon_meters": {"radon/N/state": NaN, "radon/I/state": Infinity, "radon/F/state": %r}}'
+             % (_t.time() + 5 * 86400), retain=True)
+    check("mw: NaN/Infinity ignoriert, Zukunft auf jetzt begrenzt",
+          set(nc._meter_known) == {"radon/F/state"} and _t.time() - nc._meter_known["radon/F/state"] < 5, nc._meter_known)
+    # Liste gilt erst als geschrieben, wenn paho sie angenommen hat
+    class NoConnClient(FakeClient):
+        def __init__(self):
+            super().__init__(); self.fail = True
+        def publish(self, t, p, qos=0, retain=False):
+            super().publish(t, p, qos, retain)
+            class Info: pass
+            i = Info(); i.rc = bridge.mqtt.MQTT_ERR_NO_CONN if self.fail else bridge.mqtt.MQTT_ERR_SUCCESS
+            return i
+    b, dev, mq = mkbridge()
+    b.client = NoConnClient()
+    nc = b.neuracell
+    await mq(MT, '{"mittelwert":40}')
+    check("mw: verworfene Veroeffentlichung zaehlt nicht als geschrieben", MT not in nc._meter_listed)
+    b.client.fail = False
+    await mq(MT, '{"mittelwert":40}')
+    check("mw: naechste Nachricht schreibt die Liste", MT in nc._meter_listed)
+    # Reconnect veroeffentlicht die Liste erneut - aber nie eine leere beim ersten Start
+    class ConnClient(FakeClient):
+        def __init__(self):
+            super().__init__(); self.subs = []
+        def subscribe(self, t, *a, **k):
+            self.subs.append(t)
+        def is_connected(self):
+            return True
+    b, dev, mq = mkbridge()
+    b.client = ConnClient()
+    b._on_mqtt_connect(b.client, None, {}, 0)
+    check("mw: erster Start: keine (leere) Liste veroeffentlicht", meters_list(b) is None, meters_list(b))
+    await mq(MT, '{"mittelwert":40}')
+    n = len([1 for t, _p in b.client.pub if t.endswith("neuracell/meters")])
+    b._on_mqtt_connect(b.client, None, {}, 0)
+    check("mw: Reconnect veroeffentlicht die Liste erneut", len([1 for t, _p in b.client.pub if t.endswith("neuracell/meters")]) == n + 1
+          and meters_list(b)["radon_meters"].keys() == {MT})
+
+    # K) retained vom Broker (Neustart): 'online' und alter Wert sind kein Lebenszeichen
+    b, dev, mq = mkbridge()
+    nc = b.neuracell
+    await mq(AV, "online", retain=True)
+    check("mw: retained online -> bekannt, aber unbekannt (None)",
+          MT in nc._meter_known and state(b).get("radon_meter_connected") is None, state(b))
+    await mq(MT, '{"mittelwert":77}', retain=True)
+    check("mw: retained Wert -> weiter unbekannt, Wert aber verfuegbar",
+          state(b).get("radon_meter_connected") is None and nc.last_radon == 77, state(b))
+    nc._meter_ref[MT] = _t.monotonic() - 31 * 60
+    await nc.check_radon_meter_link()
+    check("mw: retained online + 31 min still -> getrennt", state(b).get("radon_meter_connected") is False)
+    check("mw: alter Wert nach Zeitgrenze verworfen", MT not in nc._radon_values)
+    await mq(MT, '{"mittelwert":66}')
+    check("mw: live Wert -> verbunden", state(b).get("radon_meter_connected") is True)
+    b, dev, mq = mkbridge()
+    await mq(AV, "offline", retain=True)
+    check("mw: retained offline -> getrennt", state(b).get("radon_meter_connected") is False)
+    await mq(MT, '{"mittelwert":166}', retain=True)
+    check("mw: retained Wert aendert offline nicht", state(b).get("radon_meter_connected") is False)
+    check("mw: gespeicherter Wert eines getrennten Geraets nicht verwendet",
+          MT not in b.neuracell._radon_values and not b.neuracell.radon_active and b.neuracell.last_radon is None)
+    await mq(MT, '{"mittelwert":166}')
+    check("mw: live Wert -> verbunden und verwendet", state(b).get("radon_meter_connected") is True
+          and b.neuracell.radon_active)
+    # gespeicherte 0 (Startwert) nach Neustart wird ignoriert
+    b, dev, mq = mkbridge()
+    await mq(MT, '{"mittelwert":0}', retain=True)
+    check("mw: gespeicherte 0 ignoriert, Geraet bekannt", b.neuracell.last_radon is None
+          and MT in b.neuracell._meter_known and state(b).get("radon_meters") == [MT], state(b))
+    # erste live Nachricht ist die Start-0: Status wird trotzdem veroeffentlicht
+    b, dev, mq = mkbridge()
+    n0 = len([1 for t, _p in b.client.pub if t.endswith("neuracell/state")])
+    await mq(MT, '{"mittelwert":0}')
+    check("mw: Start-0 als erste Nachricht -> Status 'verbunden' veroeffentlicht",
+          len([1 for t, _p in b.client.pub if t.endswith("neuracell/state")]) > n0
+          and state(b).get("radon_meter_connected") is True and b.neuracell.last_radon is None, state(b))
+    # unbrauchbare Availability wird ignoriert
+    await mq(AV, '{"foo": 1}')
+    check("mw: unbrauchbare Availability ignoriert", state(b).get("radon_meter_connected") is True)
+    await mq(AV, '{"state": "offline"}')
+    check("mw: JSON-Availability verstanden", state(b).get("radon_meter_connected") is False)
+
+    # L) Liste wird bei laufendem Geraet hoechstens stuendlich, aber sicher erneuert
+    b, dev, mq = mkbridge()
+    nc = b.neuracell
+    await mq(MT, '{"mittelwert":40}')
+    n1 = len([1 for t, _p in b.client.pub if t.endswith("neuracell/meters")])
+    for _i in range(5):
+        await mq(MT, '{"mittelwert":40}')
+    check("mw: Liste nicht bei jedem Wert", len([1 for t, _p in b.client.pub if t.endswith("neuracell/meters")]) == n1)
+    nc._meter_listed[MT] = _t.time() - 2 * 3600          # letzter Eintrag auf dem Broker 2 h alt
+    await mq(MT, '{"mittelwert":40}')
+    check("mw: Liste nach einer Stunde erneuert", len([1 for t, _p in b.client.pub if t.endswith("neuracell/meters")]) == n1 + 1
+          and _t.time() - meters_list(b)["radon_meters"][MT] < 5, meters_list(b))
+    # 8 Tage Betrieb mit 10-Minuten-Werten: Eintrag bleibt frisch (Regression: frueher nie erneuert)
+    fake_now = [_t.time()]
+    real_time = bridge.time.time
+    bridge.time.time = lambda: fake_now[0]
+    try:
+        pubs_before = len([1 for t, _p in b.client.pub if t.endswith("neuracell/meters")])
+        for _i in range(8 * 24 * 6):
+            fake_now[0] += 600
+            await mq(MT, '{"mittelwert":40}')
+        age = fake_now[0] - meters_list(b)["radon_meters"][MT]
+        n_pubs = len([1 for t, _p in b.client.pub if t.endswith("neuracell/meters")]) - pubs_before
+    finally:
+        bridge.time.time = real_time
+    check("mw: nach 8 Tagen Betrieb Eintrag juenger als 1 h", age < 3600 + 1, age)
+    check("mw: dabei etwa stuendlich erneuert (8 Tage ~ 192 mal)", 150 <= n_pubs <= 200, n_pubs)
+
+    # J) Abonnements
+    class SubClient(FakeClient):
+        def __init__(self):
+            super().__init__(); self.subs = []
+        def subscribe(self, t, *a, **k):
+            self.subs.append(t)
+    b, dev, mq = mkbridge()
+    b.client = SubClient()
+    b._subscribe_all(b.client)
+    check("mw: Liste abonniert", LT in b.client.subs, b.client.subs)
+    check("mw: Reihenfolge Liste -> Availability -> Werte",
+          b.client.subs.index(LT) < b.client.subs.index("radon/+/availability/state") < b.client.subs.index("radon/+/state"),
+          b.client.subs)
+    b, dev, mq = mkbridge(radon_meter_topic="")
+    b.client = SubClient()
+    b._subscribe_all(b.client)
+    check("mw: ohne Messgeraet-Topic keine Liste", LT not in b.client.subs)
+
+
+async def test_controller_direct():
+    """1.4.27: Ambientika Taupunktsteuerung direkt (dew-point/<id>/state, ventilating)."""
+    import time as _t
+    c = bridge.BridgeConfig()
+    c._apply_extras({}.get)
+    c.apply_env_overrides()
+    check("tpsd: Standard dew-point/+/state / ventilating",
+          c.dewpoint_controller_topic == "dew-point/+/state" and c.dewpoint_controller_key == "ventilating")
+    c._apply_extras({"dewpoint_controller_topic": "none", "dewpoint_controller_key": ""}.get)
+    check("tpsd: none -> aus, leerer Schluessel -> Standard",
+          c.dewpoint_controller_topic == "" and c.dewpoint_controller_key == "ventilating")
+    c._apply_extras({"dewpoint_controller_topic": "tp/+/state", "dewpoint_controller_key": "lueften"}.get)
+    check("tpsd: Werte uebernommen", c.dewpoint_controller_topic == "tp/+/state" and c.dewpoint_controller_key == "lueften")
+    os.environ["DEWPOINT_CONTROLLER_TOPIC"] = "Off"
+    c3 = bridge.BridgeConfig.from_env()
+    del os.environ["DEWPOINT_CONTROLLER_TOPIC"]
+    check("tpsd: Umgebungsvariable off", c3.dewpoint_controller_topic == "")
+    check("tpsd: Sensor-Filter", bridge._sensors_filter("dew-point/+/state") == "dew-point/+/sensors"
+          and bridge._sensors_filter("x/y") == "")
+    check("tpsd: Availability-Filter", bridge._availability_filter("dew-point/+/state") == "dew-point/+/availability/state")
+    cv = bridge._controller_ventilating
+    check("tpsd: ventilating parsen", cv('{"ventilating": true, "reason": "ok"}', "ventilating") is True
+          and cv('{"ventilating": false}', "ventilating") is False
+          and cv('{"ventilating": 1}', "ventilating") is True and cv('{"ventilating": 0}', "ventilating") is False
+          and cv('{"ventilating": "false"}', "ventilating") is False)
+    check("tpsd: unbrauchbar -> None", cv('{"reason": "x"}', "ventilating") is None and cv("ON", "ventilating") is None
+          and cv('{"ventilating": 2}', "ventilating") is None and cv('{"ventilating": null}', "ventilating") is None
+          and cv("[1]", "ventilating") is None)
+
+    class Msg:
+        def __init__(self, t, p, retain=False):
+            self.topic, self.payload, self.retain = t, p.encode(), retain
+
+    def mkbridge(**kw):
+        cfg = bridge.BridgeConfig()
+        cfg.dewpoint_block_devices = "OFF-1"
+        for k, v in kw.items():
+            setattr(cfg, k, v)
+        b = bridge.AmbientikaBridge(cfg)
+        b.client = FakeClient()
+        b.loop = asyncio.get_running_loop()
+        office = FakeDevice(serial="OFF-1", name="Office", status=mkstatus(op=OM.Smart))
+        smart = FakeDevice(serial="SM-1", name="Eltern", status=mkstatus(op=OM.Night))
+        b.devices = {office.serial_number: office, smart.serial_number: smart}
+        pending = []
+        b._dispatch = lambda coro: pending.append(coro)
+
+        async def mq(t, p, retain=False):
+            b._on_mqtt_message(None, None, Msg(t, p, retain))
+            while pending:
+                await pending.pop(0)
+        return b, office, smart, mq
+
+    def state(b):
+        return [json.loads(p) for t, p in b.client.pub if t.endswith("neuracell/state")][-1]
+
+    ST, AV, SE = ("dew-point/TP_D48C4956EC10/state", "dew-point/TP_D48C4956EC10/availability/state",
+                  "dew-point/TP_D48C4956EC10/sensors")
+
+    # A) ohne jede Konfiguration: ventilating false -> Sperre, true -> frei
+    b, office, smart, mq = mkbridge()
+    await mq(ST, '{"ventilating": false, "reason": "Aussen zu feucht"}')
+    check("tpsd: ventilating false -> OFFICE aus", office._status["operating_mode"] == OM.Off and b.neuracell.dewpoint_block)
+    check("tpsd: SMART unberuehrt", smart._status["operating_mode"] == OM.Night)
+    await mq(ST, '{"ventilating": true, "reason": "ok"}')
+    check("tpsd: ventilating true -> frei, OFFICE wieder Smart",
+          office._status["operating_mode"] == OM.Smart and not b.neuracell.dewpoint_block)
+    await mq(ST, '{"reason": "ohne Flag"}')
+    check("tpsd: Nachricht ohne Flag ignoriert", not b.neuracell.dewpoint_block)
+    check("tpsd: live Nachricht der Steuerung = verbunden (auch ohne Availability)",
+          state(b).get("dewpoint_controller_connected") is True, state(b))
+
+    # B) Availability automatisch, Sensoren als Lebenszeichen
+    await mq(AV, "online")
+    check("tpsd: online -> verbunden", state(b).get("dewpoint_controller_connected") is True)
+    before = b.neuracell._tps_last_seen
+    await asyncio.sleep(0.01)
+    await mq(SE, '{"indoor": {"temp": 20.1, "humidity": 55}, "outdoor": {"temp": 12.0, "humidity": 80}}')
+    check("tpsd: Sensoren = Lebenszeichen", b.neuracell._tps_last_seen > before and not b.neuracell.dewpoint_block)
+    await mq(AV, "offline")
+    check("tpsd: Last Will -> getrennt (keep: Sperre bleibt frei)",
+          state(b).get("dewpoint_controller_connected") is False and not b.neuracell.dewpoint_block)
+
+    # C) release: Sperre aktiv, Steuerung haengt -> frei; zurueck -> letzte Entscheidung gilt wieder
+    b, office, smart, mq = mkbridge(dewpoint_lost_action="release")
+    await mq(AV, "online")
+    await mq(ST, '{"ventilating": false}')
+    check("tpsd: Sperre aktiv", office._status["operating_mode"] == OM.Off)
+    await mq(AV, "offline")
+    check("tpsd: haengt -> release", office._status["operating_mode"] == OM.Smart and not b.neuracell.dewpoint_block)
+    await mq(AV, "online")
+    check("tpsd: zurueck -> Sperre aus letzter Entscheidung wieder aktiv",
+          office._status["operating_mode"] == OM.Off and b.neuracell.dewpoint_block)
+    await mq(ST, '{"ventilating": true}')
+    check("tpsd: frei", office._status["operating_mode"] == OM.Smart)
+
+    # D) retained alter Zustand einer getrennten Steuerung wird bei release nicht angewendet
+    b, office, smart, mq = mkbridge(dewpoint_lost_action="release")
+    await mq(AV, "offline", retain=True)
+    await mq(ST, '{"ventilating": false}', retain=True)
+    check("tpsd: retained Sperre einer toten Steuerung ignoriert", office._status["operating_mode"] == OM.Smart
+          and not b.neuracell.dewpoint_block)
+    await mq(AV, "online")
+    check("tpsd: online -> gespeicherte Entscheidung (Sperre) gilt", office._status["operating_mode"] == OM.Off)
+
+    # E) Live-Nachricht auf dem eigenen Topic waehrend LWT offline: angewendet, wieder verbunden
+    #    (nur die Steuerung selbst sendet dort - wie beim Messgeraet)
+    b, office, smart, mq = mkbridge(dewpoint_lost_action="release")
+    await mq(AV, "offline")
+    await mq(ST, '{"ventilating": false}')
+    check("tpsd: live Sperre trotz offline angewendet", office._status["operating_mode"] == OM.Off)
+    check("tpsd: eigenes Topic live -> wieder verbunden", state(b).get("dewpoint_controller_connected") is True)
+    await mq(AV, "offline")
+    check("tpsd: erneuter Last Will -> getrennt, release", state(b).get("dewpoint_controller_connected") is False
+          and office._status["operating_mode"] == OM.Smart)
+    await mq(SE, '{"indoor": {"temp": 20}}')
+    check("tpsd: Sensoren live -> wieder verbunden, letzte Entscheidung (Sperre) gilt wieder",
+          state(b).get("dewpoint_controller_connected") is True and office._status["operating_mode"] == OM.Off)
+    check("tpsd: Lebenszeichen hebt offline auf, meldet aber kein online", b.neuracell._tps_avail is None)
+    # mit Zeitgrenze: nach dem Wiederbeleben ueber eigene Nachrichten greift die Zeitgrenze weiter
+    b, office, smart, mq = mkbridge(dewpoint_lost_action="release", dewpoint_signal_timeout=10)
+    await mq(AV, "online")
+    await mq(AV, "offline")
+    await mq(SE, '{"indoor": {"temp": 20}}')
+    check("tpsd: Zeitgrenze: Sensoren nach offline -> verbunden", state(b).get("dewpoint_controller_connected") is True)
+    b.neuracell._tps_last_seen = _t.monotonic() - 11 * 60
+    b.neuracell._tps_watch_start = b.neuracell._tps_last_seen
+    await b.neuracell.check_dewpoint_link()
+    check("tpsd: Zeitgrenze greift nach dem Wiederbeleben weiter", state(b).get("dewpoint_controller_connected") is False)
+    # generisches Sperr-Topic: dort bleibt der Last Will massgeblich (kann aus HA kommen)
+    b, office, smart, mq = mkbridge(dewpoint_lost_action="release", dewpoint_availability_topic="tps/avail")
+    await mq("tps/avail", "offline")
+    await mq("ambientika/dewpoint/block", "ON")
+    check("tpsd: generisches Topic live trotz offline angewendet", office._status["operating_mode"] == OM.Off)
+    check("tpsd: generisches Topic: Status bleibt getrennt", state(b).get("dewpoint_controller_connected") is False)
+    # gespeichertes 'online' nach Reconnect hebt einen live gesehenen Last Will nicht auf
+    b, office, smart, mq = mkbridge(dewpoint_lost_action="release")
+    await mq(AV, "online")
+    await mq(ST, '{"ventilating": false}')
+    await mq(AV, "offline")
+    check("tpsd: offline -> release", office._status["operating_mode"] == OM.Smart)
+    b.neuracell.on_broker_connected()
+    await mq(AV, "online", retain=True)
+    check("tpsd: gespeichertes online nach live offline -> bleibt getrennt",
+          state(b).get("dewpoint_controller_connected") is False)
+    await mq(ST, '{"ventilating": false}', retain=True)
+    check("tpsd: gespeicherte Sperre der toten Steuerung weiter ignoriert", office._status["operating_mode"] == OM.Smart)
+    await mq(AV, "online")
+    check("tpsd: live online -> verbunden, Sperre gilt wieder", state(b).get("dewpoint_controller_connected") is True
+          and office._status["operating_mode"] == OM.Off)
+
+    # F) Zeitgrenze ohne Last Will: Sensoren halten die Verbindung
+    b, office, smart, mq = mkbridge(dewpoint_signal_timeout=10)
+    await mq(SE, '{"indoor": {"temp": 20}}')
+    check("tpsd: Sensoren -> verbunden (Zeitgrenze)", state(b).get("dewpoint_controller_connected") is True)
+    b.neuracell._tps_last_seen = _t.monotonic() - 11 * 60
+    b.neuracell._tps_watch_start = b.neuracell._tps_last_seen
+    await b.neuracell.check_dewpoint_link()
+    check("tpsd: 11 min nichts -> getrennt", state(b).get("dewpoint_controller_connected") is False)
+    await mq(ST, '{"ventilating": true}')
+    check("tpsd: Nachricht -> wieder verbunden", state(b).get("dewpoint_controller_connected") is True)
+    b, office, smart, mq = mkbridge(dewpoint_signal_timeout=10, dewpoint_lost_action="release")
+    await mq(AV, "online", retain=True)
+    await mq(ST, '{"ventilating": false}', retain=True)
+    check("tpsd: Zeitgrenze: gespeicherte Sperre bei unbekanntem Status angewendet", office._status["operating_mode"] == OM.Off)
+    b.neuracell._tps_watch_start = _t.monotonic() - 11 * 60
+    await b.neuracell.check_dewpoint_link()
+    check("tpsd: Zeitgrenze abgelaufen -> release", state(b).get("dewpoint_controller_connected") is False
+          and office._status["operating_mode"] == OM.Smart)
+    await mq(SE, '{"indoor": {"temp": 20}}')
+    check("tpsd: nur Sensoren zurueck -> verbunden und Sperre wieder aktiv",
+          state(b).get("dewpoint_controller_connected") is True and office._status["operating_mode"] == OM.Off)
+
+    # G) generischer Sperr-Topic funktioniert weiter, beide Wege greifen ineinander
+    b, office, smart, mq = mkbridge()
+    await mq("ambientika/dewpoint/block", "ON")
+    check("tpsd: ambientika/dewpoint/block ON", office._status["operating_mode"] == OM.Off)
+    await mq(ST, '{"ventilating": true}')
+    check("tpsd: Steuerung meldet frei -> frei", office._status["operating_mode"] == OM.Smart)
+    await mq(ST, '{"ventilating": false}')
+    await mq("ambientika/dewpoint/block", "OFF")
+    check("tpsd: letzte Nachricht gewinnt", office._status["operating_mode"] == OM.Smart)
+
+    # H) abgeschaltet: dew-point-Topics ohne Wirkung
+    b, office, smart, mq = mkbridge(dewpoint_controller_topic="")
+    await mq(ST, '{"ventilating": false}')
+    await mq(AV, "offline")
+    b.publish_neuracell_state()
+    check("tpsd: aus -> keine Wirkung", office._status["operating_mode"] == OM.Smart
+          and state(b).get("dewpoint_controller_connected") is None, state(b))
+
+    # I) explizites Availability-Topic gleich dem automatischen -> kein Konflikt
+    b, office, smart, mq = mkbridge(dewpoint_availability_topic=AV)
+    await mq(AV, "online")
+    await mq(ST, '{"ventilating": false}')
+    check("tpsd: explizit + automatisch gleich -> verbunden und Sperre",
+          state(b).get("dewpoint_controller_connected") is True and office._status["operating_mode"] == OM.Off)
+
+    # K) retained vom Broker (Neustart): 'online' kein Lebenszeichen, Sensoren schon
+    b, office, smart, mq = mkbridge()
+    await mq(AV, "online", retain=True)
+    check("tpsd: retained online -> unbekannt", state(b).get("dewpoint_controller_connected") is None, state(b))
+    await mq(SE, '{"indoor": {"temp": 20}}', retain=True)
+    check("tpsd: retained Sensoren kein Lebenszeichen", state(b).get("dewpoint_controller_connected") is None)
+    await mq(SE, '{"indoor": {"temp": 20}}')
+    check("tpsd: live Sensoren -> verbunden", state(b).get("dewpoint_controller_connected") is True)
+    await mq(AV, "offline", retain=True)
+    check("tpsd: retained offline -> getrennt", state(b).get("dewpoint_controller_connected") is False)
+    await mq(ST, '{"ventilating": false}', retain=True)
+    check("tpsd: retained Zustand kein Lebenszeichen (keep: Sperre uebernommen)",
+          state(b).get("dewpoint_controller_connected") is False and b.neuracell.dewpoint_block)
+    await mq(AV, "online")
+    check("tpsd: live online -> verbunden", state(b).get("dewpoint_controller_connected") is True)
+    # explizites Availability-Topic (1.4.26): retained online ebenfalls unbekannt
+    b, office, smart, mq = mkbridge(dewpoint_availability_topic="taupunkt/TP_X/availability/state",
+                                    dewpoint_controller_topic="")
+    await mq("taupunkt/TP_X/availability/state", "online", retain=True)
+    check("tpsd: explizit retained online -> unbekannt", state(b).get("dewpoint_controller_connected") is None)
+    await mq("taupunkt/TP_X/availability/state", "online")
+    check("tpsd: explizit live online -> verbunden", state(b).get("dewpoint_controller_connected") is True)
+
+    # K2) Reconnect der Bridge: altes Lebenszeichen zaehlt nach retained 'online' nicht mehr
+    b, office, smart, mq = mkbridge()
+    await mq(SE, '{"indoor": {"temp": 20}}')
+    check("tpsd: live -> verbunden", state(b).get("dewpoint_controller_connected") is True)
+    await asyncio.sleep(0.01)
+    b.neuracell.on_broker_connected()
+    await mq(AV, "online", retain=True)
+    check("tpsd: nach Reconnect nur retained online -> unbekannt", state(b).get("dewpoint_controller_connected") is None, state(b))
+    await mq(SE, '{"indoor": {"temp": 21}}')
+    check("tpsd: naechste live Nachricht -> verbunden", state(b).get("dewpoint_controller_connected") is True)
+    b.neuracell.on_broker_connected()
+    await mq(AV, "offline", retain=True)
+    check("tpsd: nach Reconnect retained offline -> getrennt", state(b).get("dewpoint_controller_connected") is False)
+    # ohne Reconnect bleibt ein frisches Lebenszeichen gueltig
+    b, office, smart, mq = mkbridge()
+    await mq(ST, '{"ventilating": true}')
+    await mq(AV, "online", retain=True)
+    check("tpsd: frisches Lebenszeichen bleibt", state(b).get("dewpoint_controller_connected") is True)
+
+    # L) dewpoint_block_topic ueberdeckt das Steuerungs-Topic: Warnung, Sperrsignal-Weg bleibt (wie 1.4.26)
+    import logging as _lg
+    class _Catch(_lg.Handler):
+        def __init__(self):
+            super().__init__(); self.msgs = []
+        def emit(self, r):
+            self.msgs.append(r.getMessage())
+    class SubClient(FakeClient):
+        def __init__(self):
+            super().__init__(); self.subs = []
+        def subscribe(self, t, *a, **k):
+            self.subs.append(t)
+    b, office, smart, mq = mkbridge(dewpoint_block_topic="dew-point/+/state", dewpoint_block_key="blocked")
+    b.client = SubClient()
+    h = _Catch(); bridge.log.addHandler(h)
+    try:
+        b._subscribe_all(b.client)
+    finally:
+        bridge.log.removeHandler(h)
+    check("tpsd: Ueberdeckung gewarnt", any("also covers the state topic" in m for m in h.msgs), h.msgs)
+    await mq(ST, '{"blocked": true, "ventilating": true}')
+    check("tpsd: Ueberdeckung -> Sperrsignal-Weg (dewpoint_block_key)", office._status["operating_mode"] == OM.Off)
+    b, office, smart, mq = mkbridge()
+    b.client = SubClient()
+    h = _Catch(); bridge.log.addHandler(h)
+    try:
+        b._subscribe_all(b.client)
+    finally:
+        bridge.log.removeHandler(h)
+    check("tpsd: Standard ohne Warnung", not any("also covers" in m for m in h.msgs), h.msgs)
+
+    # M) Fehler in einem Handler landet im Log (statt still zu verschwinden)
+    b, office, smart, mq = mkbridge()
+    h = _Catch(); bridge.log.addHandler(h)
+    try:
+        async def boom():
+            raise RuntimeError("kaputt")
+        bridge.AmbientikaBridge._dispatch(b, boom())   # echter Dispatch (mkbridge faengt ihn sonst ab)
+        await asyncio.sleep(0.05)
+    finally:
+        bridge.log.removeHandler(h)
+    check("tpsd: Handler-Fehler geloggt", any("handler failed" in m and "kaputt" in m for m in h.msgs), h.msgs)
+
+    # J) Abonnements und Zuordnung
+    b, office, smart, mq = mkbridge()
+    b.client = SubClient()
+    b._subscribe_all(b.client)
+    check("tpsd: dew-point-Topics abonniert",
+          all(t in b.client.subs for t in ("dew-point/+/availability/state", "dew-point/+/state", "dew-point/+/sensors")), b.client.subs)
+    check("tpsd: Availability vor State",
+          b.client.subs.index("dew-point/+/availability/state") < b.client.subs.index("dew-point/+/state"))
+    check("tpsd: Radon-Messgeraet nicht als Steuerung gelesen",
+          not bridge._topic_match("dew-point/+/state", "radon/Radon_X/state")
+          and not bridge._topic_match("dew-point/+/state", "dew-point/TP_X/availability/state"))
+
+
 async def _async_suite():
     await test_neuracell()
     await test_neuracell_scoped()
     await test_neuracell_robust()
     await test_radon_meter()
     await test_dewpoint_watch()
+    await test_meter_watch()
+    await test_controller_direct()
     await test_payload()
     await test_command()
     await test_command_coalescing()

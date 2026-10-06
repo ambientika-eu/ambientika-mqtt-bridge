@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Live end-to-end test: real Mosquitto broker, full bridge.run() loop,
 simulated Ambientika radon meter (MQTT mode 4) with Last Will + keepalive,
+Ambientika Taupunktsteuerung with its real topics (dew-point/<id>/...),
 Vorsmann layout (2x OFFICE cellar, 5x SMART sleeping floor)."""
 import asyncio, importlib.util, json, os, socket, subprocess, sys, tempfile, threading, time
 import paho.mqtt.client as mqtt
@@ -16,6 +17,7 @@ OM, FS, HL, LS = bridge.OperatingMode, bridge.FanSpeed, bridge.HumidityLevel, br
 
 PORT = 18830
 FAILS = []
+SPY = None
 def check(name, cond, extra=""):
     print(("  PASS " if cond else "  FAIL ") + name + ("" if cond else "  <<< " + str(extra)), flush=True)
     if not cond: FAILS.append(name)
@@ -58,6 +60,10 @@ class Spy:
         with self.lock: self.msgs[m.topic] = (m.payload.decode(), m.retain)
     def get(self, t):
         with self.lock: return self.msgs.get(t, (None, None))
+    def forget(self, *topics):
+        """Drop the last message of these topics, so a fresh bridge instance must publish anew."""
+        with self.lock:
+            for t in topics: self.msgs.pop(t, None)
     def nc(self):
         p, _ = self.get("ambientika/neuracell/state")
         return json.loads(p) if p else {}
@@ -96,6 +102,40 @@ class Tps:
     def hang(self):
         self.c.loop_stop()
 
+class MeterNR(Meter):
+    """Like Meter, but Last Will and 'online' WITHOUT retain (as seen at the
+    customer on 26.09.): after a restart the broker holds nothing about it."""
+    def __init__(self, keepalive=3):
+        self.c = mqtt.Client(client_id=self.ID)
+        self.c.will_set(f"radon/{self.ID}/availability/state", "offline", retain=False)
+        self.c.connect("127.0.0.1", PORT, keepalive=keepalive); self.c.loop_start()
+        time.sleep(0.3)
+        self.c.publish(f"radon/{self.ID}/availability/state", "online", retain=False)
+    def value(self, v):
+        self.c.publish(f"radon/{self.ID}/state", json.dumps({"mittelwert": v}), retain=False)
+
+class TpsNative:
+    """Ambientika Taupunktsteuerung with the real MQTT firmware topics (HA diagnostics 30.09.):
+    dew-point/<id>/availability/state (Last Will), dew-point/<id>/state {"ventilating", "reason"},
+    dew-point/<id>/sensors {...}."""
+    ID = "TP_D48C4956EC10"
+    def __init__(self, keepalive=3, announce=True):
+        self.c = mqtt.Client(client_id=self.ID)
+        self.c.will_set(f"dew-point/{self.ID}/availability/state", "offline", retain=True)
+        self.c.connect("127.0.0.1", PORT, keepalive=keepalive); self.c.loop_start()
+        time.sleep(0.3)
+        if announce:
+            self.online()
+    def online(self):
+        self.c.publish(f"dew-point/{self.ID}/availability/state", "online", retain=False)
+    def state(self, ventilating, reason="test"):
+        self.c.publish(f"dew-point/{self.ID}/state", json.dumps({"ventilating": ventilating, "reason": reason}), retain=True)
+    def sensors(self):
+        self.c.publish(f"dew-point/{self.ID}/sensors", json.dumps({"indoor": {"temp": 20.5, "humidity": 60},
+                                                                   "outdoor": {"temp": 11.0, "humidity": 85}}), retain=False)
+    def hang(self):
+        self.c.loop_stop()
+
 def retained(topic, timeout=3):
     """Read what a NEW subscriber (e.g. HA after restart) gets for a topic."""
     got = {}
@@ -114,14 +154,20 @@ def wait(cond, timeout=15, step=0.2):
         time.sleep(step)
     return False
 
-async def run_bridge(devs, stop_after):
+async def run_bridge(devs, stop_after, native=False):
     cfg = bridge.BridgeConfig()
     cfg.mqtt_host, cfg.mqtt_port, cfg.poll_interval = "127.0.0.1", PORT, 2
     cfg.radon_threshold, cfg.radon_hysteresis = 50, 10
     cfg.dewpoint_block_devices = "FCB467C4B1E4,FCB467C6EABC"
-    cfg.dewpoint_availability_topic = "taupunkt/+/availability/state"
     cfg.dewpoint_lost_action = "release"
+    if native:
+        # 1.4.27: nothing configured for the Taupunktsteuerung (dew-point/+/state is
+        # the default), radon meter time limit shortened to 1 min for the test
+        cfg.radon_meter_timeout = 1
+    else:
+        cfg.dewpoint_availability_topic = "taupunkt/+/availability/state"
     b = bridge.AmbientikaBridge(cfg)
+    SPY.forget("ambientika/neuracell/state", "ambientika/bridge/availability")
     async def login(): b.api = object()
     async def discover(): b.devices = devs
     b._login, b._discover_devices = login, discover
@@ -138,7 +184,8 @@ async def scenario():
     broker = None if os.environ.get("E2E_EXTERNAL_BROKER") else subprocess.Popen(
         ["mosquitto", "-p", str(PORT)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.8)
-    spy = Spy(); time.sleep(0.3)
+    global SPY
+    spy = SPY = Spy(); time.sleep(0.3)
     devs = make_devices(); before = modes(devs)
 
     async def steps(b):
@@ -257,6 +304,71 @@ async def scenario():
         check("after restart: stale retained block ON of dead TPS not applied",
               await loop.run_in_executor(None, wait, lambda: all(devs2[s]._s["operating_mode"] != OM.Off for s in OFFICE), 5), modes(devs2))
     await run_bridge(devs2, steps2)
+
+    print("\n[12] 1.4.27: Taupunktsteuerung with its real topics, no configuration")
+    # clear the retained leftovers of the earlier meters so the time-limit test below starts clean
+    spy.c.publish(f"radon/{Meter.ID}/availability/state", "", retain=True)
+    spy.c.publish(f"radon/{Meter.ID}/state", "", retain=True)
+    spy.c.publish("ambientika/neuracell/meters", "", retain=True)
+    time.sleep(0.5)
+    devs3 = make_devices(); before3 = modes(devs3)
+    async def steps3(b):
+        loop = asyncio.get_running_loop()
+        aw = lambda f, t=15: loop.run_in_executor(None, wait, f, t)
+        check("start: TPS unknown (None)", await aw(lambda: "dewpoint_controller_connected" in spy.nc()
+              and spy.nc().get("dewpoint_controller_connected") is None), spy.nc())
+        tps = await loop.run_in_executor(None, TpsNative)
+        check("native TPS online -> connected True", await aw(lambda: spy.nc().get("dewpoint_controller_connected") is True), spy.nc())
+        tps.state(False, "Aussenluft zu feucht")
+        check("ventilating false -> both OFFICE Off", await aw(lambda: all(devs3[s]._s["operating_mode"] == OM.Off for s in OFFICE)), modes(devs3))
+        check("5 SMART untouched", all(devs3[s]._s["operating_mode"] == before3[s] for s in devs3 if s not in OFFICE), modes(devs3))
+        check("block flag in state", spy.nc().get("dewpoint_block") is True, spy.nc())
+        tps.sensors(); await asyncio.sleep(1)
+        check("sensor message changes nothing", spy.nc().get("dewpoint_block") is True and spy.nc().get("dewpoint_controller_connected") is True)
+        tps.state(True, "ok")
+        check("ventilating true -> everything exactly as before", await aw(lambda: modes(devs3) == before3), modes(devs3))
+        tps.state(False)
+        check("block again", await aw(lambda: all(devs3[s]._s["operating_mode"] == OM.Off for s in OFFICE)))
+        t0 = time.time(); tps.hang()
+        ok = await aw(lambda: spy.nc().get("dewpoint_controller_connected") is False, 20)
+        check("TPS hangs -> LWT on dew-point availability -> connected False (%.1f s)" % (time.time() - t0), ok, spy.nc())
+        check("release -> OFFICE back", await aw(lambda: modes(devs3) == before3), modes(devs3))
+        tps2 = await loop.run_in_executor(None, TpsNative)
+        check("TPS back -> connected True and last decision (block) active again",
+              await aw(lambda: spy.nc().get("dewpoint_controller_connected") is True)
+              and await aw(lambda: all(devs3[s]._s["operating_mode"] == OM.Off for s in OFFICE)), modes(devs3))
+        tps2.state(True)
+        check("free again", await aw(lambda: modes(devs3) == before3))
+
+        print("\n[13] 1.4.27: radon meter without retained Will (customer case) - value = sign of life")
+        m = await loop.run_in_executor(None, MeterNR)
+        m.value(0); m.value(34)
+        check("meter known from value", await aw(lambda: spy.nc().get("radon_meter_connected") is True), spy.nc())
+        lst = retained("ambientika/neuracell/meters")
+        check("retained meter list published", lst[1] == 1 and Meter.ID in (lst[0] or ""), lst)
+        t0 = time.time(); m.hang()
+        ok = await aw(lambda: spy.nc().get("radon_meter_connected") is False, 20)
+        check("meter hangs -> LWT (not retained) -> connected False (%.1f s)" % (time.time() - t0), ok, spy.nc())
+        check("broker holds nothing retained for the meter",
+              retained(f"radon/{Meter.ID}/availability/state", 1.5) == (None, None))
+    await run_bridge(devs3, steps3, native=True)
+
+    print("\n[14] 1.4.27: bridge restart while the meter is gone, nothing retained -> time limit")
+    devs4 = make_devices()
+    async def steps4(b):
+        loop = asyncio.get_running_loop()
+        aw = lambda f, t=15: loop.run_in_executor(None, wait, f, t)
+        t0 = time.time()
+        check("after restart: meter listed from retained list", await aw(lambda: Meter.ID in json.dumps(spy.nc().get("radon_meters", []))), spy.nc())
+        check("after restart: unknown first (None)", spy.nc().get("radon_meter_connected") is None, spy.nc())
+        ok = await aw(lambda: spy.nc().get("radon_meter_connected") is False, 90)
+        check("1 min without a message -> connected False (%.0f s)" % (time.time() - t0), ok, spy.nc())
+        check("not earlier than the limit", time.time() - t0 >= 50, time.time() - t0)
+        m = await loop.run_in_executor(None, MeterNR)
+        m.value(40)
+        check("meter back (value) -> connected True", await aw(lambda: spy.nc().get("radon_meter_connected") is True), spy.nc())
+        m.clean_stop()
+    await run_bridge(devs4, steps4, native=True)
 
     spy.c.loop_stop()
     if broker: broker.terminate()

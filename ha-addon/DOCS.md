@@ -50,12 +50,17 @@ Then save and start the add-on. Your units appear under
 
 ### NeuraCell-X (radon protection and dew-point control)
 
-Twenty-seven further options starting with `radon_` and `dewpoint_` configure the
+Thirty further options starting with `radon_` and `dewpoint_` configure the
 radon and dew-point protection. They only matter if you have the matching
-hardware, and the defaults are safe to leave alone. The sensors *Radon Meter
-Connected* and *Dew Point Controller Connected* show whether the two devices are
-still talking to the broker; for the dew-point controller this needs
-`dewpoint_availability_topic` or `dewpoint_signal_timeout` (with
+hardware, and the defaults are safe to leave alone. The Ambientika radon meter
+(`radon/<id>/state`) and the Ambientika Taupunktsteuerung (`dew-point/<id>/state`,
+`ventilating`) are read directly with the defaults, nothing to configure. The
+sensors *Radon Meter Connected* and *Dew Point Controller Connected* show whether
+the two devices are still talking to the broker: their Last Will counts at once,
+a radon meter silent for longer than `radon_meter_timeout` (30 min) counts as
+disconnected as well, also after an add-on restart (the meters seen so far are
+remembered on the broker). A third-party dew-point controller needs
+`dewpoint_availability_topic` or `dewpoint_signal_timeout` for that (with
 `dewpoint_source: device` it follows the cloud reads instead). The full list with an
 explanation of each is in the
 [project README](https://github.com/ambientika-eu/ambientika-mqtt-bridge#neuracell-x--patent-pending-radon--dew-point-protection).

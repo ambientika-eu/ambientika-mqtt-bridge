@@ -35,6 +35,11 @@ neuracell:
   # the highest current value decides.
   radon_meter_topic: "radon/+/state"
   radon_value_key: "mittelwert"                 # JSON key of the radon value
+  # Minutes without any message from the meter (value or availability) before it
+  # counts as disconnected - also after a bridge restart while it is already gone
+  # (the meters seen so far are remembered on the broker). Its Last Will still
+  # counts at once. 0 = Last Will only.
+  radon_meter_timeout: 30
   radon_threshold: 300                          # Bq/m3 (DE reference value; WHO = 100)
   radon_hysteresis: 50                          # Bq/m3
   radon_protection_fan: "Low"
@@ -75,6 +80,13 @@ dewpoint:
   # Connection watch for the Taupunktsteuerung (TPS). A TPS that hangs stops
   # sending; without a watch its last block state would stay in force unnoticed.
   # The HA sensor "Dew Point Controller Connected" shows the result.
-  dewpoint_availability_topic: ""   # its availability topic with Last Will (online/offline); "" = off
+  dewpoint_availability_topic: ""   # its availability topic with Last Will (online/offline); "" = off (not needed for the Ambientika Taupunktsteuerung, see below)
   dewpoint_signal_timeout: 0        # minutes without any TPS message -> disconnected; 0 = off (only without Last Will; pauses while the bridge is off the broker)
   dewpoint_lost_action: "keep"      # when disconnected: "keep" | "release" (ventilate) | "block" (units off)
+  # Ambientika Taupunktsteuerung (MQTT firmware) read directly: dew-point/<id>/state
+  # carries {"ventilating": true|false, "reason": ...} - ventilating false = block.
+  # Its Last Will (dew-point/<id>/availability/state) and its sensor messages
+  # (dew-point/<id>/sensors) are watched automatically. "none" = off (as an
+  # environment variable use DEWPOINT_CONTROLLER_TOPIC=off).
+  dewpoint_controller_topic: "dew-point/+/state"
+  dewpoint_controller_key: "ventilating"

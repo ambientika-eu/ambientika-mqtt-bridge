@@ -156,9 +156,15 @@ Hinweis zu den Gerätenamen: Der Abgleich ist **groß/klein egal** und trifft **
 - **Retained:** Alle Signale werden „retained" gesendet, damit Bridge und Eingang nach einem Neustart synchron sind.
 - 230-V-Anschluss (Relaisspule) nur durch eine Elektrofachkraft; der Steuer-Eingang bleibt potenzialfrei.
 
+## Variante E — Ambientika Taupunktsteuerung mit MQTT-Firmware (ab Bridge 1.4.27, nichts zu tun)
+
+Eine Taupunktsteuerung mit der MQTT-Firmware meldet sich selbst beim Broker an und sendet ihre Entscheidung als `{"ventilating": true|false, "reason": "…"}` auf `dew-point/<id>/state`, dazu ihre Sensorwerte auf `dew-point/<id>/sensors` und ihren Last Will auf `dew-point/<id>/availability/state`. Die Bridge liest das mit den Standardwerten direkt (`dewpoint_controller_topic: "dew-point/+/state"`, `dewpoint_controller_key: "ventilating"`): `ventilating: false` sperrt die Geräte aus `dewpoint_block_devices`, `true` gibt sie wieder frei. Eine Weiterleitung auf `ambientika/dewpoint/block` ist nicht nötig, und die Verbindungsüberwachung unten läuft über ihren Last Will automatisch mit. Es bleibt nur `dewpoint_block_devices` (welche Geräte die Sperre betrifft) und bei Bedarf `dewpoint_lost_action`.
+
+Kontrolle: Im Log steht beim Start `NeuraCell-X dew point: Taupunktsteuerung read directly on dew-point/+/state (ventilating=false -> block)` und bei jedem Umschalten `dew-point ventilation BLOCKED (fans off)` bzw. `released`; der Sensor **Dew Point Controller Connected** zeigt die Verbindung.
+
 ## Verbindung der Taupunktsteuerung überwachen (ab Bridge 1.4.26)
 
-Bleibt die Taupunktsteuerung hängen, schickt sie nichts mehr, und ohne Überwachung gilt ihre letzte Sperre unbemerkt weiter. Die Bridge erkennt das auf zwei Wegen, je nachdem, was die Steuerung sendet:
+Bleibt die Taupunktsteuerung hängen, schickt sie nichts mehr, und ohne Überwachung gilt ihre letzte Sperre unbemerkt weiter. Bei der Ambientika-Steuerung (Variante E) passiert das automatisch über ihren Last Will. Für andere Steuerungen erkennt die Bridge das auf zwei Wegen, je nachdem, was die Steuerung sendet:
 
 ```yaml
 dewpoint_availability_topic: "<Verfügbarkeits-Topic der TPS>"   # exaktes Topic mit Last Will, Payload online/offline

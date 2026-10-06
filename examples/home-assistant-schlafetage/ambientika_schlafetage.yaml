@@ -290,8 +290,9 @@ automation:
           stufe: Medium
 
   # Hinweis aufs Handy, wenn das Radon-Messgeraet laenger als 20 Minuten keine
-  # Verbindung hat (ab Bridge 1.4.25). Solange es offline ist, arbeitet der
-  # Radonschutz ohne aktuellen Messwert.
+  # Verbindung hat (ab Bridge 1.4.25; ab 1.4.27 auch, wenn es nur still wird
+  # oder beim Neustart des Add-ons schon weg war). Solange es offline ist,
+  # arbeitet der Radonschutz ohne aktuellen Messwert.
   - id: ambientika_radon_messgeraet_offline
     alias: "Ambientika NeuraCell-X – Radon-Messgerät offline"
     mode: single
@@ -309,7 +310,8 @@ automation:
             vom Strom nehmen und wieder einstecken.
 
   # Hinweis aufs Handy, wenn die Taupunktsteuerung laenger als 20 Minuten keine
-  # Verbindung hat (ab Bridge 1.4.26, braucht in der Bridge
+  # Verbindung hat (ab Bridge 1.4.26; die Ambientika-Taupunktsteuerung wird ab
+  # 1.4.27 automatisch ueberwacht, andere brauchen in der Bridge
   # dewpoint_availability_topic oder dewpoint_signal_timeout). Solange sie
   # offline ist, gilt fuer die Sperre im Keller dewpoint_lost_action.
   - id: ambientika_taupunktsteuerung_offline

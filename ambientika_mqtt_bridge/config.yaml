@@ -1,6 +1,6 @@
 name: "Ambientika MQTT Bridge"
 description: "MQTT bridge for Ambientika ventilation units. Connects the Ambientika Cloud API to your local MQTT broker with Home Assistant Auto-Discovery support. Includes NeuraCell-X radon protection + dew-point control (Taupunktsteuerung)."
-version: "1.4.26"
+version: "1.4.27"
 slug: "ambientika_mqtt_bridge"
 init: false
 arch:
@@ -32,6 +32,7 @@ options:
   radon_alarm_topic: "ambientika/radon/alarm"
   radon_meter_topic: "radon/+/state"
   radon_value_key: "mittelwert"
+  radon_meter_timeout: 30
   radon_threshold: 300
   radon_hysteresis: 50
   radon_protection_fan: "Low"
@@ -56,6 +57,8 @@ options:
   dewpoint_availability_topic: ""
   dewpoint_signal_timeout: 0
   dewpoint_lost_action: "keep"
+  dewpoint_controller_topic: "dew-point/+/state"
+  dewpoint_controller_key: "ventilating"
   # --- Kommandos zusammenfassen (0 = sofort ausfuehren) ---
   command_coalesce_ms: 800
   # --- Filter-Wartungsquittung fuer Slave-Einheiten ---
@@ -78,6 +81,7 @@ schema:
   radon_alarm_topic: str?
   radon_meter_topic: str?
   radon_value_key: str?
+  radon_meter_timeout: int(0,1440)?
   radon_threshold: int(50,1000)
   radon_hysteresis: int(0,500)
   radon_protection_fan: list(Low|Medium|High)
@@ -102,6 +106,8 @@ schema:
   dewpoint_availability_topic: str?
   dewpoint_signal_timeout: int(0,1440)?
   dewpoint_lost_action: list(keep|release|block)?
+  dewpoint_controller_topic: str?
+  dewpoint_controller_key: str?
   # --- Kommandos zusammenfassen ---
   command_coalesce_ms: int(0,10000)
   # --- Filter-Wartungsquittung ---
