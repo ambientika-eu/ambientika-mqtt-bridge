@@ -178,9 +178,14 @@ except Exception:
 COMPAT_ENUM_MEMBERS: dict = {}   # enum class -> set of names added at runtime
 _COMPAT_AUTO_BASE = 900          # value range for auto-registered members
 
-# Values seen in the wild that are missing from the pinned ambientika_py.
+# Values the cloud API defines that are missing from the pinned ambientika_py.
+# The API schema (https://app.ambientika.eu:4521/swagger/v1/swagger.json) lists
+# FanSpeed as Low, Medium, High, Night, Turbo; the status packet also carries
+# "isTurboAvailable". A unit reports Night while it runs its quiet night step
+# and Turbo while it runs its boost step - both chosen by the unit itself (e.g.
+# in Smart mode), so a status read can return them at any time.
 KNOWN_MISSING_ENUM_MEMBERS = {
-    "FanSpeed": (("Night", 3),),
+    "FanSpeed": (("Night", 3), ("Turbo", 4)),
 }
 
 
@@ -214,7 +219,29 @@ class _TolerantMemberMap(dict):
             "report this value so it can be added properly (see issue #5).",
             cls.__name__, key,
         )
-        return _register_enum_member(cls, key, value)
+        # The API may also emit an undefined enum as a bare number (or null).
+        # An enum member needs a string name, so register it under str(key) and
+        # map the raw key to the same member - otherwise every lookup would
+        # register a new member, or crash with TypeError inside status().
+        name = key if isinstance(key, str) else str(key)
+        member = dict.get(self, name)
+        if member is None:
+            member = _register_enum_member(cls, name, value)
+        if not isinstance(key, str):
+            dict.__setitem__(self, key, member)
+        return member
+
+
+def is_compat_member(enum_cls, value) -> bool:
+    """True for a read-only compatibility member (Night, Turbo, auto-registered).
+
+    Such a value may be published as state but must never be sent back to the
+    cloud: an auto-registered member carries an internal number (900+) that the
+    API rejects with HTTP 500 "Value was either too large or too small for an
+    unsigned byte", and Night/Turbo are chosen by the unit itself.
+    """
+    name = getattr(value, "name", None)
+    return name is not None and name in COMPAT_ENUM_MEMBERS.get(enum_cls, ())
 
 
 def strict_enum_lookup(enum_cls, name: str):
@@ -936,11 +963,16 @@ def filter_status_to_num(value):
 
 
 def _enum_num(v):
-    """IntEnum-Wert -> int, sonst None."""
+    """IntEnum-Wert -> int, sonst None.
+
+    Ein zur Laufzeit registrierter Kompatibilitaetswert traegt nur eine interne
+    Platzhalter-Nummer (ab 900) - die ist kein Geraetewert, also None.
+    """
     try:
-        return int(v.value)
+        n = int(v.value)
     except Exception:
         return None
+    return None if n >= _COMPAT_AUTO_BASE else n
 
 
 def _fan_speed_num(v):
@@ -2244,6 +2276,69 @@ class AmbientikaBridge:
         # we keep this to avoid overwriting the user's dusk-sensor choice on an
         # off->on toggle.
         self._last_light: dict = {}
+        # serial -> {attr: enum} - the last value of each command attribute that
+        # the cloud reported AND that the API accepts back. A unit on its own
+        # night or boost step reports FanSpeed Night/Turbo, which are read-only;
+        # a command that does not name that attribute falls back to this value
+        # instead of echoing the read-only one (-> HTTP 500 "unsigned byte").
+        self._last_sendable: dict = {}
+
+    # ----- values the cloud accepts back -----
+    _CMD_ENUMS = {
+        "operating_mode": OperatingMode,
+        "fan_speed": FanSpeed,
+        "humidity_level": HumidityLevel,
+        "light_sensor_level": LightSensorLevel,
+    }
+
+    def _remember_sendable(self, serial: str, status: dict) -> None:
+        """Keep the last API-accepted value of every command attribute per unit."""
+        mem = self._last_sendable.setdefault(serial, {})
+        for attr, enum_cls in self._CMD_ENUMS.items():
+            v = status.get(attr)
+            if v is None or is_compat_member(enum_cls, v):
+                continue
+            if attr == "light_sensor_level" and status.get("operating_mode") == OperatingMode.Off:
+                continue    # a powered-off unit reports a default dusk level
+            mem[attr] = v
+
+    @staticmethod
+    def _nearest_sendable(attr: str, value):
+        """Fallback when no accepted value of this attribute was ever seen."""
+        if attr == "fan_speed":
+            name = getattr(value, "name", "")
+            return FanSpeed.Low if name == "Night" else FanSpeed.High if name == "Turbo" else FanSpeed.Medium
+        if attr == "humidity_level":
+            return HumidityLevel.Normal
+        if attr == "light_sensor_level":
+            return LightSensorLevel.Off
+        return None     # operating_mode: never guess a mode
+
+    def _sendable(self, serial: str, attr: str, value, explicit: bool = False):
+        """Return `value` if the API accepts it, else the best replacement.
+
+        Compatibility members (FanSpeed Night/Turbo, anything auto-registered)
+        are published as state but must never go into change_mode. A value the
+        bridge only filled in from the status is replaced by the last accepted
+        one of this unit (keep what the user had); a value the command itself
+        named (`explicit`, e.g. a scene restoring "Night") by the nearest
+        sendable one, since that is what was asked for. None means: no safe
+        replacement exists (unknown operating mode) - skip the command.
+        """
+        enum_cls = self._CMD_ENUMS[attr]
+        if value is None or not is_compat_member(enum_cls, value):
+            return value
+        repl = None if explicit else self._last_sendable.get(serial, {}).get(attr)
+        if repl is None:
+            repl = self._nearest_sendable(attr, value)
+        if repl is None:
+            log.error("%s %r of %s is read-only and no earlier value is known - "
+                      "command skipped.", attr, getattr(value, "name", value), serial)
+            return None
+        log.warning("%s %r for %s is a read-only value the cloud does not accept - "
+                    "sending %r instead.", attr, getattr(value, "name", value),
+                    serial, repl.name)
+        return repl
 
     # ----- availability debounce -----
     def _note_poll_failure(self, serial: str, reason: str) -> None:
@@ -2626,11 +2721,20 @@ class AmbientikaBridge:
         if light is None:
             st = await self.read_status(device)
             if st is not None:
+                self._remember_sendable(serial, st)
                 light = st["light_sensor_level"]
-                if st["operating_mode"] != OperatingMode.Off:
+                if (st["operating_mode"] != OperatingMode.Off
+                        and not is_compat_member(LightSensorLevel, light)):
                     self._last_light[serial] = light
         if light is None:
             light = LightSensorLevel.Off
+        # Never echo a read-only value (Night/Turbo/auto-registered) to the cloud.
+        operating_mode = self._sendable(serial, "operating_mode", operating_mode)
+        if operating_mode is None:
+            return False
+        fan_speed = self._sendable(serial, "fan_speed", fan_speed)
+        humidity_level = self._sendable(serial, "humidity_level", humidity_level)
+        light = self._sendable(serial, "light_sensor_level", light)
         mode = {
             "operating_mode": operating_mode,
             "fan_speed": fan_speed,
@@ -2645,6 +2749,7 @@ class AmbientikaBridge:
         if isinstance(res, Failure):
             log.error("change_mode failed for %s: %s", device.serial_number, res)
             return False
+        self._last_sendable.setdefault(serial, {}).update(mode)
         log.info("Device %s set to %s / %s.", device.serial_number, operating_mode.name, fan_speed.name)
         return True
 
@@ -2928,11 +3033,18 @@ class AmbientikaBridge:
         enum_cls = self._BASELINE_ATTRS.get(attr)
         if enum_cls is None and attr != "light_sensor_level":
             return None
+        enum_cls = enum_cls if enum_cls is not None else LightSensorLevel
         # Strict lookup on purpose: a bad payload must not create a new enum
-        # member via the compatibility map, and compatibility members (e.g. the
-        # reported-only fan speed "Night") must not be sent back to the API.
-        return strict_enum_lookup(enum_cls if enum_cls is not None else LightSensorLevel,
-                                  str(value))
+        # member via the compatibility map. A read-only member that already
+        # exists (e.g. "Night"/"Turbo", which a Home Assistant scene restores
+        # verbatim from the state it snapshotted) is accepted here and replaced
+        # by the nearest sendable value when the command is built (_sendable).
+        member = strict_enum_lookup(enum_cls, str(value))
+        if member is None:
+            compat = dict.get(enum_cls._member_map_, str(value))
+            if compat is not None and is_compat_member(enum_cls, compat):
+                return compat
+        return member
 
     async def _queue_command(self, device, parsed: dict) -> None:
         """Merge attributes into the device's pending set and schedule the flush."""
@@ -3024,6 +3136,7 @@ class AmbientikaBridge:
         if status is None:
             log.error("Cannot read current status of %s", serial)
             return
+        self._remember_sendable(serial, status)
         cur_mode = status["operating_mode"]
         op = cur_mode
         fan = status["fan_speed"]
@@ -3071,7 +3184,19 @@ class AmbientikaBridge:
             hum = parsed["humidity_level"]
         if "light_sensor_level" in parsed:
             light = parsed["light_sensor_level"]
-            self._last_light[serial] = light
+            if not is_compat_member(LightSensorLevel, light):
+                self._last_light[serial] = light
+
+        # Attributes the command did not name were filled from the cloud status.
+        # A unit on its own night/boost step reports FanSpeed Night/Turbo there -
+        # read-only values the cloud rejects (HTTP 500 "unsigned byte"). Replace
+        # them with the last accepted value of that unit before sending.
+        op = self._sendable(serial, "operating_mode", op, "operating_mode" in parsed)
+        if op is None:
+            return
+        fan = self._sendable(serial, "fan_speed", fan, "fan_speed" in parsed)
+        hum = self._sendable(serial, "humidity_level", hum, "humidity_level" in parsed)
+        light = self._sendable(serial, "light_sensor_level", light, "light_sensor_level" in parsed)
 
         mode = {
             "operating_mode": op, "fan_speed": fan,
@@ -3086,6 +3211,7 @@ class AmbientikaBridge:
             log.error("change_mode failed for %s: %s", serial, res)
         else:
             log.info("change_mode OK for %s", serial)
+            self._last_sendable.setdefault(serial, {}).update(mode)
             # The user's own command is now the reference, not the last restore.
             nc._recent_restore.pop(serial, None)
             if pending_base is not None and not nc._device_under_control(serial, device):
@@ -3263,8 +3389,11 @@ class AmbientikaBridge:
                     s = res.unwrap()
                     # Remember the user's light-sensor level while the unit runs;
                     # a powered-off unit reports a default (e.g. Medium) instead.
-                    if s["operating_mode"] != OperatingMode.Off:
+                    # Read-only compatibility values are never remembered.
+                    if (s["operating_mode"] != OperatingMode.Off
+                            and not is_compat_member(LightSensorLevel, s["light_sensor_level"])):
                         self._last_light[serial] = s["light_sensor_level"]
+                    self._remember_sendable(serial, s)
                     # Filterstatus einmal aufloesen: der effektive Wert (mit
                     # Wartungsquittung) steht in den Hauptfeldern, der rohe
                     # Geraetewert daneben in den *_raw-Feldern. Ohne aktive

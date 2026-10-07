@@ -91,6 +91,14 @@ stays on that value even though the unit switches between concrete functions on
 its own. The read-only sensor **Active Operating Mode (SMART)** shows the
 function actually running, and **Fan Speed** shows the real speed.
 
+**Fan Speed** can show `Night` or `Turbo`: the unit chose that step itself. You
+can read these values but not set them. A command that names one (for example a
+scene that restores a snapshotted `Turbo`) or that does not name the speed at all
+(a mode change alone) never sends them back: the bridge uses the last speed the
+cloud accepted for that unit, or `Low` for `Night` and `High` for `Turbo` if it
+never saw one, and writes a line about it to the log. If you want a specific
+speed, name it in the command.
+
 ## Setting several values in one automation
 
 Commands for the same unit that arrive close together are applied in a single

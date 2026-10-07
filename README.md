@@ -276,11 +276,26 @@ reported while a unit runs in night mode (see
 ERROR  Error polling <serial>: 'Night'
 ```
 
-The bridge registers `FanSpeed.Night` at start-up and installs a tolerant enum
+The bridge registers `FanSpeed.Night` and `FanSpeed.Turbo` at start-up (the API
+schema at `https://app.ambientika.eu:4521/swagger/v1/swagger.json` defines
+`FanSpeed` as Low, Medium, High, Night, Turbo) and installs a tolerant enum
 lookup, so any future unknown value is auto-registered with a warning instead of
 breaking the poll. Such compatibility members are **read-only**: they are
-published as state but rejected on the command path, because the API would not
-accept them back.
+published as state but never sent to the API, which would not accept them back.
+A command that names one (a Home Assistant scene restoring a snapshotted
+`Turbo`, say) is carried out with the nearest sendable value instead, see below;
+a name the enum does not know at all is still rejected.
+
+A command that does not name every attribute (e.g. a mode change from the
+Home Assistant `select`) fills the missing ones from the current cloud status.
+Since 1.4.29 a read-only value found there is never echoed back: the bridge sends
+the last value of that attribute the cloud accepted for this unit (seen in a poll
+or sent by a command), or - if it never saw one - the nearest sendable value
+(Night → Low, Turbo → High, unknown humidity → Normal, unknown dusk level → Off),
+and logs what it replaced. An unknown *operating mode* is never guessed; such a
+command is skipped with an error. Before 1.4.29 an auto-registered value (internal
+number 900+) went straight into `change_mode` and the cloud answered
+`HTTP 500 "Value was either too large or too small for an unsigned byte"`.
 
 ### Filter reset on Master/Slave groups
 

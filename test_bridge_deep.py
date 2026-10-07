@@ -1105,6 +1105,138 @@ async def test_command_coalescing():
         bridge.COMMAND_COALESCE_S = alt
 
 
+async def test_readonly_values():
+    """1.4.29: Nur-Lese-Werte (FanSpeed Night/Turbo, Unbekanntes) nie an die Cloud.
+
+    Kundenfall: Das Schlafetagen-Paket sendete nur den Modus, die Bridge fuellte
+    die Luefterstufe aus dem Cloud-Status - und zwei Geraete meldeten gerade eine
+    Stufe, die die Bridge nur als Kompatibilitaetswert (interne Nummer >= 900)
+    kennt. Die Cloud antwortete HTTP 500 "Value was either too large or too
+    small for an unsigned byte". Jetzt ersetzt die Bridge solche Werte durch den
+    zuletzt akzeptierten Wert des Geraets, sonst durch den naechstliegenden.
+    """
+    # Turbo ist seit 1.4.29 ein bekannter Nur-Lese-Wert (API-Schema: Low, Medium,
+    # High, Night, Turbo), Night wie bisher.
+    check("readonly: FanSpeed.Turbo registriert (4)", getattr(FS, "Turbo", None) is not None and int(FS.Turbo) == 4)
+    check("readonly: Turbo ist Kompatibilitaetswert", bridge.is_compat_member(FS, FS.Turbo))
+    check("readonly: Turbo nicht als Befehl", bridge.strict_enum_lookup(FS, "Turbo") is None)
+    check("readonly: fan_speed_num Night=4, Turbo=5",
+          bridge._fan_speed_num(FS.Night) == 4 and bridge._fan_speed_num(FS.Turbo) == 5)
+    # Unbekannte Werte: Text und Zahl (undefinierter Enum-Wert als JSON-Zahl)
+    hl_unknown = HL["VeryMoist"]
+    ls_num = LS[7]
+    check("readonly: unbekannter Text registriert (>= 900)", int(hl_unknown) >= 900 and bridge.is_compat_member(HL, hl_unknown))
+    check("readonly: Zahl als Schluessel crasht nicht, zweiter Zugriff gleicher Member",
+          LS[7] is ls_num and LS["7"] is ls_num, (ls_num, LS["7"]))
+    check("readonly: *_num fuer Platzhalter None", bridge._enum_num(hl_unknown) is None and bridge._enum_num(ls_num) is None)
+    # Discovery: die Auswahl zeigt den Live-Wert, also stehen Night/Turbo mit drin
+    opts = {p["name"]: p["options"] for t, p in bridge.build_discovery_configs(bridge.BridgeConfig(), "AMB-2", "K")
+            if "/select/" in t}
+    check("readonly: Auswahl Fan Speed enthaelt Low/Medium/High + Night/Turbo",
+          {"Low", "Medium", "High", "Night", "Turbo"} <= set(opts.get("Fan Speed", [])), opts.get("Fan Speed"))
+
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    b = bridge.AmbientikaBridge(cfg)
+    b.client = FakeClient()
+    b.loop = asyncio.get_running_loop()
+
+    # A) Geraet im Smart-Modus auf Turbo, noch nie eine andere Stufe gesehen:
+    #    Modus-Befehl ohne Stufe -> keine 900 mehr, naechstliegende Stufe High.
+    dev = FakeDevice(status=mkstatus(op=OM.Smart, fan=FS.Turbo))
+    b.devices = {dev.serial_number: dev}
+    await b._handle_command("AMB-2", "operating_mode", "ManualHeatRecovery")
+    sent = dev.mode_calls[-1] if dev.mode_calls else {}
+    check("readonly A: Befehl gesendet", bool(dev.mode_calls))
+    check("readonly A: alle Werte Byte-tauglich (< 256)",
+          all(0 <= int(v) < 256 for v in sent.values()), {k: int(v) for k, v in sent.items()})
+    check("readonly A: Turbo -> High (kein frueherer Wert)", sent.get("fan_speed") == FS.High, sent.get("fan_speed"))
+    check("readonly A: Modus wie befohlen", sent.get("operating_mode") == OM.ManualHeatRecovery)
+
+    # B) Zuletzt akzeptierte Stufe bekannt (aus dem Poll): die wird genommen.
+    dev = FakeDevice(status=mkstatus(op=OM.Smart, fan=FS.Low))
+    b.devices = {dev.serial_number: dev}
+    b._stop_event = asyncio.Event()
+    task = asyncio.create_task(b._poll_loop())
+    await asyncio.sleep(0.2)
+    b._stop_event.set()
+    await task
+    check("readonly B: Poll merkt sich akzeptierte Stufe", b._last_sendable.get("AMB-2", {}).get("fan_speed") == FS.Low,
+          b._last_sendable.get("AMB-2"))
+    dev._status["fan_speed"] = FS.Night          # Geraet ist auf die Nachtstufe gegangen
+    await b._handle_command("AMB-2", "operating_mode", "Smart")
+    check("readonly B: Night -> zuletzt akzeptierte Stufe Low", dev.mode_calls[-1]["fan_speed"] == FS.Low, dev.mode_calls[-1])
+    # Night ohne Vorwissen -> Low (leiseste sendbare Stufe)
+    dev2 = FakeDevice(serial="AMB-3", status=mkstatus(op=OM.Night, fan=FS.Night))
+    b.devices["AMB-3"] = dev2
+    await b._handle_command("AMB-3", "humidity_level", "Dry")
+    check("readonly B: Night ohne Vorwissen -> Low", dev2.mode_calls[-1]["fan_speed"] == FS.Low, dev2.mode_calls[-1])
+    check("readonly B: befohlener Wert unveraendert", dev2.mode_calls[-1]["humidity_level"] == HL.Dry)
+
+    # C) Ausdruecklich befohlene Stufe hat Vorrang vor allem.
+    dev._status["fan_speed"] = FS.Turbo
+    await b._handle_command_set("AMB-2", {"operating_mode": "Smart", "fan_speed": "Medium"})
+    check("readonly C: befohlene Stufe gewinnt", dev.mode_calls[-1]["fan_speed"] == FS.Medium, dev.mode_calls[-1])
+    check("readonly C: Erfolg aktualisiert Merker", b._last_sendable["AMB-2"]["fan_speed"] == FS.Medium)
+
+    # D) Unbekannte Feuchte-/Lichtstufe im Status -> Normal / zuletzt gesehen bzw. Off
+    dev3 = FakeDevice(serial="AMB-4", status=mkstatus(op=OM.Smart))
+    dev3._status["humidity_level"] = hl_unknown
+    dev3._status["light_sensor_level"] = LS["Bright"]
+    b.devices["AMB-4"] = dev3
+    await b._handle_command("AMB-4", "fan_speed", "High")
+    sent = dev3.mode_calls[-1]
+    check("readonly D: unbekannte Feuchtestufe -> Normal", sent["humidity_level"] == HL.Normal, sent)
+    check("readonly D: unbekannte Lichtstufe -> Off", sent["light_sensor_level"] == LS.Off, sent)
+    check("readonly D: alle Werte Byte-tauglich", all(0 <= int(v) < 256 for v in sent.values()))
+    check("readonly D: Platzhalter nie in _last_light", "AMB-4" not in b._last_light, b._last_light)
+
+    # E) Unbekannter Betriebsmodus im Status, Befehl nennt keinen Modus:
+    #    ohne frueheren Wert wird nicht geraten (kein Befehl), mit -> dieser.
+    dev4 = FakeDevice(serial="AMB-5", status=mkstatus(op=OM.Smart))
+    dev4._status["operating_mode"] = OM["Holiday"]
+    b.devices["AMB-5"] = dev4
+    await b._handle_command("AMB-5", "fan_speed", "Low")
+    check("readonly E: unbekannter Modus ohne Vorwissen -> kein Befehl", not dev4.mode_calls, dev4.mode_calls)
+    b._last_sendable["AMB-5"] = {"operating_mode": OM.Auto}
+    await b._handle_command("AMB-5", "fan_speed", "Low")
+    check("readonly E: mit Vorwissen -> letzter Modus", dev4.mode_calls and dev4.mode_calls[-1]["operating_mode"] == OM.Auto,
+          dev4.mode_calls[-1:])
+
+    # G) Befehl MIT Nur-Lese-Wert (Home-Assistant-Szene stellt den Stand "Turbo"/
+    #    "Night" wieder her): wird angenommen und beim Senden ersetzt, ein
+    #    wirklich unbekannter Name wird weiterhin verworfen.
+    dev6 = FakeDevice(serial="AMB-7", status=mkstatus(op=OM.MasterSlaveFlow, fan=FS.High))
+    b.devices["AMB-7"] = dev6
+    await b._handle_command_set("AMB-7", {"operating_mode": "Smart", "fan_speed": "Turbo"})
+    sent = dev6.mode_calls[-1] if dev6.mode_calls else {}
+    check("readonly G: Szene mit Turbo wird ausgefuehrt", bool(sent), dev6.mode_calls)
+    check("readonly G: Turbo im Befehl -> High", sent.get("fan_speed") == FS.High and sent.get("operating_mode") == OM.Smart, sent)
+    n = len(dev6.mode_calls)
+    await b._handle_command("AMB-7", "fan_speed", "Night")
+    check("readonly G: Night im Befehl -> Low", dev6.mode_calls[-1]["fan_speed"] == FS.Low and len(dev6.mode_calls) == n + 1, dev6.mode_calls[-1:])
+    n = len(dev6.mode_calls)
+    await b._handle_command("AMB-7", "fan_speed", "Bogus")
+    check("readonly G: unbekannter Name weiterhin verworfen", len(dev6.mode_calls) == n)
+    await b._handle_command_set("AMB-7", {"operating_mode": "Smart", "fan_speed": "Bogus"})
+    check("readonly G: kombiniert mit unbekanntem Namen verworfen", len(dev6.mode_calls) == n)
+    await b._handle_command("AMB-7", "light_sensor_level", "Bright")   # auto-registrierter Platzhalter
+    check("readonly G: Platzhalter-Lichtstufe -> Off", dev6.mode_calls[-1]["light_sensor_level"] == LS.Off, dev6.mode_calls[-1])
+    check("readonly G: Platzhalter nicht in _last_light", "AMB-7" not in b._last_light, b._last_light.get("AMB-7"))
+    check("readonly G: Enum nicht erweitert", "Bogus" not in FS._member_map_ and "Bogus" not in bridge.COMPAT_ENUM_MEMBERS.get(FS, ()))
+
+    # F) NeuraCell-Pfad (set_device_mode): Nur-Lese-Werte werden ebenso ersetzt.
+    dev5 = FakeDevice(serial="AMB-6", status=mkstatus(op=OM.Smart, fan=FS.Turbo))
+    dev5._status["light_sensor_level"] = LS["Bright"]
+    b.devices["AMB-6"] = dev5
+    ok = await b.set_device_mode(dev5, OM.Intake, FS.Night, HL.Normal)
+    sent = dev5.mode_calls[-1] if dev5.mode_calls else {}
+    check("readonly F: set_device_mode sendet", ok and bool(sent))
+    check("readonly F: Night -> Low, Licht -> Off", sent.get("fan_speed") == FS.Low and sent.get("light_sensor_level") == LS.Off, sent)
+    check("readonly F: Byte-tauglich", all(0 <= int(v) < 256 for v in sent.values()))
+
+
 async def test_meter_watch():
     """1.4.27: Radon-Messgeraet - Messwert als Lebenszeichen, Zeitgrenze, Liste ueber Neustart."""
     import time as _t
@@ -1771,6 +1903,7 @@ async def _async_suite():
     await test_payload()
     await test_command()
     await test_command_coalescing()
+    await test_readonly_values()
 
 
 def main():
