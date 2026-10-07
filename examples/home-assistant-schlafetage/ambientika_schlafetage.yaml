@@ -128,30 +128,70 @@ script:
       master_serials: ["AABBCCDDEE01", "AABBCCDDEE02", "AABBCCDDEE03"]
       # Ab hier nichts aendern: sucht zu jeder Seriennummer die Auswahl-Entitaeten
       # "Mode" und "Fan Speed" des Geraets, unabhaengig von Namen und Entitaets-ID.
+      # Erkennung ueber die Optionen: "Mode" enthaelt MasterSlaveFlow; "Fan Speed"
+      # enthaelt Low und High, aber kein Smart. Die Liste von "Fan Speed" darf
+      # laenger sein als Low/Medium/High - die Bridge zeigt dort auch die vom
+      # Geraet selbst gewaehlten Stufen Night und Turbo an (nur lesbar). Ein
+      # Vergleich auf genau drei Eintraege fand die Entitaet deshalb nicht, und
+      # das Skript setzte nur den Modus - die Stufe blieb dem Geraet ueberlassen.
       master_info: >-
         {%- set wanted = master_serials | map('string') | map('upper') | list -%}
-        {%- set ns = namespace(modus=[], stufe=[], found=[], names=[]) -%}
-        {%- for e in integration_entities('mqtt') | sort if e.startswith('select.') -%}
-          {%- set d = device_id(e) -%}
-          {%- if d -%}
-            {%- set idents = device_attr(d, 'identifiers') | string | upper -%}
-            {%- set opts = state_attr(e, 'options') or [] -%}
-            {%- for s in wanted if s in idents -%}
+        {%- set sel = integration_entities('mqtt') | sort | list -%}
+        {%- set ns = namespace(modus=[], stufe=[], found=[], names=[], ohne_stufe=[]) -%}
+        {%- for s in wanted -%}
+          {%- set m = namespace(modus=none, stufe=none, name=s) -%}
+          {%- for e in sel if e.startswith('select.') -%}
+            {%- set d = device_id(e) -%}
+            {%- if d and s in (device_attr(d, 'identifiers') | string | upper) -%}
+              {%- set opts = state_attr(e, 'options') or [] -%}
               {%- if 'MasterSlaveFlow' in opts -%}
-                {%- set ns.modus = ns.modus + [e] -%}
-                {%- set ns.found = ns.found + [s] -%}
-                {%- set ns.names = ns.names + [(device_attr(d, 'name_by_user') or device_attr(d, 'name') or s) | string] -%}
-              {%- elif opts | list == ['Low', 'Medium', 'High'] -%}
-                {%- set ns.stufe = ns.stufe + [e] -%}
+                {%- set m.modus = e -%}
+                {%- set m.name = (device_attr(d, 'name_by_user') or device_attr(d, 'name') or s) | string -%}
+              {%- elif 'Low' in opts and 'High' in opts and 'Smart' not in opts -%}
+                {%- set m.stufe = e -%}
               {%- endif -%}
-            {%- endfor -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- if m.modus -%}
+            {%- set ns.found = ns.found + [s] -%}
+            {%- if m.stufe -%}
+              {%- set ns.modus = ns.modus + [m.modus] -%}
+              {%- set ns.stufe = ns.stufe + [m.stufe] -%}
+              {%- set ns.names = ns.names + [m.name] -%}
+            {%- else -%}
+              {%- set ns.ohne_stufe = ns.ohne_stufe + [m.name] -%}
+            {%- endif -%}
           {%- endif -%}
         {%- endfor -%}
-        {{ {'modus': ns.modus, 'stufe': ns.stufe, 'names': ns.names,
+        {{ {'modus': ns.modus, 'stufe': ns.stufe, 'names': ns.names, 'ohne_stufe': ns.ohne_stufe,
             'fehlend': wanted | reject('in', ns.found) | list} }}
       modus_entities: "{{ master_info.modus }}"
       stufe_entities: "{{ master_info.stufe }}"
     sequence:
+      - if:
+          - condition: template
+            value_template: "{{ nur_pruefen | default(false) | bool(true) }}"
+        then:
+          - service: persistent_notification.create
+            data:
+              notification_id: ambientika_schlafetage_master
+              title: "Ambientika Schlafetage – gefundene Master"
+              message: >-
+                {%- set ns = namespace(lines=[]) -%}
+                {%- for n in master_info.names -%}
+                  {%- set ns.lines = ns.lines + [n ~ ': ' ~ master_info.modus[loop.index0] ~ ' + ' ~ master_info.stufe[loop.index0]] -%}
+                {%- endfor -%}
+                {%- if master_info.ohne_stufe -%}
+                  {%- set ns.lines = ns.lines + ['Ohne Auswahl „Fan Speed" (wird nicht geschaltet): ' ~ (master_info.ohne_stufe | join(', '))] -%}
+                {%- endif -%}
+                {%- if master_info.fehlend -%}
+                  {%- set ns.lines = ns.lines + ['Nicht gefunden: ' ~ (master_info.fehlend | join(', '))] -%}
+                {%- endif -%}
+                {%- if not ns.lines -%}
+                  {%- set ns.lines = ['Kein Gerät gefunden.'] -%}
+                {%- endif -%}
+                {{ ns.lines | join('\n\n') }}
+          - stop: "Nur Prüfung, es wurden keine Befehle gesendet."
       - if:
           - condition: template
             value_template: "{{ master_info.modus | count == 0 }}"
@@ -165,26 +205,29 @@ script:
                 master_serials im Skript "Lüftung Schlafetage setzen" prüfen
                 (Log der Bridge: "Device: … (serial: …)").
                 Gesucht: {{ master_info.fehlend | join(', ') }}
+                {%- if master_info.ohne_stufe %}
+                Gefunden, aber ohne Auswahl „Fan Speed": {{ master_info.ohne_stufe | join(', ') }}
+                – Add-on aktualisieren und Home Assistant neu starten.
+                {%- endif %}
           - stop: "Kein Master-Gerät der Schlafetage gefunden – Seriennummern in master_serials prüfen."
             error: true
+      # Ein Master ohne Auswahl "Fan Speed" wuerde nur den Modus bekommen und die
+      # Stufe dem Geraet ueberlassen. Lieber gar nicht schalten und Bescheid sagen.
       - if:
           - condition: template
-            value_template: "{{ nur_pruefen | default(false) | bool(true) }}"
+            value_template: "{{ master_info.ohne_stufe | count > 0 }}"
         then:
           - service: persistent_notification.create
             data:
               notification_id: ambientika_schlafetage_master
-              title: "Ambientika Schlafetage – gefundene Master"
+              title: "Ambientika Schlafetage"
               message: >-
-                {%- set ns = namespace(lines=[]) -%}
-                {%- for n in master_info.names -%}
-                  {%- set ns.lines = ns.lines + [n ~ ': ' ~ master_info.modus[loop.index0]] -%}
-                {%- endfor -%}
-                {%- if master_info.fehlend -%}
-                  {%- set ns.lines = ns.lines + ['Nicht gefunden: ' ~ (master_info.fehlend | join(', '))] -%}
-                {%- endif -%}
-                {{ ns.lines | join('\n\n') }}
-          - stop: "Nur Prüfung, es wurden keine Befehle gesendet."
+                Für {{ master_info.ohne_stufe | join(', ') }} wurde die Auswahl
+                „Fan Speed" nicht gefunden, es wurde nichts geschaltet. Bitte das
+                Add-on aktualisieren und Home Assistant neu starten; zur Kontrolle
+                das Skript mit "nur_pruefen" starten.
+          - stop: "Auswahl Fan Speed fehlt – es wurde nichts geschaltet."
+            error: true
       - if:
           - condition: template
             value_template: >-

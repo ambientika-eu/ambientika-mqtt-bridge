@@ -38,6 +38,8 @@ Das Paket sucht die Geräte über die Seriennummer, nicht über den Namen. Ein G
 
 Wird ein Gerät nicht gefunden, bricht das Skript mit einem Hinweis ab und legt eine Benachrichtigung an, welche Seriennummern fehlen.
 
+Zu jedem Master braucht das Skript beide Auswahl-Entitäten der Bridge, *Mode* und *Fan Speed*. Es erkennt sie an ihren Optionen, nicht am Namen. Die Liste von *Fan Speed* enthält neben Low, Medium und High auch die Stufen Night und Turbo, die ein Gerät von selbst wählt (z. B. im SMART-Betrieb) und die nur angezeigt, nicht gesetzt werden können. Die Fassung vom 5. Oktober 2026 verlangte genau drei Einträge, fand die Stufen-Entität deshalb nie und setzte stillschweigend nur den Modus; die Stufe blieb dem Gerät überlassen – und die Bridge bis 1.4.28 schickte dann die Stufe aus dem Cloud-Status zurück, was die Cloud ablehnte, wenn das Gerät gerade auf Turbo stand (eine Stufe, die die Bridge bis dahin nicht kannte). Fehlt die Stufen-Entität, schaltet das Skript jetzt nichts und meldet sich; `nur_pruefen` zeigt zu jedem Master beide Entitäten.
+
 ## Selbstheilung: automatischer Neustart über eine Steckdose
 
 Bleibt das Radon-Messgerät oder die Taupunktsteuerung hängen (keine Verbindung mehr zum Broker, Gerät kommt von selbst nicht zurück), hilft bisher nur, es kurz vom Strom zu nehmen. Das Paket kann das übernehmen: jedes der beiden Geräte hängt an einer Steckdose, die Home Assistant schalten kann, und wird automatisch neu gestartet, sobald die Bridge es 10 Minuten lang als nicht verbunden meldet (Sensor *Radon Meter Connected* bzw. *Dew Point Controller Connected* aus; ab Bridge 1.4.27 zählt dafür auch ein Messgerät, das nur still wird).
