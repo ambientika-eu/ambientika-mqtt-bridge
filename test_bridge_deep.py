@@ -1948,6 +1948,8 @@ def test_filter_ack_robust():
         check("ack: danach Bad -> weiter Good", AB._filter_ack_effective(S, "Bad") == "Good")
 
         # B) kurz gruener Rohwert (unter der Schwelle) loescht nicht
+        alt_min = bridge.FILTER_ACK_CLEAR_MIN_S
+        bridge.FILTER_ACK_CLEAR_MIN_S = 0.0   # erst nur die Abruf-Zaehlung pruefen
         for _ in range(bridge.FILTER_ACK_CLEAR_POLLS - 1):
             AB._filter_ack_effective(S, "Good")
         check("ack: %d x Good in Folge -> Quittung bleibt" % (bridge.FILTER_ACK_CLEAR_POLLS - 1),
@@ -1966,6 +1968,26 @@ def test_filter_ack_robust():
             check("ack: Entfernen wegen Good steht im Log",
                   lc.has("INFO", "removed") and lc.has("INFO", "polls in a row"), lc.lines)
         check("ack: ohne Quittung zeigt Bad wieder Bad", AB._filter_ack_effective(S, "Bad") == "Bad")
+        bridge.FILTER_ACK_CLEAR_MIN_S = alt_min
+
+        # C2) Mindestdauer: zehn Abrufe in Folge reichen allein nicht (Neustart
+        # eines Slaves mit Standardstatus, poll_interval 10 s = 100 s)
+        AB._filter_ack_write(S, "Bad")
+        with _LogCatch() as lc:
+            for _ in range(bridge.FILTER_ACK_CLEAR_POLLS * 3):
+                AB._filter_ack_effective(S, "Good")
+            check("ack: %d x Good ohne Mindestdauer -> Quittung bleibt" % (bridge.FILTER_ACK_CLEAR_POLLS * 3),
+                  S in AB._filter_ack_load() and not lc.has("INFO", "removed"), lc.lines)
+        check("ack: nach kurzer Good-Phase Bad -> weiter quittiert", AB._filter_ack_effective(S, "Bad") == "Good")
+        # Serie neu, Startzeit zurueckdatieren -> Dauer erreicht, Zaehlung muss trotzdem voll sein
+        AB._filter_ack_effective(S, "Good")
+        cnt, since = bridge._FILTER_ACK_GOOD_STREAK[S]
+        bridge._FILTER_ACK_GOOD_STREAK[S] = (cnt, since - bridge.FILTER_ACK_CLEAR_MIN_S - 1)
+        check("ack: Dauer erreicht, aber erst 1 Abruf -> bleibt",
+              AB._filter_ack_effective(S, "Good") == "Good" and S in AB._filter_ack_load())
+        for _ in range(bridge.FILTER_ACK_CLEAR_POLLS):
+            AB._filter_ack_effective(S, "Good")
+        check("ack: Dauer und Abrufe erreicht -> entfernt", S not in AB._filter_ack_load())
 
         # D) Frist: 43 Tage alt -> gilt noch; 91 Tage alt -> entfernt, mit Log
         AB._filter_ack_write(S, "Bad")
@@ -1991,6 +2013,50 @@ def test_filter_ack_robust():
         # F) ohne Option bleibt alles roh
         os.environ["SLAVE_FILTER_SOFT_RESET"] = "0"
         check("ack: Option aus -> Rohwert", AB._filter_ack_effective(S, "Bad") == "Bad")
+    finally:
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        bridge._FILTER_ACK_GOOD_STREAK.clear()
+        bridge._FILTER_ACK_ODD_RAW.clear()
+
+
+async def test_filter_ack_poll_path():
+    """Kundenfall durch den echten Poll-Pfad: Bad, dann ein Abruf None, einer Good,
+    dann wieder Bad -> der veroeffentlichte filters_status bleibt durchgehend Good,
+    der Rohwert steht daneben, die Quittung bleibt gespeichert."""
+    AB = bridge.AmbientikaBridge
+    old_env = {k: os.environ.get(k) for k in ("SLAVE_FILTER_SOFT_RESET", "FILTER_ACK_PATH")}
+    os.environ["SLAVE_FILTER_SOFT_RESET"] = "1"
+    os.environ["FILTER_ACK_PATH"] = os.path.join(_tempfile.mkdtemp(), "filter_ack.json")
+    try:
+        cfg = bridge.BridgeConfig()
+        cfg.neuracell_enabled = False
+        cfg.dewpoint_enabled = False
+        cfg.enable_discovery = False
+        cfg.poll_interval = 1
+        b = bridge.AmbientikaBridge(cfg)
+        b.client = FakeClient()
+        b.loop = asyncio.get_running_loop()
+        dev = FakeDevice(serial="WOZI", name="Wohnzimmer", zone=0, status=mkstatus())
+        dev._status["filters_status"] = "Bad"
+        b.devices = {"WOZI": dev}
+        AB._filter_ack_write("WOZI", "Bad")
+        seen = []
+        b._stop_event = asyncio.Event()
+        task = asyncio.create_task(b._poll_loop())
+        for raw in ("Bad", None, "Good", "Bad", "Bad"):
+            dev._status["filters_status"] = raw
+            await asyncio.sleep(1.05)
+            states = [json.loads(pl) for t, pl in b.client.pub if t.endswith("/state")]
+            seen.append((raw, states[-1]["filters_status"], states[-1]["filters_status_raw"]))
+        b._stop_event.set()
+        await task
+        check("ack/poll: effektiv durchgehend Good", all(e == "Good" for _, e, _ in seen), seen)
+        check("ack/poll: Rohwert daneben unveraendert", [r for r, _, _ in seen] == [r for _, _, r in seen], seen)
+        check("ack/poll: Quittung weiterhin gespeichert", "WOZI" in AB._filter_ack_load())
     finally:
         for k, v in old_env.items():
             if v is None:
@@ -2096,6 +2162,7 @@ async def _async_suite():
     await test_command_coalescing()
     await test_readonly_values()
     await test_mode_verify()
+    await test_filter_ack_poll_path()
 
 
 def main():

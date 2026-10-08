@@ -79,10 +79,13 @@ _BRIDGE_VERSION = os.environ.get("BRIDGE_VERSION", "").strip()
 FILTER_RESET_VERIFY_DELAY = 12.0
 
 # Slave filter acknowledgement (SLAVE_FILTER_SOFT_RESET): the device itself must
-# report "Good" this many polls in a row before an acknowledgement is dropped as
-# no longer needed. A single odd poll must never end it.
+# report "Good" for at least this many polls in a row AND for at least this long
+# before an acknowledgement is dropped as no longer needed. A single odd poll, a
+# unit rebooting with a default status or a short cloud hiccup must never end it;
+# with a 10 s poll interval ten polls alone would be 100 s. Overridable in tests.
 FILTER_ACK_CLEAR_POLLS = 10
-_FILTER_ACK_GOOD_STREAK: dict = {}   # serial -> consecutive "Good" polls
+FILTER_ACK_CLEAR_MIN_S = 600.0
+_FILTER_ACK_GOOD_STREAK: dict = {}   # serial -> (consecutive "Good" polls, monotonic start)
 _FILTER_ACK_ODD_RAW: dict = {}       # serial -> last unrecognised raw value logged
 
 # Operating-mode check after a command: the cloud answers change-mode with
@@ -2315,9 +2318,10 @@ class AmbientikaBridge:
         if exp is None:
             return
         sent, t_sent = exp
+        sent_name = getattr(sent, "name", str(sent))
         if reported == sent:
             self._mode_expect.pop(serial, None)
-            log.info("operating mode %s confirmed on %s", sent.name, serial)
+            log.info("operating mode %s confirmed on %s", sent_name, serial)
             return
         try:
             if self.neuracell._device_under_control(serial, device):
@@ -2330,24 +2334,28 @@ class AmbientikaBridge:
             return
         self._mode_expect.pop(serial, None)
         rep_name = getattr(reported, "name", str(reported))
+        # A unit that was unreachable for a while gets its first comparable poll
+        # late; say how long it really has been.
+        since = ("%d s" % int(waited)) if waited < 600 else ("%d min" % int(waited // 60))
         master = self._zone_master(device)
         if master is not None:
             log.warning(
                 "operating mode for %s: %s was sent and accepted by the cloud, but the "
-                "unit still reports %s after %d s. This unit is a SLAVE in zone %s - "
+                "unit still reports %s after %s. This unit is a SLAVE in zone %s - "
                 "a Slave takes its operating mode from the zone Master %s over the "
                 "local WLAN. Set the mode on the Master. If a Slave keeps a different "
                 "mode than its Master, its link to the Master is interrupted "
                 "(check 2.4 GHz WLAN on all access points and that WLAN devices may "
                 "talk to each other).",
-                serial, sent.name, rep_name, int(waited),
-                getattr(device, "zone_index", "?"), master.serial_number)
+                serial, sent_name, rep_name, since,
+                getattr(device, "zone_index", "?"),
+                getattr(master, "serial_number", "?"))
         else:
             log.warning(
                 "operating mode for %s: %s was sent and accepted by the cloud, but the "
-                "unit still reports %s after %d s. The cloud confirms the call, not its "
+                "unit still reports %s after %s. The cloud confirms the call, not its "
                 "execution on the unit - the command has not been applied.",
-                serial, sent.name, rep_name, int(waited))
+                serial, sent_name, rep_name, since)
 
     # ----- values the cloud accepts back -----
     _CMD_ENUMS = {
@@ -2763,8 +2771,9 @@ class AmbientikaBridge:
 
         Die Quittung endet nur aus zwei Gruenden, und beide stehen im Log:
           * die Frist FILTER_ACK_TTL_DAYS ist abgelaufen, oder
-          * das Geraet meldet selbst FILTER_ACK_CLEAR_POLLS Abrufe in Folge
-            "Good" (Filter direkt am Geraet zurueckgesetzt).
+          * das Geraet meldet selbst mindestens FILTER_ACK_CLEAR_POLLS Abrufe in
+            Folge und mindestens FILTER_ACK_CLEAR_MIN_S lang "Good" (Filter
+            direkt am Geraet zurueckgesetzt).
         Ein einzelner unbekannter oder kurz gruener Rohwert loescht sie nicht
         mehr - frueher genuegte dafuer ein einziger Abruf, ohne Logeintrag.
         """
@@ -2780,12 +2789,12 @@ class AmbientikaBridge:
         except Exception:
             acked_at = 0.0
         age = time.time() - acked_at
-        if age > cls._filter_ack_ttl():
+        ttl = cls._filter_ack_ttl()
+        if age > ttl:
             cls._filter_ack_drop(
                 data, serial,
-                "validity of %s days ran out (set %.0f days ago) - showing the device "
-                "value %r again" % (os.environ.get("FILTER_ACK_TTL_DAYS", "90"),
-                                   age / 86400.0, raw_status))
+                "validity of %.0f days ran out (set %.0f days ago) - showing the device "
+                "value %r again" % (ttl / 86400.0, age / 86400.0, raw_status))
             return raw_status
         num = filter_status_to_num(raw_status)
         if num is None:
@@ -2799,13 +2808,17 @@ class AmbientikaBridge:
             return "Good"
         _FILTER_ACK_ODD_RAW.pop(serial, None)
         if num <= 0:
-            streak = _FILTER_ACK_GOOD_STREAK.get(serial, 0) + 1
-            _FILTER_ACK_GOOD_STREAK[serial] = streak
-            if streak >= FILTER_ACK_CLEAR_POLLS:
+            now_m = time.monotonic()
+            count, since = _FILTER_ACK_GOOD_STREAK.get(serial, (0, now_m))
+            count += 1
+            _FILTER_ACK_GOOD_STREAK[serial] = (count, since)
+            lasted = now_m - since
+            if count >= FILTER_ACK_CLEAR_POLLS and lasted >= FILTER_ACK_CLEAR_MIN_S:
                 cls._filter_ack_drop(
                     data, serial,
-                    "the device itself has reported %r for %d polls in a row - the "
-                    "acknowledgement is no longer needed" % (raw_status, streak))
+                    "the device itself has reported %r for %d polls in a row over %.0f min "
+                    "- the acknowledgement is no longer needed"
+                    % (raw_status, count, lasted / 60.0))
             return raw_status
         # Faellig (Gelb oder Rot): die Quittung gilt.
         _FILTER_ACK_GOOD_STREAK.pop(serial, None)
@@ -3509,7 +3522,10 @@ class AmbientikaBridge:
                             and not is_compat_member(LightSensorLevel, s["light_sensor_level"])):
                         self._last_light[serial] = s["light_sensor_level"]
                     self._remember_sendable(serial, s)
-                    self._check_mode_applied(serial, device, s["operating_mode"])
+                    try:
+                        self._check_mode_applied(serial, device, s["operating_mode"])
+                    except Exception as e:  # a diagnostic must never cost a poll
+                        log.debug("mode check for %s skipped: %s", serial, e)
                     # Filterstatus einmal aufloesen: der effektive Wert (mit
                     # Wartungsquittung) steht in den Hauptfeldern, der rohe
                     # Geraetewert daneben in den *_raw-Feldern. Ohne aktive

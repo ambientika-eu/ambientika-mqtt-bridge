@@ -85,10 +85,11 @@ The diagnostic sensor *Filter Reset Status* reports `confirmed` (the counter
 really cleared), `acknowledged` (recorded by the bridge) or `unconfirmed`.
 
 An acknowledgement ends for exactly two reasons, and both are written to the log:
-`filter_ack_ttl_days` has run out, or the unit itself reports `Good` for ten polls
-in a row (its filter was reset at the device). A single poll with an unknown or
-briefly green value no longer removes it. Up to 1.4.29 one such poll was enough,
-silently, so an acknowledgement could vanish long before its time.
+`filter_ack_ttl_days` has run out, or the unit itself reports `Good` for at least
+ten polls in a row and at least ten minutes (its filter was reset at the device).
+A single poll with an unknown or briefly green value no longer removes it. Up to
+1.4.29 one such poll was enough, silently, so an acknowledgement could vanish long
+before its time.
 
 ## Mode changes on Master/Slave groups
 

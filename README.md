@@ -333,11 +333,13 @@ reset, as opposed to `confirmed` (the counter really cleared) and `unconfirmed`
 (neither cleared nor recorded).
 
 Since 1.4.30 an acknowledgement ends only when `FILTER_ACK_TTL_DAYS` run out or
-when the device itself reports `Good` for 10 polls in a row (filter reset at the
-unit); both are logged (`filter acknowledgement for <serial> removed: ...`). A poll
-with an unrecognised raw value keeps the acknowledgement and is logged once per
-new value. Before 1.4.30 a single poll with a raw value that was `Good` or
-unrecognised removed it at once and without a log line.
+when the device itself reports `Good` for at least 10 polls in a row spanning at
+least 10 minutes (filter reset at the unit; a rebooting unit or a short cloud
+hiccup reporting a default `Good` does not count); both are logged
+(`filter acknowledgement for <serial> removed: ...`). A poll with an unrecognised
+raw value keeps the acknowledgement and is logged once per new value. Before
+1.4.30 a single poll with a raw value that was `Good` or unrecognised removed it
+at once and without a log line.
 
 ### Mode changes: accepted is not applied
 
@@ -346,7 +348,9 @@ does not report whether the unit carried it out. Since 1.4.30 the log line reads
 `change_mode OK for <serial> (accepted by the cloud)` and the bridge checks the
 following polls: `operating mode <mode> confirmed on <serial>` once the unit
 reports the sent mode, or a warning if it still reports another mode after
-`MODE_VERIFY_WINDOW_S` (180 s). A unit under NeuraCell-X protection is not judged.
+`MODE_VERIFY_WINDOW_S` (180 s). A unit under NeuraCell-X protection is not judged,
+and the check never costs a poll - if it ever failed internally the status would
+still be published.
 For a Slave the warning names the zone Master: a Slave takes its operating mode
 from the Master over the local WLAN, so the mode belongs on the Master, and a Slave
 that keeps a different mode than its Master has lost its link to it.
