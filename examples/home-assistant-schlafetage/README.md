@@ -20,11 +20,11 @@ Fertiges Paket für eine Etage mit mehreren Ambientika SMART/OFFICE über die Am
      packages: !include_dir_named packages
    ```
 2. `ambientika_schlafetage.yaml` nach `config/packages/` kopieren.
-3. Im Skript `lueftung_schlafetage_setzen` die Liste `master_serials` anpassen. Dort gehören nur die **Master**-Geräte der Etage hinein, mit ihrer Seriennummer. Slaves folgen ihrem Master automatisch.
+3. Im Skript `lueftung_schlafetage_setzen` die Liste `geraete_serials` anpassen. Dort gehören **alle** Geräte der Etage hinein, Master und Slaves, mit ihrer Seriennummer. Welches Gerät gerade Master ist, liest das Skript bei jedem Lauf aus dem Sensor *Device Role*; Befehle gehen nur an die Master, die Slaves folgen ihrem Master automatisch.
 4. Entwicklerwerkzeuge → YAML → Konfiguration prüfen, dann Home Assistant neu starten.
 5. Kontrolle: Entwicklerwerkzeuge → Aktionen → `Lüftung Schlafetage setzen`, Haken bei `nur_pruefen`, ausführen. Es erscheint eine Benachrichtigung mit den gefundenen Geräten und ihren Entitäten. Es werden dabei keine Befehle gesendet.
 
-## Die Seriennummern für `master_serials`
+## Die Seriennummern für `geraete_serials`
 
 Die Seriennummer steht im Log der Bridge (Einstellungen → Add-ons → Ambientika MQTT Bridge → Protokoll), zum Beispiel:
 
@@ -38,7 +38,9 @@ Das Paket sucht die Geräte über die Seriennummer, nicht über den Namen. Ein G
 
 Wird ein Gerät nicht gefunden, bricht das Skript mit einem Hinweis ab und legt eine Benachrichtigung an, welche Seriennummern fehlen.
 
-Zu jedem Master braucht das Skript beide Auswahl-Entitäten der Bridge, *Mode* und *Fan Speed*. Es erkennt sie an ihren Optionen, nicht am Namen. Die Liste von *Fan Speed* enthält neben Low, Medium und High auch die Stufen Night und Turbo, die ein Gerät von selbst wählt (z. B. im SMART-Betrieb) und die nur angezeigt, nicht gesetzt werden können. Die Fassung vom 5. Oktober 2026 verlangte genau drei Einträge, fand die Stufen-Entität deshalb nie und setzte stillschweigend nur den Modus; die Stufe blieb dem Gerät überlassen – und die Bridge bis 1.4.28 schickte dann die Stufe aus dem Cloud-Status zurück, was die Cloud ablehnte, wenn das Gerät gerade auf Turbo stand (eine Stufe, die die Bridge bis dahin nicht kannte). Fehlt die Stufen-Entität, schaltet das Skript jetzt nichts und meldet sich; `nur_pruefen` zeigt zu jedem Master beide Entitäten.
+**Master oder Slave entscheidet der Sensor, nicht die Liste.** Frühere Fassungen verlangten, nur die Master einzutragen. Wer die Geräte in der App neu koppelt (anderer Master, andere Paare), hatte danach einen Slave in der Liste: Der Befehl ging an den Slave, der folgte ihm kurz, der eigentliche Master der Zone blieb unverändert – und holte den Slave später wieder zu sich. Jetzt stehen alle Geräte der Etage in der Liste, und das Skript nimmt bei jedem Lauf die, deren *Device Role* `Master` ist (oder `NotConfigured`, also ein Einzelgerät). `SlaveEqualMaster` und `SlaveOppositeMaster` werden übersprungen. Ist die Rolle nicht lesbar – Sensor deaktiviert oder Gerät gerade offline –, wird das Gerät im Zweifel angesteuert; `nur_pruefen` zeigt das als „Rolle nicht lesbar“.
+
+Zu jedem Master braucht das Skript beide Auswahl-Entitäten der Bridge, *Mode* und *Fan Speed*. Es erkennt sie an ihren Optionen, nicht am Namen. Die Liste von *Fan Speed* enthält neben Low, Medium und High auch die Stufen Night und Turbo, die ein Gerät von selbst wählt (z. B. im SMART-Betrieb) und die nur angezeigt, nicht gesetzt werden können. Die Fassung vom 5. Oktober 2026 verlangte genau drei Einträge, fand die Stufen-Entität deshalb nie und setzte stillschweigend nur den Modus; die Stufe blieb dem Gerät überlassen – und die Bridge bis 1.4.28 schickte dann die Stufe aus dem Cloud-Status zurück, was die Cloud ablehnte, wenn das Gerät gerade auf Turbo stand (eine Stufe, die die Bridge bis dahin nicht kannte). Fehlt die Stufen-Entität, schaltet das Skript jetzt nichts und meldet sich; `nur_pruefen` zeigt zu jedem Master beide Entitäten und nennt die Slaves.
 
 ## Selbstheilung: automatischer Neustart über eine Steckdose
 
