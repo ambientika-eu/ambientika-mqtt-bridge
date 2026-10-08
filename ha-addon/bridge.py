@@ -78,6 +78,19 @@ _BRIDGE_VERSION = os.environ.get("BRIDGE_VERSION", "").strip()
 # way). Overridable in tests.
 FILTER_RESET_VERIFY_DELAY = 12.0
 
+# Slave filter acknowledgement (SLAVE_FILTER_SOFT_RESET): the device itself must
+# report "Good" this many polls in a row before an acknowledgement is dropped as
+# no longer needed. A single odd poll must never end it.
+FILTER_ACK_CLEAR_POLLS = 10
+_FILTER_ACK_GOOD_STREAK: dict = {}   # serial -> consecutive "Good" polls
+_FILTER_ACK_ODD_RAW: dict = {}       # serial -> last unrecognised raw value logged
+
+# Operating-mode check after a command: the cloud answers change-mode with
+# HTTP 200 as soon as it has accepted the call, not when the unit has applied
+# it. The bridge watches the following polls and warns if the unit still
+# reports a different mode after this many seconds. Overridable in tests.
+MODE_VERIFY_WINDOW_S = 180.0
+
 # Filter reset (device + zone Master).
 # The official cloud API documents exactly one filter reset:
 # GET /Device/reset-filter?deviceSerialNumber=... ("Sends the reset filter
@@ -2282,6 +2295,59 @@ class AmbientikaBridge:
         # a command that does not name that attribute falls back to this value
         # instead of echoing the read-only one (-> HTTP 500 "unsigned byte").
         self._last_sendable: dict = {}
+        # serial -> (sent OperatingMode, monotonic time sent). Filled after a
+        # change_mode the cloud accepted; the poll loop confirms or warns
+        # (see MODE_VERIFY_WINDOW_S and _check_mode_applied).
+        self._mode_expect: dict = {}
+
+    # ----- operating-mode check after a command -----
+    def _check_mode_applied(self, serial: str, device, reported) -> None:
+        """Compare a polled operating mode with the last commanded one.
+
+        Logs "confirmed" as soon as the unit reports the sent mode, and a
+        warning if it still reports something else after MODE_VERIFY_WINDOW_S.
+        A unit taken over by NeuraCell-X protection is not judged here: the
+        protection mode is expected to differ from the user's command. Only the
+        reported operating_mode counts - last_operating_mode may still name the
+        sent mode from long before and would hide a command that never arrived.
+        """
+        exp = self._mode_expect.get(serial)
+        if exp is None:
+            return
+        sent, t_sent = exp
+        if reported == sent:
+            self._mode_expect.pop(serial, None)
+            log.info("operating mode %s confirmed on %s", sent.name, serial)
+            return
+        try:
+            if self.neuracell._device_under_control(serial, device):
+                self._mode_expect.pop(serial, None)
+                return
+        except Exception:
+            pass
+        waited = time.monotonic() - t_sent
+        if waited < MODE_VERIFY_WINDOW_S:
+            return
+        self._mode_expect.pop(serial, None)
+        rep_name = getattr(reported, "name", str(reported))
+        master = self._zone_master(device)
+        if master is not None:
+            log.warning(
+                "operating mode for %s: %s was sent and accepted by the cloud, but the "
+                "unit still reports %s after %d s. This unit is a SLAVE in zone %s - "
+                "a Slave takes its operating mode from the zone Master %s over the "
+                "local WLAN. Set the mode on the Master. If a Slave keeps a different "
+                "mode than its Master, its link to the Master is interrupted "
+                "(check 2.4 GHz WLAN on all access points and that WLAN devices may "
+                "talk to each other).",
+                serial, sent.name, rep_name, int(waited),
+                getattr(device, "zone_index", "?"), master.serial_number)
+        else:
+            log.warning(
+                "operating mode for %s: %s was sent and accepted by the cloud, but the "
+                "unit still reports %s after %d s. The cloud confirms the call, not its "
+                "execution on the unit - the command has not been applied.",
+                serial, sent.name, rep_name, int(waited))
 
     # ----- values the cloud accepts back -----
     _CMD_ENUMS = {
@@ -2680,10 +2746,28 @@ class AmbientikaBridge:
         data = cls._filter_ack_load()
         data[serial] = {"acked_at": time.time(), "raw_when_acked": str(raw_status)}
         cls._filter_ack_save(data)
+        _FILTER_ACK_GOOD_STREAK.pop(serial, None)
+        _FILTER_ACK_ODD_RAW.pop(serial, None)
+
+    @classmethod
+    def _filter_ack_drop(cls, data: dict, serial: str, why: str) -> None:
+        data.pop(serial, None)
+        cls._filter_ack_save(data)
+        _FILTER_ACK_GOOD_STREAK.pop(serial, None)
+        _FILTER_ACK_ODD_RAW.pop(serial, None)
+        log.info("filter acknowledgement for %s removed: %s", serial, why)
 
     @classmethod
     def _filter_ack_effective(cls, serial: str, raw_status):
-        """Roh, ausser eine gueltige Quittung ueberschreibt einen weiter faelligen Slave -> 'Good'."""
+        """Roh, ausser eine gueltige Quittung ueberschreibt einen weiter faelligen Slave -> 'Good'.
+
+        Die Quittung endet nur aus zwei Gruenden, und beide stehen im Log:
+          * die Frist FILTER_ACK_TTL_DAYS ist abgelaufen, oder
+          * das Geraet meldet selbst FILTER_ACK_CLEAR_POLLS Abrufe in Folge
+            "Good" (Filter direkt am Geraet zurueckgesetzt).
+        Ein einzelner unbekannter oder kurz gruener Rohwert loescht sie nicht
+        mehr - frueher genuegte dafuer ein einziger Abruf, ohne Logeintrag.
+        """
         if not cls._soft_reset_enabled():
             return raw_status
         import time
@@ -2691,12 +2775,40 @@ class AmbientikaBridge:
         rec = data.get(serial)
         if not rec:
             return raw_status
-        if time.time() - float(rec.get("acked_at", 0)) > cls._filter_ack_ttl():
-            data.pop(serial, None); cls._filter_ack_save(data); return raw_status
-        # Faellig ist alles ueber "Good" - also Gelb wie Rot. Unbekannte Werte
-        # gelten als nicht faellig, dann wird die Quittung aufgeraeumt.
-        if (filter_status_to_num(raw_status) or 0) <= 0:
-            data.pop(serial, None); cls._filter_ack_save(data); return raw_status
+        try:
+            acked_at = float(rec.get("acked_at", 0))
+        except Exception:
+            acked_at = 0.0
+        age = time.time() - acked_at
+        if age > cls._filter_ack_ttl():
+            cls._filter_ack_drop(
+                data, serial,
+                "validity of %s days ran out (set %.0f days ago) - showing the device "
+                "value %r again" % (os.environ.get("FILTER_ACK_TTL_DAYS", "90"),
+                                   age / 86400.0, raw_status))
+            return raw_status
+        num = filter_status_to_num(raw_status)
+        if num is None:
+            # Unbekannter Rohwert: sagt nichts ueber den Filter. Quittung bleibt,
+            # einmal je neuem Wert ins Log.
+            _FILTER_ACK_GOOD_STREAK.pop(serial, None)
+            if _FILTER_ACK_ODD_RAW.get(serial) != str(raw_status):
+                _FILTER_ACK_ODD_RAW[serial] = str(raw_status)
+                log.info("filter acknowledgement for %s kept: the device reported an "
+                         "unrecognised filter value %r", serial, raw_status)
+            return "Good"
+        _FILTER_ACK_ODD_RAW.pop(serial, None)
+        if num <= 0:
+            streak = _FILTER_ACK_GOOD_STREAK.get(serial, 0) + 1
+            _FILTER_ACK_GOOD_STREAK[serial] = streak
+            if streak >= FILTER_ACK_CLEAR_POLLS:
+                cls._filter_ack_drop(
+                    data, serial,
+                    "the device itself has reported %r for %d polls in a row - the "
+                    "acknowledgement is no longer needed" % (raw_status, streak))
+            return raw_status
+        # Faellig (Gelb oder Rot): die Quittung gilt.
+        _FILTER_ACK_GOOD_STREAK.pop(serial, None)
         return "Good"
 
 
@@ -3210,8 +3322,11 @@ class AmbientikaBridge:
         if isinstance(res, Failure):
             log.error("change_mode failed for %s: %s", serial, res)
         else:
-            log.info("change_mode OK for %s", serial)
+            log.info("change_mode OK for %s (accepted by the cloud)", serial)
             self._last_sendable.setdefault(serial, {}).update(mode)
+            if "operating_mode" in parsed:
+                # HTTP 200 means accepted, not applied: check on the next polls.
+                self._mode_expect[serial] = (op, time.monotonic())
             # The user's own command is now the reference, not the last restore.
             nc._recent_restore.pop(serial, None)
             if pending_base is not None and not nc._device_under_control(serial, device):
@@ -3394,6 +3509,7 @@ class AmbientikaBridge:
                             and not is_compat_member(LightSensorLevel, s["light_sensor_level"])):
                         self._last_light[serial] = s["light_sensor_level"]
                     self._remember_sendable(serial, s)
+                    self._check_mode_applied(serial, device, s["operating_mode"])
                     # Filterstatus einmal aufloesen: der effektive Wert (mit
                     # Wartungsquittung) steht in den Hauptfeldern, der rohe
                     # Geraetewert daneben in den *_raw-Feldern. Ohne aktive

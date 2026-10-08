@@ -84,6 +84,26 @@ serviced unit then reads green, while the unchanged device value stays visible:
 The diagnostic sensor *Filter Reset Status* reports `confirmed` (the counter
 really cleared), `acknowledged` (recorded by the bridge) or `unconfirmed`.
 
+An acknowledgement ends for exactly two reasons, and both are written to the log:
+`filter_ack_ttl_days` has run out, or the unit itself reports `Good` for ten polls
+in a row (its filter was reset at the device). A single poll with an unknown or
+briefly green value no longer removes it. Up to 1.4.29 one such poll was enough,
+silently, so an acknowledgement could vanish long before its time.
+
+## Mode changes on Master/Slave groups
+
+The cloud answers a mode change with OK as soon as it has accepted the call, not
+when the unit has carried it out. The log line `change_mode OK ... (accepted by
+the cloud)` therefore only says that much. The bridge then watches the following
+polls: `operating mode ... confirmed` means the unit has really switched. If it
+still reports a different mode after three minutes, a warning says so.
+
+In a coupled zone a Slave takes its mode from the **Master** over the local WLAN,
+so set the mode on the Master. If a Slave keeps a different mode than its Master,
+its link to the Master is interrupted; the warning for a Slave names its Master
+and what to check (2.4 GHz on every access point, WLAN devices allowed to talk to
+each other).
+
 ## What SMART is currently doing
 
 The `Mode` control shows the macro mode you selected. In `Smart` and `Auto` it

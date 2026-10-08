@@ -1892,6 +1892,197 @@ async def test_controller_direct():
           and not bridge._topic_match("dew-point/+/state", "dew-point/TP_X/availability/state"))
 
 
+class _LogCatch:
+    """Sammelt die Logzeilen der Bridge fuer eine Pruefung."""
+
+    def __init__(self):
+        import logging
+        self.lines = []
+        self._h = logging.Handler()
+        self._h.emit = lambda r: self.lines.append((r.levelname, r.getMessage()))
+        self._lg = logging.getLogger("ambientika_bridge")
+
+    def __enter__(self):
+        self._old = self._lg.level
+        self._lg.setLevel(10)
+        self._lg.addHandler(self._h)
+        return self
+
+    def __exit__(self, *a):
+        self._lg.removeHandler(self._h)
+        self._lg.setLevel(self._old)
+
+    def has(self, level, text):
+        return any(lv == level and text in m for lv, m in self.lines)
+
+
+def test_filter_ack_robust():
+    """Wartungsquittung (Kundenfall Okt. 2026): nach 43 statt 90 Tagen weg, ohne Log.
+
+    Ursache: ein einziger Abruf mit unbekanntem oder gruenem Rohwert loeschte die
+    Quittung endgueltig und still. Jetzt endet sie nur nach Ablauf der Frist oder
+    nach FILTER_ACK_CLEAR_POLLS gruenen Abrufen in Folge - beides mit Logzeile.
+    """
+    import time as _t
+    AB = bridge.AmbientikaBridge
+    old_env = {k: os.environ.get(k) for k in ("SLAVE_FILTER_SOFT_RESET", "FILTER_ACK_PATH", "FILTER_ACK_TTL_DAYS")}
+    os.environ["SLAVE_FILTER_SOFT_RESET"] = "1"
+    os.environ["FILTER_ACK_PATH"] = os.path.join(_tempfile.mkdtemp(), "filter_ack.json")
+    os.environ["FILTER_ACK_TTL_DAYS"] = "90"
+    try:
+        S = "E05A1B9BAF0C"
+        AB._filter_ack_write(S, "Bad")
+        check("ack: Bad -> effektiv Good", AB._filter_ack_effective(S, "Bad") == "Good")
+        check("ack: Medium -> effektiv Good", AB._filter_ack_effective(S, "Medium") == "Good")
+
+        # A) einzelner unbekannter Rohwert (null, leer, neuer Text) loescht nicht mehr
+        with _LogCatch() as lc:
+            for odd in (None, "", "Unknown"):
+                check("ack: unbekannter Rohwert %r -> Quittung bleibt (Good)" % (odd,),
+                      AB._filter_ack_effective(S, odd) == "Good")
+            check("ack: unbekannter Rohwert steht im Log", lc.has("INFO", "unrecognised filter value"), lc.lines)
+            n_before = len(lc.lines)
+            AB._filter_ack_effective(S, "Unknown")
+            check("ack: gleicher unbekannter Wert nicht jedes Mal geloggt", len(lc.lines) == n_before, lc.lines)
+        check("ack: nach unbekannten Werten weiter gespeichert", S in AB._filter_ack_load())
+        check("ack: danach Bad -> weiter Good", AB._filter_ack_effective(S, "Bad") == "Good")
+
+        # B) kurz gruener Rohwert (unter der Schwelle) loescht nicht
+        for _ in range(bridge.FILTER_ACK_CLEAR_POLLS - 1):
+            AB._filter_ack_effective(S, "Good")
+        check("ack: %d x Good in Folge -> Quittung bleibt" % (bridge.FILTER_ACK_CLEAR_POLLS - 1),
+              S in AB._filter_ack_load())
+        check("ack: Bad nach kurzem Good -> wieder quittiert", AB._filter_ack_effective(S, "Bad") == "Good")
+        check("ack: Bad setzt die Good-Serie zurueck", S not in bridge._FILTER_ACK_GOOD_STREAK)
+        for _ in range(bridge.FILTER_ACK_CLEAR_POLLS - 1):
+            AB._filter_ack_effective(S, "Good")
+        check("ack: Serie nach Unterbrechung neu gezaehlt -> bleibt", S in AB._filter_ack_load())
+
+        # C) dauerhaft gruen (Filter direkt am Geraet zurueckgesetzt) -> geloescht, mit Log
+        with _LogCatch() as lc:
+            r = AB._filter_ack_effective(S, "Good")
+            check("ack: %d. Good in Folge -> Rohwert Good" % bridge.FILTER_ACK_CLEAR_POLLS, r == "Good")
+            check("ack: dauerhaft Good -> Quittung entfernt", S not in AB._filter_ack_load())
+            check("ack: Entfernen wegen Good steht im Log",
+                  lc.has("INFO", "removed") and lc.has("INFO", "polls in a row"), lc.lines)
+        check("ack: ohne Quittung zeigt Bad wieder Bad", AB._filter_ack_effective(S, "Bad") == "Bad")
+
+        # D) Frist: 43 Tage alt -> gilt noch; 91 Tage alt -> entfernt, mit Log
+        AB._filter_ack_write(S, "Bad")
+        data = AB._filter_ack_load()
+        data[S]["acked_at"] = _t.time() - 43 * 86400
+        AB._filter_ack_save(data)
+        check("ack: nach 43 Tagen (TTL 90) noch gueltig", AB._filter_ack_effective(S, "Bad") == "Good")
+        data = AB._filter_ack_load()
+        data[S]["acked_at"] = _t.time() - 91 * 86400
+        AB._filter_ack_save(data)
+        with _LogCatch() as lc:
+            check("ack: nach 91 Tagen Rohwert Bad", AB._filter_ack_effective(S, "Bad") == "Bad")
+            check("ack: Ablauf steht im Log", lc.has("INFO", "ran out"), lc.lines)
+        check("ack: nach Ablauf entfernt", S not in AB._filter_ack_load())
+
+        # E) kaputtes acked_at crasht nicht, gilt als abgelaufen
+        AB._filter_ack_write(S, "Bad")
+        data = AB._filter_ack_load()
+        data[S]["acked_at"] = "kaputt"
+        AB._filter_ack_save(data)
+        check("ack: kaputtes acked_at -> kein Crash, Rohwert", AB._filter_ack_effective(S, "Bad") == "Bad")
+
+        # F) ohne Option bleibt alles roh
+        os.environ["SLAVE_FILTER_SOFT_RESET"] = "0"
+        check("ack: Option aus -> Rohwert", AB._filter_ack_effective(S, "Bad") == "Bad")
+    finally:
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        bridge._FILTER_ACK_GOOD_STREAK.clear()
+        bridge._FILTER_ACK_ODD_RAW.clear()
+
+
+class _IgnoringDevice(FakeDevice):
+    """Cloud nimmt change-mode an (HTTP 200), das Geraet uebernimmt den Modus nicht."""
+
+    async def change_mode(self, mode):
+        self.mode_calls.append(mode)
+        return Success(None)
+
+
+async def test_mode_verify():
+    """change_mode OK heisst nur angenommen: Bridge prueft den Modus nach (Kundenfall Okt. 2026)."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.enable_discovery = False
+    b = bridge.AmbientikaBridge(cfg)
+    b.client = FakeClient()
+    b.loop = asyncio.get_running_loop()
+    master = FakeDevice(serial="FLUR", name="Flur", zone=0, status=mkstatus(op=OM.Smart))
+    master.role = "Master"
+    ok = FakeDevice(serial="KIZI", name="Kinderzimmer", zone=0, status=mkstatus(op=OM.Surveillance))
+    stuck = _IgnoringDevice(serial="GBAD", name="Gaeste-Bad", zone=0, status=mkstatus(op=OM.Surveillance))
+    solo = _IgnoringDevice(serial="SOLO", name="Einzel", zone=5, status=mkstatus(op=OM.Auto))
+    solo.role = "Master"
+    b.devices = {d.serial_number: d for d in (master, ok, stuck, solo)}
+
+    alt = bridge.MODE_VERIFY_WINDOW_S
+    bridge.MODE_VERIFY_WINDOW_S = 0.25
+    try:
+        with _LogCatch() as lc:
+            for s in ("KIZI", "GBAD", "SOLO"):
+                await b._handle_command(s, "operating_mode", "Smart")
+            check("mode: OK-Zeile sagt 'accepted by the cloud'",
+                  lc.has("INFO", "change_mode OK for GBAD (accepted by the cloud)"), lc.lines)
+            check("mode: drei Erwartungen offen", set(b._mode_expect) == {"KIZI", "GBAD", "SOLO"}, b._mode_expect)
+
+            # erster Poll: Kinderzimmer bestaetigt, die anderen noch im Fenster -> keine Warnung
+            for s, d in b.devices.items():
+                b._check_mode_applied(s, d, d._status["operating_mode"])
+            check("mode: uebernommener Modus wird bestaetigt", lc.has("INFO", "operating mode Smart confirmed on KIZI"), lc.lines)
+            check("mode: im Fenster noch keine Warnung", not any(lv == "WARNING" for lv, _ in lc.lines), lc.lines)
+            check("mode: Master ohne Befehl wird nicht geprueft", "FLUR" not in b._mode_expect)
+
+            await asyncio.sleep(0.3)
+            # echter Poll-Pfad: ein Durchlauf von _poll_loop nach Fensterende
+            b._stop_event = asyncio.Event()
+            task = asyncio.create_task(b._poll_loop())
+            await asyncio.sleep(0.3)
+            b._stop_event.set()
+            await task
+            warn_slave = [m for lv, m in lc.lines if lv == "WARNING" and "GBAD" in m]
+            check("mode: Slave ohne Uebernahme -> Warnung", len(warn_slave) == 1, lc.lines)
+            check("mode: Warnung nennt Ist-Modus und Master",
+                  warn_slave and "still reports Surveillance" in warn_slave[0] and "FLUR" in warn_slave[0]
+                  and "SLAVE" in warn_slave[0], warn_slave)
+            warn_solo = [m for lv, m in lc.lines if lv == "WARNING" and "SOLO" in m]
+            check("mode: Einzelgeraet ohne Uebernahme -> Warnung ohne Slave-Hinweis",
+                  len(warn_solo) == 1 and "SLAVE" not in warn_solo[0] and "has not been applied" in warn_solo[0], warn_solo)
+            check("mode: Warnung nur einmal, danach nichts offen", not b._mode_expect, b._mode_expect)
+            check("mode: kein Warn-Eintrag fuer das Kinderzimmer",
+                  not any(lv == "WARNING" and "KIZI" in m for lv, m in lc.lines))
+
+        # Lueefterstufe allein: kein Moduswechsel verlangt -> keine Pruefung
+        b._mode_expect.clear()
+        await b._handle_command("SOLO", "fan_speed", "High")
+        check("mode: Befehl ohne Modus legt keine Pruefung an", "SOLO" not in b._mode_expect, b._mode_expect)
+
+        # NeuraCell-X uebernimmt das Geraet -> nicht als Fehler werten
+        await b._handle_command("GBAD", "operating_mode", "Smart")
+        orig = b.neuracell._device_under_control
+        b.neuracell._device_under_control = lambda s, d=None: s == "GBAD"
+        try:
+            await asyncio.sleep(0.3)
+            with _LogCatch() as lc:
+                b._check_mode_applied("GBAD", stuck, OM.Intake)
+                check("mode: unter NeuraCell-X-Schutz keine Warnung",
+                      not any(lv == "WARNING" for lv, _ in lc.lines) and "GBAD" not in b._mode_expect, lc.lines)
+        finally:
+            b.neuracell._device_under_control = orig
+    finally:
+        bridge.MODE_VERIFY_WINDOW_S = alt
+
+
 async def _async_suite():
     await test_neuracell()
     await test_neuracell_scoped()
@@ -1904,6 +2095,7 @@ async def _async_suite():
     await test_command()
     await test_command_coalescing()
     await test_readonly_values()
+    await test_mode_verify()
 
 
 def main():
@@ -1911,6 +2103,7 @@ def main():
     test_discovery()
     test_dewpoint()
     test_config()
+    test_filter_ack_robust()
     asyncio.run(_async_suite())
     print("\nRESULT:", "ALL PASS" if not FAILS else f"{len(FAILS)} FAIL -> {FAILS}")
     return 1 if FAILS else 0
