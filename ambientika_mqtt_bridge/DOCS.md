@@ -82,7 +82,8 @@ serviced unit then reads green, while the unchanged device value stays visible:
 | `filters_status_raw` / `filter_status_raw_num` | raw device value |
 
 The diagnostic sensor *Filter Reset Status* reports `confirmed` (the counter
-really cleared), `acknowledged` (recorded by the bridge) or `unconfirmed`.
+really cleared), `acknowledged` (recorded by the bridge) or `unconfirmed`. The
+acknowledged value is published right away, together with its log line.
 
 An acknowledgement ends for exactly two reasons, and both are written to the log:
 `filter_ack_ttl_days` has run out, or the unit itself reports `Good` for at least
@@ -99,17 +100,47 @@ the cloud)` therefore only says that much. The bridge then watches the following
 polls: `operating mode ... confirmed` means the unit has really switched. If it
 still reports a different mode after three minutes, a warning says so.
 
-In a coupled zone a Slave takes its mode from the **Master** over the local WLAN,
-so set the mode on the Master. If a Slave keeps a different mode than its Master,
-its link to the Master is interrupted; the warning for a Slave names its Master
-and what to check (2.4 GHz on every access point, WLAN devices allowed to talk to
-each other).
+In a coupled zone a Slave runs with its **Master**, so set the mode on the
+Master. A Slave's own mode field is not what it is doing: a Slave can report
+`Surveillance` and still ventilate in the Master's rhythm. Like the Ambientika app,
+which shows only the Master for a zone, the `Mode` of a Slave therefore shows its
+Master's mode; the unit's own value is in `Mode raw`:
+
+| Field | Content |
+|---|---|
+| `operating_mode` / `operating_mode_num` | effective mode (the Master's for a Slave) |
+| `operating_mode_raw` / `operating_mode_raw_num` | the unit's own value |
+
+While NeuraCell-X protection controls a unit, or if its Master has not been read
+for a while, the unit's own value is shown. Which unit is a Slave and which its
+Master is taken from the role each unit reports in its own status, so re-coupling
+or resetting units in the app is followed without restarting the add-on. The log
+notes once per change when a Slave's own value differs from what is shown.
+
+For automations this means: a Slave's `Mode` / `Mode (num)` now follow the
+Master. Selecting a mode on a Slave's `Mode` control still sends the command to
+that unit, but the control shows the Master's mode again on the next poll - set
+the mode on the Master instead.
+
+## Implausible readings
+
+Temperature and humidity outside the sensor range are never published (humidity
+1-100 %, temperature -40 to 85 °C). A single impossible drop such as 6 % humidity
+between 55 and 70 % is held back as well: below 20 % a value is published only if
+dry air was already measured shortly before (among the last three readings, or a
+published dry reading within the last hour). Rises, shower peaks and the normal
+reversing rhythm are never held back; in dry winter air only the first dry
+reading after a long humid stretch is delayed by one reading. Reading the same
+status packet again within two minutes (the cloud keeps the unit's last packet)
+does not count as a new reading. Meanwhile the last plausible value stays, for at most ten minutes, then
+the value shows as unknown - a failed sensor never looks live. Both events are
+written to the log once, at most once an hour for a flapping sensor.
 
 ## What SMART is currently doing
 
-The `Mode` control shows the macro mode you selected. In `Smart` and `Auto` it
-stays on that value even though the unit switches between concrete functions on
-its own. The read-only sensor **Active Operating Mode (SMART)** shows the
+The `Mode` control shows the macro mode you selected (for a Slave: the one
+selected on its Master). In `Smart` and `Auto` it stays on that value even
+though the unit switches between concrete functions on its own. The read-only sensor **Active Operating Mode (SMART)** shows the
 function actually running, and **Fan Speed** shows the real speed.
 
 **Fan Speed** can show `Night` or `Turbo`: the unit chose that step itself. You

@@ -94,6 +94,46 @@ _FILTER_ACK_ODD_RAW: dict = {}       # serial -> last unrecognised raw value log
 # reports a different mode after this many seconds. Overridable in tests.
 MODE_VERIFY_WINDOW_S = 180.0
 
+# A coupled Slave runs with its zone Master; its own operating-mode field is not
+# what it is doing (a Slave reporting "Surveillance" ventilates in the Master's
+# rhythm). Like the app, the bridge therefore shows the Master's mode for a Slave
+# and keeps the Slave's own field in operating_mode_raw. The Master's mode is used
+# only if the Master was read within this many seconds; otherwise, and while
+# NeuraCell-X protection controls the unit, the Slave's own value is shown.
+MASTER_MODE_MAX_AGE_S = 300.0
+
+# Plausibility of the two measured values. A unit occasionally reports a single
+# impossible reading (e.g. 6 % relative humidity between 55 and 70 %); published,
+# it would distort the long-term minima for good. Two rules:
+#  * hard limits - values outside are never published (sensor range, generous so
+#    that very cold or very dry air in the airflow is never cut off);
+#  * a humidity reading below HUMIDITY_LOW_SUSPECT is published only if dry air
+#    (below HUMIDITY_LOW_CONFIRM) was already seen: among the previous
+#    HUMIDITY_LOW_READINGS readings (a held-back one counts), or a published dry
+#    reading within HUMIDITY_LOW_WINDOW_S (one hour, at least six poll
+#    intervals). Also right after start. A lone drop to 6 % between 55 and 70 %
+#    is held back; genuinely dry air - in the reversing rhythm the dry outdoor
+#    phase returns every minute or two - is confirmed by its own next dry
+#    reading, so in dry winter air only the first dry reading after a long humid
+#    stretch is delayed. Readings at or above HUMIDITY_LOW_SUSPECT, i.e. rises,
+#    peaks and the normal rhythm, are never held back. A repeat of the same
+#    status packet (cloud cache read more often than the unit uploads) never
+#    counts as a new reading.
+# Meanwhile the last plausible value is published, for at most PLAUSIBLE_HOLD_S;
+# after that the value is published as unknown, so a dead sensor never looks live.
+HUMIDITY_PLAUSIBLE = (1, 100)
+TEMPERATURE_PLAUSIBLE = (-40, 85)
+HUMIDITY_LOW_SUSPECT = 20
+HUMIDITY_LOW_CONFIRM = 25
+HUMIDITY_LOW_READINGS = 3
+HUMIDITY_LOW_WINDOW_S = 3600.0
+PLAUSIBLE_HOLD_S = 600.0
+# A status identical to the previous poll's is the same cached packet - unless it
+# has been the same for longer than this: a unit standing still reports the same
+# values for real, and such a reading must still count (e.g. to confirm a held-
+# back dry value). Longer than the unit's upload rhythm of about half a minute.
+DUPLICATE_PACKET_MAX_S = 120.0
+
 # Filter reset (device + zone Master).
 # The official cloud API documents exactly one filter reset:
 # GET /Device/reset-filter?deviceSerialNumber=... ("Sends the reset filter
@@ -1018,6 +1058,7 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
         ("filters_status", "Filter Status", None, None, "mdi:air-filter"),
         ("filters_status_raw", "Filter Status raw", None, None, "mdi:air-filter"),
         ("operating_mode", "Mode", None, None, "mdi:fan"),
+        ("operating_mode_raw", "Mode raw", None, None, "mdi:fan"),
         ("fan_speed", "Fan Speed", None, None, "mdi:speedometer"),
         ("humidity_level", "Humidity Level", None, None, "mdi:water-percent"),
         ("light_sensor_level", "Light Sensor Level", None, None, "mdi:brightness-5"),
@@ -1058,6 +1099,7 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
         ("filter_status_num", "Filter Status (num)"),
         ("filter_status_raw_num", "Filter Status raw (num)"),
         ("operating_mode_num", "Mode (num)"),
+        ("operating_mode_raw_num", "Mode raw (num)"),
         ("last_operating_mode_num", "Last Mode (num)"),
         ("fan_speed_num", "Fan Speed (num)"),
         ("humidity_level_num", "Humidity Level (num)"),
@@ -2302,6 +2344,196 @@ class AmbientikaBridge:
         # change_mode the cloud accepted; the poll loop confirms or warns
         # (see MODE_VERIFY_WINDOW_S and _check_mode_applied).
         self._mode_expect: dict = {}
+        # serial -> (own OperatingMode, monotonic time read) from the last poll;
+        # a Slave is shown with its zone Master's entry (see _shown_mode).
+        self._last_mode: dict = {}
+        # serial -> (own, shown) pair last logged, so a Slave shown with its
+        # Master's mode is logged once per change, not on every poll.
+        self._mode_note: dict = {}
+        # serial -> {"temperature": v, "humidity": v}, last plausible readings.
+        self._last_plausible: dict = {}
+        # serial -> house id from discovery; zone_index is unique only per house.
+        self._device_house: dict = {}
+        # serial -> role string the unit itself reported in its last status.
+        self._live_role: dict = {}
+        # serial -> (last status dict, monotonic time first seen). The cloud hands
+        # out the unit's last status packet; with a poll interval shorter than
+        # the unit's upload rhythm the same packet is read several times, and a
+        # repeat must not count as a new reading (see _plausible).
+        self._last_status: dict = {}
+
+    # ----- values shown for a unit -----
+    def _shown_mode(self, serial: str, device, own):
+        """Operating mode to publish: the zone Master's for a coupled Slave.
+
+        A Slave runs with its Master; its own field is published separately as
+        operating_mode_raw. Falls back to the unit's own value when it is not a
+        Slave, when NeuraCell-X protection controls it, or when the Master has not
+        been read within MASTER_MODE_MAX_AGE_S.
+        """
+        master = self._zone_master(device)
+        if master is None:
+            return own
+        try:
+            if self.neuracell._device_under_control(serial, device):
+                return own
+        except Exception:
+            return own
+        rec = self._last_mode.get(master.serial_number)
+        try:
+            interval = float(self.cfg.poll_interval)
+        except (TypeError, ValueError):
+            interval = 0.0
+        max_age = max(MASTER_MODE_MAX_AGE_S, 2 * interval + 60)
+        if rec is None or time.monotonic() - rec[1] > max_age:
+            return own
+        shown = rec[0]
+        note = (getattr(own, "name", str(own)), getattr(shown, "name", str(shown)))
+        if note[0] != note[1] and self._mode_note.get(serial) != note:
+            self._mode_note[serial] = note
+            log.info("operating mode of %s: the unit reports %s, shown as %s - it is a SLAVE "
+                     "and runs with its zone Master %s (own value in operating_mode_raw)",
+                     serial, note[0], note[1], master.serial_number)
+        return shown
+
+    def _plausible(self, serial: str, key: str, value, fresh: bool = True):
+        """Return the value to publish for a measured value (see HUMIDITY_PLAUSIBLE).
+
+        `fresh` is False when the status is the same packet as on the previous
+        poll: the decision of that poll is repeated and nothing is counted again,
+        so a held-back reading cannot confirm itself just because the cloud hands
+        out the same packet two or three times.
+        Logged once when values start being held back and once when a plausible
+        value arrives again - never on every poll, and at most once an hour per
+        value for a flapping sensor.
+        """
+        if value is None:
+            return None
+        st = self._last_plausible.setdefault(serial, {}).setdefault(
+            key, {"last": None, "t": 0.0, "bad": 0, "dry": [], "dry_t": None, "gone": False,
+                  "out": None, "log_t": None, "loud": True})
+        now = time.monotonic()
+        # A flapping sensor (0 % / 55 % / 0 % ...) would otherwise write two lines
+        # per flap: the first episode within an hour is logged at INFO (its start
+        # and its end), the following ones at DEBUG.
+        if st["bad"] == 0:
+            st["loud"] = st["log_t"] is None or now - st["log_t"] >= 3600.0
+        note = log.info if st["loud"] else log.debug
+        expired = st["last"] is not None and now - st["t"] > PLAUSIBLE_HOLD_S
+        if not fresh and st["out"] is not None and st["out"][1] == value:
+            # Same packet as last time: repeat the decision. Only the hold time
+            # still runs out, so a unit stuck on one packet never looks live.
+            if st["bad"] == 0 or not expired:
+                return st["out"][0]
+            if not st["gone"]:
+                note("%s of %s: no plausible value for %.0f min - published as unknown",
+                     key, serial, PLAUSIBLE_HOLD_S / 60.0)
+            st["gone"] = True
+            st["out"] = (None, value)
+            return None
+        lo, hi = HUMIDITY_PLAUSIBLE if key == "humidity" else TEMPERATURE_PLAUSIBLE
+        try:
+            v = None if isinstance(value, bool) else float(value)
+        except (TypeError, ValueError):
+            v = None
+        ok = v is not None and v == v and lo <= v <= hi        # v == v: not NaN
+        why = "outside %s..%s" % (lo, hi)
+        if ok and key == "humidity":
+            dry = st["dry"]                        # last readings: below CONFIRM?
+            try:
+                window = max(HUMIDITY_LOW_WINDOW_S, 6 * float(self.cfg.poll_interval))
+            except (TypeError, ValueError):
+                window = HUMIDITY_LOW_WINDOW_S
+            seen_dry = any(dry) or (st["dry_t"] is not None and now - st["dry_t"] <= window)
+            if v < HUMIDITY_LOW_SUSPECT and not seen_dry:
+                ok = False
+                why = "below %s %% without dry air in the last %d readings or %.0f min" % (
+                    HUMIDITY_LOW_SUSPECT, HUMIDITY_LOW_READINGS, window / 60.0)
+            # A held-back dry reading confirms only the next few readings (dry
+            # air recurs within a minute or two); the long window is kept alive
+            # by published dry readings alone, so two lone outliers an hour apart
+            # do not confirm each other.
+            dry.append(v < HUMIDITY_LOW_CONFIRM)
+            del dry[:-HUMIDITY_LOW_READINGS]
+            if ok and v < HUMIDITY_LOW_CONFIRM:
+                st["dry_t"] = now
+        if ok:
+            if st["bad"]:
+                note("%s of %s plausible again (%r) after %d held-back value(s)",
+                     key, serial, value, st["bad"])
+            st.update(last=value, t=now, bad=0, gone=False, out=(value, value))
+            return value
+        if st["bad"] == 0:
+            note("%s %r from %s held back (%s) - publishing the last plausible value "
+                 "%r meanwhile", key, value, serial, why, st["last"])
+            if st["loud"]:
+                st["log_t"] = now
+        st["bad"] += 1
+        if st["last"] is not None and not expired:
+            st["out"] = (st["last"], value)
+            return st["last"]
+        if not st["gone"] and st["last"] is not None:
+            note("%s of %s: no plausible value for %.0f min - published as unknown",
+                 key, serial, PLAUSIBLE_HOLD_S / 60.0)
+        st["gone"] = True
+        st["out"] = (None, value)
+        return None
+
+    def _state_payload(self, serial: str, device, s: dict) -> dict:
+        """Build the published state of one unit from its status.
+
+        Filter status and operating mode come as pairs: the main field carries the
+        effective value, the device's own value sits next to it in *_raw.
+        """
+        own = s["operating_mode"]
+        self._note_live_role(serial, s)
+        self._last_mode[serial] = (own, time.monotonic())
+        shown = self._shown_mode(serial, device, own)
+        fs_raw = s["filters_status"]
+        fs_eff = self._filter_ack_effective(serial, fs_raw)
+        now_m = time.monotonic()
+        try:
+            prev = self._last_status.get(serial)
+            fresh = prev is None or s != prev[0] or now_m - prev[1] > DUPLICATE_PACKET_MAX_S
+        except Exception:
+            fresh = True
+        if fresh:
+            self._last_status[serial] = (dict(s), now_m)
+        return {
+            "operating_mode": shown.name,
+            "operating_mode_raw": own.name,
+            "fan_speed": s["fan_speed"].name,
+            "humidity_level": s["humidity_level"].name,
+            "light_sensor_level": s["light_sensor_level"].name,
+            "temperature": self._plausible(serial, "temperature", s["temperature"], fresh),
+            "humidity": self._plausible(serial, "humidity", s["humidity"], fresh),
+            "air_quality": s["air_quality"],
+            "humidity_alarm": s["humidity_alarm"],
+            "filters_status": fs_eff,
+            "filters_status_raw": fs_raw,
+            "night_alarm": s["night_alarm"],
+            "device_role": s["device_role"],
+            "last_operating_mode": s["last_operating_mode"].name,
+            "zone_index": device.zone_index,
+            # --- numerische Begleitwerte (Zahl je Textwert) ---
+            "operating_mode_num": _enum_num(shown),
+            "operating_mode_raw_num": _enum_num(own),
+            "last_operating_mode_num": _enum_num(s["last_operating_mode"]),
+            "fan_speed_num": _fan_speed_num(s["fan_speed"]),
+            "humidity_level_num": _enum_num(s["humidity_level"]),
+            "light_sensor_level_num": _enum_num(s["light_sensor_level"]),
+            "air_quality_num": air_quality_to_num(s["air_quality"]),
+            "filter_status_num": filter_status_to_num(fs_eff),
+            "filter_status_raw_num": filter_status_to_num(fs_raw),
+        }
+
+    def _publish_state(self, serial: str, payload: dict) -> None:
+        if self.client is None:
+            return
+        self.client.publish(state_topic(self.cfg.topic_prefix, serial),
+                            json.dumps(payload), qos=0, retain=True)
+        self.client.publish(avail_topic(self.cfg.topic_prefix, serial),
+                            "online", qos=0, retain=True)
 
     # ----- operating-mode check after a command -----
     def _check_mode_applied(self, serial: str, device, reported) -> None:
@@ -2321,7 +2553,13 @@ class AmbientikaBridge:
         sent_name = getattr(sent, "name", str(sent))
         if reported == sent:
             self._mode_expect.pop(serial, None)
-            log.info("operating mode %s confirmed on %s", sent_name, serial)
+            master = self._zone_master(device)
+            if master is not None:
+                log.info("operating mode %s confirmed on %s (the unit's own field; it is a "
+                         "SLAVE and keeps running with its zone Master %s, whose mode "
+                         "stays the published one)", sent_name, serial, master.serial_number)
+            else:
+                log.info("operating mode %s confirmed on %s", sent_name, serial)
             return
         try:
             if self.neuracell._device_under_control(serial, device):
@@ -2342,11 +2580,8 @@ class AmbientikaBridge:
             log.warning(
                 "operating mode for %s: %s was sent and accepted by the cloud, but the "
                 "unit still reports %s after %s. This unit is a SLAVE in zone %s - "
-                "a Slave takes its operating mode from the zone Master %s over the "
-                "local WLAN. Set the mode on the Master. If a Slave keeps a different "
-                "mode than its Master, its link to the Master is interrupted "
-                "(check 2.4 GHz WLAN on all access points and that WLAN devices may "
-                "talk to each other).",
+                "a coupled Slave runs with its zone Master %s, its own mode field does "
+                "not decide how it ventilates. Set the mode on the Master.",
                 serial, sent_name, rep_name, since,
                 getattr(device, "zone_index", "?"),
                 getattr(master, "serial_number", "?"))
@@ -2480,23 +2715,49 @@ class AmbientikaBridge:
                         m, path, device.serial_number, e)
             return (None, None, None)
 
+    def _note_live_role(self, serial: str, status) -> None:
+        """Remember the role the unit itself reports (device_role in its status)."""
+        try:
+            role = (status or {}).get("device_role")
+        except Exception:
+            role = None
+        if role is not None:
+            self._live_role[serial] = str(getattr(role, "name", role))
+
+    def _role_of(self, device) -> str:
+        """Current role, lower-case: the unit's own report from the last status,
+        else the role from discovery. Discovery roles go stale when units are
+        re-coupled or reset in the app (the cloud then clears the role but keeps
+        the zone index), the status packet carries the live one."""
+        live = self._live_role.get(device.serial_number)
+        role = live if live is not None else (getattr(device, "role", "") or "")
+        return str(role).lower()
+
     def _zone_master(self, device):
         """Return the Master device of this device's zone, or None.
 
         A coupled Ambientika group has one Master and one or more Slaves sharing a
-        zone_index; per the RS485 protocol only the Master applies the filter
-        reset. Returns None if the device is itself the Master or no Master with
-        the same zone_index is found.
+        zone_index in one house; per the RS485 protocol only the Master applies
+        the filter reset, and a Slave runs with its Master. Only a unit whose
+        current role is a Slave role (SlaveEqualMaster / SlaveOppositeMaster) has
+        a zone Master: a Master, a reset unit (NotConfigured, role cleared) or a
+        unit without zone has none, even if it still carries a zone index.
         """
-        if str(getattr(device, "role", "") or "").lower() == "master":
+        # Role names: Master, SlaveEqualMaster, SlaveOppositeMaster, NotConfigured
+        # (or none at all) - the Slave names contain "Master", so compare exactly.
+        if not self._role_of(device).startswith("slave"):
             return None
         zone = getattr(device, "zone_index", None)
         if zone is None:
             return None
+        # zone_index is only unique within one house: an account with several
+        # houses has a zone 0 in each, so the Master must be in the same house.
+        house = self._device_house.get(device.serial_number)
         for other in self.devices.values():
             if (other.serial_number != device.serial_number
                     and getattr(other, "zone_index", None) == zone
-                    and str(getattr(other, "role", "") or "").lower() == "master"):
+                    and self._device_house.get(other.serial_number) == house
+                    and self._role_of(other) == "master"):
                 return other
         return None
 
@@ -2685,8 +2946,13 @@ class AmbientikaBridge:
                 return "confirmed"
         acknowledged = False
         if is_slave:
-            self._filter_ack_write(serial, (after or {}).get("filters_status") or "Bad")
-            acknowledged = self._soft_reset_enabled()
+            acknowledged = self._filter_ack_write(
+                serial, (after or {}).get("filters_status") or "Bad")
+            if self._soft_reset_enabled() and not acknowledged:
+                log.warning("filter reset for %s: the maintenance acknowledgement could not "
+                            "be stored at %s - the filter status stays as reported by the "
+                            "device. Check that this path is writable (persistent /data).",
+                            serial, self._filter_ack_path())
             log.warning(
                 "filter reset for %s: this is a SLAVE - its filter counter cannot be "
                 "reset remotely. The cloud reset is applied only by the zone Master to "
@@ -2700,9 +2966,21 @@ class AmbientikaBridge:
                 "if the device applies it, the change appears on a later poll.",
                 serial, (after or {}).get("filters_status") if after else None, verify_attempts)
         if acknowledged:
+            # Publish the effective value right away instead of on the next poll,
+            # so the log line below and the published state agree.
+            published = False
+            try:
+                st = await self.read_status(device)
+                if st is not None and self.client is not None:
+                    payload = self._state_payload(serial, device, st)
+                    self._publish_state(serial, payload)
+                    published = filter_status_to_num(payload.get("filters_status")) == 0
+            except Exception as e:
+                log.debug("immediate state publish after filter reset for %s skipped: %s",
+                          serial, e)
             log.info("filter reset for %s: recorded bridge-side as serviced - the effective "
-                     "filter status reports Good while the raw device value stays unchanged.",
-                     serial)
+                     "filter status reports Good while the raw device value stays unchanged%s.",
+                     serial, " (published)" if published else " (published with the next poll)")
             return "acknowledged"
         return "unconfirmed"
 
@@ -2747,15 +3025,21 @@ class AmbientikaBridge:
             pass  # best-effort; never break a reset/poll over a write error
 
     @classmethod
-    def _filter_ack_write(cls, serial: str, raw_status) -> None:
+    def _filter_ack_write(cls, serial: str, raw_status) -> bool:
+        """Record the acknowledgement; True only if it is really stored."""
         if not cls._soft_reset_enabled():
-            return
+            return False
         import time
         data = cls._filter_ack_load()
-        data[serial] = {"acked_at": time.time(), "raw_when_acked": str(raw_status)}
+        acked_at = time.time()
+        data[serial] = {"acked_at": acked_at, "raw_when_acked": str(raw_status)}
         cls._filter_ack_save(data)
         _FILTER_ACK_GOOD_STREAK.pop(serial, None)
         _FILTER_ACK_ODD_RAW.pop(serial, None)
+        # Stored only if the file now holds exactly this entry (a silently failed
+        # save next to an old entry for the same unit must not count).
+        rec = cls._filter_ack_load().get(serial) or {}
+        return rec.get("acked_at") == acked_at
 
     @classmethod
     def _filter_ack_drop(cls, data: dict, serial: str, why: str) -> None:
@@ -2834,7 +3118,9 @@ class AmbientikaBridge:
         if isinstance(res, Failure):
             log.warning("status() failed for %s: %s", device.serial_number, res)
             return None
-        return res.unwrap()
+        st = res.unwrap()
+        self._note_live_role(device.serial_number, st)
+        return st
 
     async def set_device_mode(self, device, operating_mode, fan_speed, humidity_level) -> bool:
         # change_mode requires all four attributes; light_sensor_level is not a
@@ -3450,10 +3736,12 @@ class AmbientikaBridge:
         houses = houses_res.unwrap()
 
         self.devices = {}
+        self._device_house = {}
         for house in houses:
             for room in house.rooms:
                 for device in room.devices:
                     self.devices[device.serial_number] = device
+                    self._device_house[device.serial_number] = getattr(house, "id", None)
                     log.info("  Device: %s  (serial: %s)", device.name, device.serial_number)
         log.info("Found %d device(s).", len(self.devices))
 
@@ -3501,7 +3789,11 @@ class AmbientikaBridge:
         while not self._stop_event.is_set():
             cycle_ok = 0
             saw_auth_error = False
-            for serial, device in list(self.devices.items()):
+            # Masters first, so a Slave is shown with its Master's mode of this
+            # cycle (sorted() is stable: the order among Masters/Slaves is kept).
+            for serial, device in sorted(
+                    self.devices.items(),
+                    key=lambda kv: self._role_of(kv[1]) != "master"):
                 try:
                     res = await device.status()
                     if isinstance(res, Failure):
@@ -3526,42 +3818,10 @@ class AmbientikaBridge:
                         self._check_mode_applied(serial, device, s["operating_mode"])
                     except Exception as e:  # a diagnostic must never cost a poll
                         log.debug("mode check for %s skipped: %s", serial, e)
-                    # Filterstatus einmal aufloesen: der effektive Wert (mit
-                    # Wartungsquittung) steht in den Hauptfeldern, der rohe
-                    # Geraetewert daneben in den *_raw-Feldern. Ohne aktive
-                    # Quittung sind beide identisch.
-                    fs_raw = s["filters_status"]
-                    fs_eff = self._filter_ack_effective(serial, fs_raw)
-                    payload = {
-                        "operating_mode": s["operating_mode"].name,
-                        "fan_speed": s["fan_speed"].name,
-                        "humidity_level": s["humidity_level"].name,
-                        "light_sensor_level": s["light_sensor_level"].name,
-                        "temperature": s["temperature"],
-                        "humidity": s["humidity"],
-                        "air_quality": s["air_quality"],
-                        "humidity_alarm": s["humidity_alarm"],
-                        "filters_status": fs_eff,
-                        "filters_status_raw": fs_raw,
-                        "night_alarm": s["night_alarm"],
-                        "device_role": s["device_role"],
-                        "last_operating_mode": s["last_operating_mode"].name,
-                        "zone_index": device.zone_index,
-                        # --- numerische Begleitwerte (Zahl je Textwert) ---
-                        "operating_mode_num": _enum_num(s["operating_mode"]),
-                        "last_operating_mode_num": _enum_num(s["last_operating_mode"]),
-                        "fan_speed_num": _fan_speed_num(s["fan_speed"]),
-                        "humidity_level_num": _enum_num(s["humidity_level"]),
-                        "light_sensor_level_num": _enum_num(s["light_sensor_level"]),
-                        "air_quality_num": air_quality_to_num(s["air_quality"]),
-                        "filter_status_num": filter_status_to_num(fs_eff),
-                        "filter_status_raw_num": filter_status_to_num(fs_raw),
-                    }
-                    if self.client is not None:
-                        self.client.publish(state_topic(self.cfg.topic_prefix, serial),
-                                            json.dumps(payload), qos=0, retain=True)
-                        self.client.publish(avail_topic(self.cfg.topic_prefix, serial),
-                                            "online", qos=0, retain=True)
+                    # Effektive Werte in den Hauptfeldern, Geraetewerte daneben
+                    # in *_raw (Filterstatus mit Wartungsquittung, Modus eines
+                    # Slaves = Modus seines Masters).
+                    self._publish_state(serial, self._state_payload(serial, device, s))
                     self._note_poll_success(serial)
                     cycle_ok += 1
                 except Exception as e:

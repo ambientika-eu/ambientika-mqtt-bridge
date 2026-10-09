@@ -166,6 +166,7 @@ the log at start-up. `ambientika` is the default prefix (`MQTT_PREFIX`).
 ```json
 {
   "operating_mode": "Smart",
+  "operating_mode_raw": "Surveillance",
   "fan_speed": "Medium",
   "humidity_level": "Normal",
   "light_sensor_level": "Medium",
@@ -180,6 +181,7 @@ the log at start-up. `ambientika` is the default prefix (`MQTT_PREFIX`).
   "last_operating_mode": "Smart",
   "zone_index": 1,
   "operating_mode_num": 0,
+  "operating_mode_raw_num": 5,
   "last_operating_mode_num": 0,
   "fan_speed_num": 2,
   "humidity_level_num": 1,
@@ -330,7 +332,10 @@ main and raw fields are identical.
 
 The diagnostic sensor *Filter Reset Status* reports `acknowledged` for such a
 reset, as opposed to `confirmed` (the counter really cleared) and `unconfirmed`
-(neither cleared nor recorded).
+(neither cleared nor recorded). Since 1.4.32 the acknowledged value is published at
+once, not with the next poll, and an acknowledgement that cannot be stored (no
+writable `/data`) is reported as a warning and `unconfirmed` instead of
+`acknowledged`.
 
 Since 1.4.30 an acknowledgement ends only when `FILTER_ACK_TTL_DAYS` run out or
 when the device itself reports `Good` for at least 10 polls in a row spanning at
@@ -351,13 +356,56 @@ reports the sent mode, or a warning if it still reports another mode after
 `MODE_VERIFY_WINDOW_S` (180 s). A unit under NeuraCell-X protection is not judged,
 and the check never costs a poll - if it ever failed internally the status would
 still be published.
-For a Slave the warning names the zone Master: a Slave takes its operating mode
-from the Master over the local WLAN, so the mode belongs on the Master, and a Slave
-that keeps a different mode than its Master has lost its link to it.
+For a Slave the warning names the zone Master: a coupled Slave runs with its
+Master, so the mode belongs on the Master.
 
 Truly zeroing a Slave's counter is only possible at the device: configure the unit
 in the app temporarily as a standalone device, reset the filter, then set it up as
 a Slave again.
+
+### Operating mode of a Slave
+
+A coupled Slave runs with its zone Master. Its own mode field is not what it is
+doing - a Slave can report `Surveillance` and still ventilate in the Master's
+reversing rhythm. Like the Ambientika app, which shows only the Master's status for
+a zone, the bridge since 1.4.32 publishes the Master's mode for a Slave and keeps
+the Slave's own value next to it:
+
+| Field | Content |
+|---|---|
+| `operating_mode` / `operating_mode_num` | effective mode (the zone Master's for a Slave) |
+| `operating_mode_raw` / `operating_mode_raw_num` | the unit's own value |
+
+Masters are read first in each cycle. The unit's own value is shown instead while
+NeuraCell-X protection controls the unit, or if its Master has not been read for
+more than `max(300 s, 2 x POLL_INTERVAL + 60 s)`. The zone Master is looked up
+within the same house, and the roles come from what each unit reports in its own
+status (`device_role`: `Master`, `SlaveEqualMaster`, `SlaveOppositeMaster`,
+`NotConfigured`), so re-coupling or resetting units in the app is followed
+without a restart; a reset unit that still carries its old zone index is not a
+Slave. When a Slave's own value differs, the log says so once per change
+(`operating mode of <serial>: the unit reports ..., shown as ...`). Selecting a
+mode on a Slave still sends the command to that unit; the published mode follows
+the Master, so set modes on the Master.
+
+### Plausibility of temperature and humidity
+
+Values outside the sensor range are never published (humidity 1-100 %,
+temperature -40 to 85 °C). A single impossible drop such as 6 % humidity between
+55 and 70 % is held back too: a humidity below 20 % is published only if dry air
+(below 25 %) was already measured among the last three readings (a held-back one
+counts) or published within the last hour (at least six poll intervals).
+Genuinely dry winter air is therefore confirmed by its own next dry reading - only
+the first dry reading after a long humid stretch is delayed by one reading - while
+rises, shower peaks and the normal reversing rhythm are never held back. The cloud
+hands out the unit's last status packet, so with a poll interval shorter than the
+unit's upload rhythm the same packet is read several times; a repeat within
+`DUPLICATE_PACKET_MAX_S` (120 s) does not count as a new reading and cannot
+confirm a held-back value. Meanwhile the last
+plausible value is published, for at most ten minutes; after that the value is
+published as unknown, so a failed sensor never looks live. The log notes once when
+values are held back and once when a plausible value returns, at most once an hour
+for a flapping sensor.
 
 ### Availability debounce
 

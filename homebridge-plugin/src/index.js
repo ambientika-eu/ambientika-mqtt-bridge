@@ -244,7 +244,7 @@ class AmbientikaPlugin {
 
     // Humidity
     const humidityService = accessory.getService(Service.HumiditySensor);
-    if (humidityService && state.humidity !== undefined) {
+    if (humidityService && state.humidity !== undefined && state.humidity !== null) {
       humidityService.updateCharacteristic(
         Characteristic.CurrentRelativeHumidity,
         Math.min(100, Math.max(0, state.humidity))

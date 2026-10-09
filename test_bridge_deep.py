@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Kommandos werden im Betrieb ueber ein kurzes Fenster zusammengefasst. Fuer die
@@ -88,10 +89,21 @@ class FakeDevice:
         self.serial_number = serial
         self.name = name
         self.zone_index = zone
-        self.role = "Slave"
         self._status = status or mkstatus()
+        self.role = "Slave"
         self.mode_calls = []
         self.reset_calls = 0
+
+    # Like a real unit: the role from discovery and the role the unit reports in
+    # its status (device_role) agree unless a test sets them apart on purpose.
+    @property
+    def role(self):
+        return self._role
+
+    @role.setter
+    def role(self, value):
+        self._role = value
+        self._status["device_role"] = value
 
     async def status(self):
         return Success(dict(self._status))
@@ -2149,6 +2161,482 @@ async def test_mode_verify():
         bridge.MODE_VERIFY_WINDOW_S = alt
 
 
+async def _one_poll(b, cycles=1):
+    """Run _poll_loop for the given number of cycles (poll_interval tiny)."""
+    b._stop_event = asyncio.Event()
+    task = asyncio.create_task(b._poll_loop())
+    await asyncio.sleep(0.06 * cycles + 0.02)
+    b._stop_event.set()
+    await task
+
+
+def _last_state(b, serial):
+    states = [json.loads(pl) for t, pl in b.client.pub if t.endswith("/%s/state" % serial)]
+    return states[-1] if states else None
+
+
+async def test_shown_mode():
+    """Kundenfall Okt. 2026: Slaves melden 'Surveillance', laufen aber mit dem Master.
+    Die Bridge zeigt fuer einen Slave den Modus des Masters, den eigenen Wert in *_raw."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.enable_discovery = False
+    cfg.poll_interval = 0.05
+    b = bridge.AmbientikaBridge(cfg)
+    b.client = FakeClient()
+    b.loop = asyncio.get_running_loop()
+    # Slave vor dem Master im Dict: im ersten Durchlauf ist der Master noch unbekannt
+    gbad = FakeDevice(serial="GBAD", name="Gaeste-Bad", zone=0, status=mkstatus(op=OM.Surveillance))
+    master = FakeDevice(serial="FLUR", name="Flur", zone=0, status=mkstatus(op=OM.Smart))
+    master.role = "Master"
+    wozi = FakeDevice(serial="WOZI", name="Wohnzimmer", zone=0, status=mkstatus(op=OM.Smart))
+    solo = FakeDevice(serial="SOLO", name="Einzel", zone=5, status=mkstatus(op=OM.Night))
+    solo.role = "Master"
+    b.devices = {d.serial_number: d for d in (gbad, master, wozi, solo)}
+
+    with _LogCatch() as lc:
+        await _one_poll(b, 1)
+        firsts = [json.loads(pl) for t, pl in b.client.pub if t.endswith("/GBAD/state")]
+        st = firsts[0] if firsts else None
+        check("shown: Master zuerst -> schon der erste Durchlauf zeigt den Mastermodus",
+              st and st["operating_mode"] == "Smart" and st["operating_mode_raw"] == "Surveillance", st)
+        # ohne jeden Masterwert (Master noch nie gelesen) -> eigener Wert
+        b._last_mode.pop("FLUR", None)
+        st0 = b._shown_mode("GBAD", gbad, OM.Surveillance)
+        check("shown: ohne Masterwert -> eigener Wert", st0 == OM.Surveillance, st0)
+        await _one_poll(b, 3)
+        st = _last_state(b, "GBAD")
+        check("shown: Slave zeigt den Modus des Masters", st["operating_mode"] == "Smart", st)
+        check("shown: eigener Wert steht in operating_mode_raw", st["operating_mode_raw"] == "Surveillance", st)
+        check("shown: Zahlen passend", st["operating_mode_num"] == OM.Smart.value
+              and st["operating_mode_raw_num"] == OM.Surveillance.value, st)
+        notes = [m for lv, m in lc.lines if lv == "INFO" and "operating mode of GBAD" in m]
+        check("shown: Hinweis genau einmal im Log", len(notes) == 1, notes)
+        check("shown: Hinweis nennt beide Werte und den Master",
+              notes and "reports Surveillance, shown as Smart" in notes[0] and "FLUR" in notes[0], notes)
+        st = _last_state(b, "FLUR")
+        check("shown: Master unveraendert", st["operating_mode"] == "Smart" and st["operating_mode_raw"] == "Smart", st)
+        st = _last_state(b, "WOZI")
+        check("shown: Slave gleich Master -> kein Hinweis",
+              st["operating_mode"] == "Smart" and not any("operating mode of WOZI" in m for _, m in lc.lines), st)
+        st = _last_state(b, "SOLO")
+        check("shown: Einzelgeraet zeigt eigenen Wert", st["operating_mode"] == "Night"
+              and st["operating_mode_raw"] == "Night", st)
+
+        # Master wechselt -> Slave folgt in der Anzeige, neuer Hinweis
+        master._status["operating_mode"] = OM.Auto
+        await _one_poll(b, 3)
+        st = _last_state(b, "GBAD")
+        check("shown: Masterwechsel wird uebernommen", st["operating_mode"] == "Auto", st)
+        notes = [m for lv, m in lc.lines if lv == "INFO" and "operating mode of GBAD" in m]
+        check("shown: neuer Hinweis bei geaendertem Paar", len(notes) == 2, notes)
+
+    # Master zu lange nicht gelesen -> eigener Wert
+    b._last_mode["FLUR"] = (OM.Auto, time.monotonic() - 1000)
+    st = b._state_payload("GBAD", gbad, dict(gbad._status))
+    check("shown: veralteter Masterwert -> eigener Wert", st["operating_mode"] == "Surveillance", st)
+    # Grenze waechst mit dem Abrufintervall: 280 s Intervall, Masterwert 400 s alt -> noch gueltig
+    b.cfg.poll_interval = 280
+    b._last_mode["FLUR"] = (OM.Auto, time.monotonic() - 400)
+    st = b._state_payload("GBAD", gbad, dict(gbad._status))
+    check("shown: Altersgrenze haengt am Abrufintervall", st["operating_mode"] == "Auto", st)
+    b.cfg.poll_interval = 0.05
+
+    # NeuraCell-X steuert das Geraet -> eigener Wert (Schutzmodus sichtbar)
+    b._last_mode["FLUR"] = (OM.Smart, time.monotonic())
+    orig = b.neuracell._device_under_control
+    b.neuracell._device_under_control = lambda s, d=None: s == "GBAD"
+    try:
+        gbad._status["operating_mode"] = OM.Intake
+        st = b._state_payload("GBAD", gbad, dict(gbad._status))
+        check("shown: unter NeuraCell-X-Schutz eigener Wert", st["operating_mode"] == "Intake", st)
+    finally:
+        b.neuracell._device_under_control = orig
+    # Fehler in der Schutzabfrage kostet nie den Status
+    b.neuracell._device_under_control = lambda s, d=None: 1 / 0
+    try:
+        st = b._state_payload("GBAD", gbad, dict(gbad._status))
+        check("shown: Fehler in Schutzabfrage -> eigener Wert, kein Absturz", st["operating_mode"] == "Intake", st)
+    finally:
+        b.neuracell._device_under_control = orig
+
+
+async def test_plausibility():
+    """Einzelne unmoegliche Tiefstwerte (6 % Feuchte) werden nicht veroeffentlicht.
+    Anstiege, Duschspitzen, der Wechseltakt und echte trockene Luft bleiben unberuehrt."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.enable_discovery = False
+
+    def run(b, seq, key="humidity"):
+        return [b._plausible("WOZI", key, v) for v in seq]
+
+    # A) Kundenfall: einzelner Ausreisser 6 % zwischen 55 und 70 %
+    b = bridge.AmbientikaBridge(cfg)
+    with _LogCatch() as lc:
+        out = run(b, [55, 6, 70, 72, 68])
+    check("plaus: Ausreisser 6 % wird zurueckgehalten", out == [55, 55, 70, 72, 68], out)
+    held = [m for lv, m in lc.lines if "held back" in m]
+    again = [m for lv, m in lc.lines if "plausible again" in m]
+    check("plaus: genau ein Hinweis + eine Entwarnung", len(held) == 1 and len(again) == 1, lc.lines)
+    check("plaus: Hinweis nennt Wert und Grund", held and "humidity 6 from WOZI held back (below 20 % without dry air in the last 3 readings" in held[0], held)
+
+    # B) Anstiege und Spitzen werden nie zurueckgehalten (auch bei langem Abrufintervall)
+    b = bridge.AmbientikaBridge(cfg)
+    seq = [50, 70, 90, 100, 30, 100, 62, 100, 64, 99, 45]
+    check("plaus: Anstiege, Spitzen, Wechseltakt unveraendert", run(b, seq) == seq, run(bridge.AmbientikaBridge(cfg), seq))
+
+    # C) echte trockene Luft im Wechseltakt: erster trockener Wert einmal verzoegert, dann durch
+    b = bridge.AmbientikaBridge(cfg)
+    out = run(b, [40, 12, 41, 11, 42, 13, 40])
+    check("plaus: trockene Phase bestaetigt sich", out == [40, 40, 41, 11, 42, 13, 40], out)
+    # Bestaetigung auch durch einen Wert knapp ueber 20 %
+    b = bridge.AmbientikaBridge(cfg)
+    check("plaus: 22 % bestaetigt 15 %", run(b, [40, 22, 41, 15]) == [40, 22, 41, 15])
+    # veroeffentlichte trockene Luft vor einigen Minuten zaehlt (Zeitfenster), auch nach
+    # drei normalen Werten; ein nur zurueckgehaltener Wert haelt das Fenster nicht offen
+    b = bridge.AmbientikaBridge(cfg)
+    check("plaus: veroeffentlichte trockene Luft haelt das Zeitfenster offen",
+          run(b, [40, 12, 13, 41, 45, 50, 11]) == [40, 40, 13, 41, 45, 50, 11])
+    b = bridge.AmbientikaBridge(cfg)
+    check("plaus: zwei einzelne Ausreisser im Abstand bestaetigen sich nicht",
+          run(b, [40, 12, 41, 45, 50, 11]) == [40, 40, 41, 45, 50, 50])
+    # Zeitfenster abgelaufen und keine trockene Messung unter den letzten drei -> zurueckhalten
+    alt = bridge.HUMIDITY_LOW_WINDOW_S
+    bridge.HUMIDITY_LOW_WINDOW_S = 0.0
+    try:
+        b = bridge.AmbientikaBridge(cfg)
+        b.cfg.poll_interval = 0
+        check("plaus: Zeitfenster abgelaufen -> gehalten",
+              run(b, [40, 12, 13, 41, 45, 50, 11]) == [40, 40, 13, 41, 45, 50, 50])
+    finally:
+        bridge.HUMIDITY_LOW_WINDOW_S = alt
+    # schneller Abruf: Aussenphase ueber mehrere Werte -> nur der erste verzoegert
+    b = bridge.AmbientikaBridge(cfg)
+    check("plaus: mehrere trockene Werte am Stueck", run(b, [45, 14, 13, 15, 44, 46, 15]) == [45, 45, 13, 15, 44, 46, 15])
+
+    # D) Start mit einem Ausreisser: wird nicht veroeffentlicht
+    b = bridge.AmbientikaBridge(cfg)
+    check("plaus: Ausreisser als erster Wert -> nichts veroeffentlicht", run(b, [6, 55, 56]) == [None, 55, 56])
+
+    # E) harte Grenzen
+    b = bridge.AmbientikaBridge(cfg)
+    out = run(b, [50, 0, 101, 52])
+    check("plaus: 0 % und 101 % verworfen", out == [50, 50, 50, 52], out)
+    out = run(b, [20, -45, -40, 85, 86, 21], key="temperature")
+    check("plaus: Temperaturgrenzen -40..85", out == [20, 20, -40, 85, 85, 21], out)
+    out = run(b, [True, 53])
+    check("plaus: bool wird nie als Messwert veroeffentlicht", out == [52, 53], out)
+    out = run(b, [float("nan"), "x", 54])
+    check("plaus: NaN und Text verworfen", out == [53, 53, 54], out)
+
+    # F) toter Sensor: ein Hinweis, nach der Haltezeit 'unbekannt', kein Logspam
+    alt = bridge.PLAUSIBLE_HOLD_S
+    bridge.PLAUSIBLE_HOLD_S = 0.0
+    try:
+        b = bridge.AmbientikaBridge(cfg)
+        with _LogCatch() as lc:
+            out = run(b, [55] + [0] * 50)
+        check("plaus: toter Sensor -> unbekannt statt eingefrorenem Wert",
+              out[0] == 55 and all(v is None for v in out[1:]), out[:5])
+        check("plaus: hoechstens zwei Logzeilen fuer 50 Ausfaelle", len(lc.lines) <= 2, lc.lines)
+    finally:
+        bridge.PLAUSIBLE_HOLD_S = alt
+
+    # G) None bleibt None ohne Log; ueber den Payload-Pfad
+    b = bridge.AmbientikaBridge(cfg)
+    with _LogCatch() as lc:
+        r = b._plausible("X", "humidity", None)
+    check("plaus: None bleibt None ohne Log", r is None and not lc.lines, lc.lines)
+    dev = FakeDevice(serial="WOZI", name="Wohnzimmer", zone=0, status=mkstatus(op=OM.Smart))
+    dev.role = "Master"
+    vals = []
+    for h in (55, 6, 70):
+        dev._status["humidity"] = h
+        vals.append(b._state_payload("WOZI", dev, dict(dev._status))["humidity"])
+    check("plaus: Payload nutzt den Filter", vals == [55, 55, 70], vals)
+
+
+async def test_zone_master_houses_and_order():
+    """Zone 0 gibt es in jedem Haus: ein Slave folgt nur dem Master seines Hauses.
+    Master werden zuerst abgefragt, damit Slaves den Modus desselben Durchlaufs zeigen."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.enable_discovery = False
+    cfg.poll_interval = 0.05
+    b = bridge.AmbientikaBridge(cfg)
+    b.client = FakeClient()
+    b.loop = asyncio.get_running_loop()
+    ma = FakeDevice(serial="MA", name="Master A", zone=0, status=mkstatus(op=OM.Off))
+    ma.role = "Master"
+    sb = FakeDevice(serial="SB", name="Slave B", zone=0, status=mkstatus(op=OM.Surveillance))
+    mb = FakeDevice(serial="MB", name="Master B", zone=0, status=mkstatus(op=OM.Smart))
+    mb.role = "Master"
+    b.devices = {"MA": ma, "SB": sb, "MB": mb}
+    b._device_house = {"MA": 1, "SB": 2, "MB": 2}
+    check("houses: Master im selben Haus gefunden", b._zone_master(sb) is mb, b._zone_master(sb))
+    await _one_poll(b, 1)
+    firsts = [json.loads(pl) for t, pl in b.client.pub if t.endswith("/SB/state")]
+    check("houses: Slave zeigt Master seines Hauses, schon im ersten Durchlauf",
+          firsts and firsts[0]["operating_mode"] == "Smart", firsts[:1])
+    order = [t.split("/")[1] for t, pl in b.client.pub if t.endswith("/state")][:3]
+    check("order: Master vor Slave abgefragt", order.index("MB") < order.index("SB"), order)
+    b._device_house = {"MA": 1, "SB": 3, "MB": 2}
+    check("houses: kein Master im Haus -> None", b._zone_master(sb) is None)
+
+
+async def test_ack_publish_now():
+    """Quittung: der wirksame Wert wird sofort veroeffentlicht, nicht erst beim naechsten Abruf."""
+    old_env = {k: os.environ.get(k) for k in ("SLAVE_FILTER_SOFT_RESET", "FILTER_ACK_PATH")}
+    os.environ["SLAVE_FILTER_SOFT_RESET"] = "1"
+    os.environ["FILTER_ACK_PATH"] = os.path.join(_tempfile.mkdtemp(), "filter_ack.json")
+    alt = bridge.FILTER_RESET_VERIFY_DELAY
+    bridge.FILTER_RESET_VERIFY_DELAY = 0.01
+    try:
+        cfg = bridge.BridgeConfig()
+        cfg.neuracell_enabled = False
+        cfg.dewpoint_enabled = False
+        cfg.enable_discovery = False
+        b = bridge.AmbientikaBridge(cfg)
+        b.client = FakeClient()
+        b.loop = asyncio.get_running_loop()
+        master = FakeDevice(serial="FLUR", name="Flur", zone=0, status=mkstatus(op=OM.Smart))
+        master.role = "Master"
+        master._status["filters_status"] = "Bad"
+        wozi = FakeDevice(serial="WOZI", name="Wohnzimmer", zone=0, status=mkstatus(op=OM.Smart))
+        wozi._status["filters_status"] = "Bad"
+        b.devices = {"FLUR": master, "WOZI": wozi}
+
+        async def fake_req(device, method, path, body):
+            return (200, None, "")
+        b._reset_request = fake_req
+        with _LogCatch() as lc:
+            res = await b._reset_filter(wozi)
+        st = _last_state(b, "WOZI")
+        check("ack-now: Ergebnis acknowledged", res == "acknowledged", res)
+        check("ack-now: Zustand sofort veroeffentlicht",
+              st and st["filters_status"] == "Good" and st["filters_status_raw"] == "Bad"
+              and st["filter_status_num"] == 0, st)
+        check("ack-now: Logzeile sagt published", lc.has("INFO", "stays unchanged (published)"), lc.lines)
+        # Quittung laesst sich nicht speichern -> nicht 'published' behaupten
+        os.environ["FILTER_ACK_PATH"] = "/proc/nicht/schreibbar/filter_ack.json"
+        with _LogCatch() as lc:
+            res = await b._reset_filter(wozi)
+        st = _last_state(b, "WOZI")
+        check("ack-now: Speichern fehlgeschlagen -> Ergebnis unconfirmed", res == "unconfirmed", res)
+        check("ack-now: Speichern fehlgeschlagen -> Warnung statt 'recorded'",
+              lc.has("WARNING", "could not be stored") and not lc.has("INFO", "recorded bridge-side"), lc.lines)
+        os.environ["FILTER_ACK_PATH"] = os.path.join(_tempfile.mkdtemp(), "filter_ack.json")
+        # alter, abgelaufener Eintrag + Speichern scheitert still -> nicht als gespeichert werten
+        AB = bridge.AmbientikaBridge
+        AB._filter_ack_save({"WOZI": {"acked_at": 1.0, "raw_when_acked": "Bad"}})
+        orig_save = AB._filter_ack_save
+        AB._filter_ack_save = classmethod(lambda cls, data: None)
+        try:
+            check("ack-now: stilles Speicherversagen neben altem Eintrag erkannt",
+                  AB._filter_ack_write("WOZI", "Bad") is False)
+        finally:
+            AB._filter_ack_save = orig_save
+        # ohne MQTT-Verbindung: ehrlicher Hinweis statt Behauptung
+        b.client = None
+        with _LogCatch() as lc:
+            res = await b._reset_filter(wozi)
+        check("ack-now: ohne Verbindung -> naechster Abruf",
+              res == "acknowledged" and lc.has("INFO", "published with the next poll"), lc.lines)
+    finally:
+        bridge.FILTER_RESET_VERIFY_DELAY = alt
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        bridge._FILTER_ACK_GOOD_STREAK.clear()
+        bridge._FILTER_ACK_ODD_RAW.clear()
+
+
+def test_discovery_raw_mode():
+    cfg = bridge.BridgeConfig()
+    ents = bridge.build_discovery_configs(cfg, "AMB-2", "Kitchen")
+    uids = [p["unique_id"] for _, p in ents]
+    raw = next((p for t, p in ents if t.endswith("AMB-2_operating_mode_raw/config")), None)
+    rawn = next((p for t, p in ents if t.endswith("AMB-2_operating_mode_raw_num/config")), None)
+    check("disc: Mode raw vorhanden", raw and raw["value_template"] == "{{ value_json.operating_mode_raw }}", raw)
+    check("disc: Mode raw (num) mit measurement", rawn and rawn.get("state_class") == "measurement", rawn)
+    check("disc: unique_ids weiterhin eindeutig", len(uids) == len(set(uids)))
+
+
+async def test_live_roles():
+    """Die Rolle aus dem Status des Geraets zaehlt, nicht die vom Start:
+    zurueckgesetzte Geraete behalten in der Cloud ihren Zonen-Index, neu gekoppelte
+    ihre alte Rolle - beides darf keinen falschen Modus anzeigen."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.enable_discovery = False
+    cfg.poll_interval = 0.05
+    b = bridge.AmbientikaBridge(cfg)
+    b.client = FakeClient()
+    b.loop = asyncio.get_running_loop()
+    flur = FakeDevice(serial="FLUR", name="Flur", zone=0, status=mkstatus(op=OM.Smart))
+    flur.role = "Master"
+    gbad = FakeDevice(serial="GBAD", name="Gaeste-Bad", zone=0, status=mkstatus(op=OM.Surveillance))
+    gbad.role = "SlaveOppositeMaster"                  # echte Rollenbezeichnung der Cloud
+    kizi = FakeDevice(serial="KIZI", name="Kinderzimmer", zone=0, status=mkstatus(op=OM.Night))
+    kizi.role = "SlaveEqualMaster"
+    reset = FakeDevice(serial="RSET", name="Zurueckgesetzt", zone=0, status=mkstatus(op=OM.Auto))
+    reset.role = None                                  # Cloud: Rolle geloescht, Zone 0 bleibt
+    reset._status["device_role"] = "NotConfigured"     # das Geraet selbst meldet das
+    b.devices = {d.serial_number: d for d in (gbad, reset, flur, kizi)}
+    await _one_poll(b, 2)
+    st = {sn: _last_state(b, sn) for sn in b.devices}
+    check("live: SlaveOppositeMaster zeigt Master", st["GBAD"]["operating_mode"] == "Smart", st["GBAD"])
+    check("live: SlaveEqualMaster zeigt Master", st["KIZI"]["operating_mode"] == "Smart", st["KIZI"])
+    check("live: zurueckgesetztes Geraet in Zone 0 zeigt eigenen Wert",
+          st["RSET"]["operating_mode"] == "Auto" and st["RSET"]["operating_mode_raw"] == "Auto", st["RSET"])
+    check("live: zurueckgesetztes Geraet hat keinen Zonen-Master", b._zone_master(reset) is None)
+    check("live: Master zeigt eigenen Wert", st["FLUR"]["operating_mode"] == "Smart")
+
+    # Neu gekoppelt in der App, Bridge nicht neu gestartet: KIZI meldet jetzt Master,
+    # FLUR meldet jetzt SlaveOppositeMaster - die Startrollen sind veraltet.
+    kizi._status["device_role"] = "Master"
+    flur._status["device_role"] = "SlaveOppositeMaster"
+    kizi._status["operating_mode"] = OM.ManualHeatRecovery
+    flur._status["operating_mode"] = OM.Off
+    await _one_poll(b, 3)
+    st = {sn: _last_state(b, sn) for sn in b.devices}
+    check("live: neuer Master zeigt eigenen Wert", st["KIZI"]["operating_mode"] == "ManualHeatRecovery", st["KIZI"])
+    check("live: alter Master ist jetzt Slave und zeigt den neuen Master",
+          st["FLUR"]["operating_mode"] == "ManualHeatRecovery" and st["FLUR"]["operating_mode_raw"] == "Off", st["FLUR"])
+    check("live: anderer Slave folgt dem neuen Master", st["GBAD"]["operating_mode"] == "ManualHeatRecovery", st["GBAD"])
+    check("live: Zonen-Master nach Umkopplung ist KIZI", b._zone_master(flur) is kizi)
+    # Reihenfolge: der neue Master wird im naechsten Durchlauf zuerst abgefragt
+    b.client.pub.clear()
+    await _one_poll(b, 1)
+    order = [t.split("/")[1] for t, pl in b.client.pub if t.endswith("/state")]
+    check("live: neuer Master zuerst abgefragt", order and order[0] == "KIZI", order)
+    # Filter-Reset-Ziel folgt ebenfalls der Live-Rolle
+    cands = [sn for sn, _ in b._reset_candidates(flur)]
+    check("live: Reset-Kandidaten nach Live-Rolle", cands == ["FLUR", "KIZI"], cands)
+    # Status ohne Rolle (None) aendert die gemerkte Rolle nicht
+    kizi._status["device_role"] = None
+    await _one_poll(b, 1)
+    check("live: Status ohne Rolle laesst die gemerkte Rolle stehen", b._role_of(kizi) == "master")
+    # Rollennamen enthalten "Master": ein SlaveEqualMaster ist nie ein Master
+    check("live: SlaveEqualMaster ist kein Master", b._role_of(gbad).startswith("slave")
+          and all(b._zone_master(d) is not gbad for d in b.devices.values()))
+
+
+async def test_duplicate_packets():
+    """Die Cloud liefert das letzte Paket des Geraets; bei kurzem Abrufintervall
+    wird dasselbe Paket mehrfach gelesen. Ein zurueckgehaltener Wert darf sich so
+    nicht selbst bestaetigen, und ein Wiederholungspaket zaehlt nirgends doppelt."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.enable_discovery = False
+    b = bridge.AmbientikaBridge(cfg)
+    dev = FakeDevice(serial="WOZI", name="Wohnzimmer", zone=0, status=mkstatus(op=OM.Smart))
+    dev.role = "Master"
+
+    def poll(h, t=22):
+        dev._status["humidity"] = h
+        dev._status["temperature"] = t
+        return b._state_payload("WOZI", dev, dict(dev._status))["humidity"]
+
+    # Kundenfall bei 10 s Abruf: das 6-%-Paket wird dreimal gelesen
+    with _LogCatch() as lc:
+        out = [poll(55), poll(6), poll(6), poll(6), poll(70), poll(70), poll(68)]
+    check("dup: Ausreisser bleibt bei Wiederholung zurueckgehalten", out == [55, 55, 55, 55, 70, 70, 68], out)
+    held = [m for lv, m in lc.lines if lv == "INFO" and "held back" in m]
+    check("dup: Hinweis trotz drei Lesungen nur einmal", len(held) == 1, lc.lines)
+    # echte trockene Luft: das erste neue Paket bestaetigt, Wiederholungen nicht
+    b = bridge.AmbientikaBridge(cfg)
+    out = [poll(40), poll(12), poll(12), poll(12), poll(13), poll(13), poll(41), poll(11)]
+    check("dup: trockene Luft wird vom naechsten neuen Paket bestaetigt",
+          out == [40, 40, 40, 40, 13, 13, 41, 11], out)
+    # gleiches Paket, aber anderer Wert in einem anderen Feld -> neues Paket
+    b = bridge.AmbientikaBridge(cfg)
+    out = [poll(40), poll(12, 22), poll(12, 21)]
+    check("dup: Paket mit anderer Temperatur gilt als neu", out == [40, 40, 12], out)
+    # Ein seit Minuten unveraendertes Paket ist kein Wiederholungspaket mehr: ein
+    # stillstehendes Geraet meldet dieselben Werte wirklich, und sie zaehlen
+    b = bridge.AmbientikaBridge(cfg)
+    out = [poll(26), poll(18), poll(18)]
+    check("dup: gleiches Paket kurz danach -> gehalten", out == [26, 26, 26], out)
+    d0, t0 = b._last_status["WOZI"]
+    b._last_status["WOZI"] = (d0, t0 - bridge.DUPLICATE_PACKET_MAX_S - 1)
+    out = [poll(18), poll(18)]
+    check("dup: gleiches Paket nach mehr als 2 min gilt als neu und bestaetigt", out == [18, 18], out)
+    # Haltezeit laeuft auch bei Wiederholungspaketen ab
+    alt = bridge.PLAUSIBLE_HOLD_S
+    bridge.PLAUSIBLE_HOLD_S = 0.0
+    try:
+        b = bridge.AmbientikaBridge(cfg)
+        with _LogCatch() as lc:
+            out = [poll(55), poll(0), poll(0), poll(0)]
+        check("dup: Haltezeit abgelaufen -> unbekannt auch bei gleichem Paket",
+              out == [55, None, None, None], out)
+        check("dup: 'unbekannt' einmal im Log", sum("published as unknown" in m for _, m in lc.lines) == 1, lc.lines)
+    finally:
+        bridge.PLAUSIBLE_HOLD_S = alt
+
+
+async def test_log_rate_limit():
+    """Ein flatternder Sensor (0 % / 55 % / 0 % ...) schreibt nicht bei jedem Wechsel ins Log."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.enable_discovery = False
+    b = bridge.AmbientikaBridge(cfg)
+    with _LogCatch() as lc:
+        out = [b._plausible("X", "humidity", v) for v in [55, 0] * 100]
+    info = [m for lv, m in lc.lines if lv == "INFO"]
+    check("rate: 200 Flatterwerte -> genau zwei INFO-Zeilen (Beginn und Entwarnung)",
+          len(info) == 2 and "held back" in info[0] and "plausible again" in info[1], info)
+    check("rate: Werte trotzdem richtig", out == [55] * 200, out[:4])
+    # Ein einzelnes Ereignis: beide Zeilen INFO
+    b2 = bridge.AmbientikaBridge(cfg)
+    with _LogCatch() as lc:
+        [b2._plausible("Y", "humidity", v) for v in [55, 0, 55]]
+    check("rate: einzelnes Ereignis -> Beginn und Entwarnung auf INFO",
+          [lv for lv, _ in lc.lines] == ["INFO", "INFO"], lc.lines)
+    # Einmal je Stunde darf wieder gemeldet werden
+    st = b._last_plausible["X"]["humidity"]
+    st["log_t"] = time.monotonic() - 3601
+    with _LogCatch() as lc:
+        b._plausible("X", "humidity", 55)      # Entwarnung des leisen Ereignisses -> DEBUG
+        b._plausible("X", "humidity", 0)       # neues Ereignis nach einer Stunde -> INFO
+        b._plausible("X", "humidity", 55)      # seine Entwarnung -> INFO
+    check("rate: nach einer Stunde wieder INFO (Beginn und Entwarnung)",
+          [lv for lv, _ in lc.lines] == ["DEBUG", "INFO", "INFO"], lc.lines)
+
+
+async def test_mode_confirmed_slave_note():
+    """Die Bestaetigungszeile fuer einen Slave sagt, dass der gezeigte Modus der des Masters bleibt."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.enable_discovery = False
+    b = bridge.AmbientikaBridge(cfg)
+    b.client = FakeClient()
+    b.loop = asyncio.get_running_loop()
+    master = FakeDevice(serial="FLUR", name="Flur", zone=0, status=mkstatus(op=OM.Smart))
+    master.role = "Master"
+    slave = FakeDevice(serial="GBAD", name="Gaeste-Bad", zone=0, status=mkstatus(op=OM.Surveillance))
+    b.devices = {"FLUR": master, "GBAD": slave}
+    with _LogCatch() as lc:
+        await b._handle_command("GBAD", "operating_mode", "Night")
+        b._check_mode_applied("GBAD", slave, OM.Night)
+        await b._handle_command("FLUR", "operating_mode", "Night")
+        b._check_mode_applied("FLUR", master, OM.Night)
+    conf = [m for lv, m in lc.lines if "confirmed on" in m]
+    check("confirmed: Slave-Zeile nennt den Master", len(conf) == 2 and "SLAVE" in conf[0] and "FLUR" in conf[0], conf)
+    check("confirmed: Master-Zeile unveraendert", conf[1] == "operating mode Night confirmed on FLUR", conf)
+
+
 async def _async_suite():
     await test_neuracell()
     await test_neuracell_scoped()
@@ -2163,6 +2651,14 @@ async def _async_suite():
     await test_readonly_values()
     await test_mode_verify()
     await test_filter_ack_poll_path()
+    await test_shown_mode()
+    await test_plausibility()
+    await test_zone_master_houses_and_order()
+    await test_ack_publish_now()
+    await test_live_roles()
+    await test_duplicate_packets()
+    await test_log_rate_limit()
+    await test_mode_confirmed_slave_note()
 
 
 def main():
@@ -2171,6 +2667,7 @@ def main():
     test_dewpoint()
     test_config()
     test_filter_ack_robust()
+    test_discovery_raw_mode()
     asyncio.run(_async_suite())
     print("\nRESULT:", "ALL PASS" if not FAILS else f"{len(FAILS)} FAIL -> {FAILS}")
     return 1 if FAILS else 0
