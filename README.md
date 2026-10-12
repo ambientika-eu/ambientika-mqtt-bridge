@@ -172,6 +172,8 @@ the log at start-up. `ambientika` is the default prefix (`MQTT_PREFIX`).
   "light_sensor_level": "Medium",
   "temperature": 21,
   "humidity": 52,
+  "temperature_avg": 21.3,
+  "humidity_avg": 61.8,
   "air_quality": "Good",
   "humidity_alarm": false,
   "filters_status": "Good",
@@ -255,6 +257,7 @@ back. Set `COMMAND_COALESCE_MS=0` to apply every command on its own, immediately
 | `HA_DISCOVERY` | `true` | Enable Home Assistant Auto-Discovery |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `COMMAND_COALESCE_MS` | `800` | Commands for the same device within this window are applied in one call (`0` = off) |
+| `AVERAGE_WINDOW_MIN` | `30` | Window of `humidity_avg` / `temperature_avg` in minutes, 1-1440 (at least twenty poll intervals) |
 | `SLAVE_FILTER_SOFT_RESET` | `0` | Record a bridge-side "serviced" acknowledgement when a Slave's filter counter cannot be cleared remotely (see below) |
 | `FILTER_ACK_TTL_DAYS` | `90` | How long such an acknowledgement stays valid |
 | `FILTER_ACK_PATH` | `/data/filter_ack.json` | Where the acknowledgements are stored (needs a persistent volume) |
@@ -406,6 +409,31 @@ plausible value is published, for at most ten minutes; after that the value is
 published as unknown, so a failed sensor never looks live. The log notes once when
 values are held back and once when a plausible value returns, at most once an hour
 for a flapping sensor.
+
+### Averaged humidity and temperature
+
+The unit reverses its airflow about every half minute, so its sensor sees room air
+and incoming air in turn and a single humidity reading jumps by up to about 20
+percentage points - unusable for a dashboard tile or a threshold automation, which
+read a random phase. Since 1.4.33 every unit also publishes `humidity_avg` and
+`temperature_avg` (Home Assistant: *Humidity (averaged)*, *Temperature (averaged)*,
+`state_class: measurement`): the time-weighted mean of the published readings over
+`AVERAGE_WINDOW_MIN` minutes (default 30, at least twenty poll intervals). Each reading
+counts for the time since the previous one, at most two poll intervals, so a cached
+packet read several times, an extra publish between polls or a missed poll do not
+skew it. Held-back readings (see above) do not count. The value is `null` until at
+least two readings cover two minutes (or the whole window, if shorter) and, like the
+raw value, once no plausible reading has counted for ten minutes. `humidity` and `temperature` stay
+unchanged. The mean covers the whole reversing cycle, room air and incoming air: a
+steady value for display, history and thresholds, not a pure room-air value.
+What to expect: the cloud hands out about one packet per half minute, i.e. about
+one reading per reversal, and which phase of the cycle it catches drifts slowly. The
+mean is therefore much calmer than the raw value but can still wander by several
+points over an hour. Simulated with a 30 s upload rhythm (+-10 %) and half-periods
+of 30-45 s, the raw value jumps by ~35 points, the 30-min mean wanders by up to ~10
+over hours and the 60-min mean by ~5-10; with an irregular upload rhythm (25-35 s)
+the mean stays within 1-2 points. Keep `POLL_INTERVAL` at 30 s or shorter; at 60 s
+and above the mean needs many more reads and scatters more.
 
 ### Availability debounce
 

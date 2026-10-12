@@ -128,6 +128,42 @@ HUMIDITY_LOW_CONFIRM = 25
 HUMIDITY_LOW_READINGS = 3
 HUMIDITY_LOW_WINDOW_S = 3600.0
 PLAUSIBLE_HOLD_S = 600.0
+# Averaged measured values (humidity_avg, temperature_avg). The unit reverses its
+# airflow about every half minute, so its sensor sees room air and incoming air in
+# turn and a single reading jumps by up to ~20 percentage points: a dashboard tile
+# shows something different at every look, and an automation on a humidity
+# threshold fires depending on the phase it happens to read. The averaged sensors
+# carry the time-weighted mean of the published readings over a sliding window;
+# the raw values stay unchanged next to them. The mean covers the whole reversing
+# cycle (room and incoming air) - a steady value for display, history and
+# thresholds, not a pure room-air value.
+#  * window: AVERAGE_WINDOW_MIN minutes (env, default 30), at least
+#    AVERAGE_MIN_POLLS poll intervals, so a long poll interval still averages
+#    over enough readings. The cloud hands out about one packet per half minute,
+#    i.e. about one reading per reversal; which phase of the cycle it catches
+#    drifts slowly, so the mean of a window is read from a slowly wandering mix
+#    of room and incoming air. Simulated (half-period 30-45 s, upload interval
+#    30 s +-10 %): the raw value jumps by ~35 points, the 20-min mean wanders
+#    by up to ~15 points over hours, the 30-min mean by ~10, the 60-min mean by
+#    ~5-10. With a strongly varying upload interval (25-35 s) the mean stays
+#    within ~1-2 points. A limit of the data, not of the averaging - documented
+#    as "much calmer, a residual slow swing of several points is possible";
+#  * each reading counts for the time since the previous one (at most
+#    AVERAGE_MAX_GAP_POLLS poll intervals), so a cached packet read several times,
+#    an extra publish between polls or a missed poll keep the time weighting right;
+#  * held-back and unknown values (see _plausible) do not count;
+#  * published once at least two readings cover AVERAGE_MIN_COVER_S (or the whole
+#    window, if shorter); otherwise None (unknown), e.g. right after start. Like
+#    the raw value, it turns unknown when no plausible reading counted for
+#    PLAUSIBLE_HOLD_S (at least two poll intervals) - a dead sensor never looks live.
+try:
+    _aw = float(os.environ.get("AVERAGE_WINDOW_MIN", "30"))
+    AVERAGE_WINDOW_S = 1800.0 if _aw != _aw else min(1440.0, max(1.0, _aw)) * 60.0   # NaN -> default
+except Exception:
+    AVERAGE_WINDOW_S = 1800.0
+AVERAGE_MIN_POLLS = 20
+AVERAGE_MAX_GAP_POLLS = 2
+AVERAGE_MIN_COVER_S = 120.0
 # A status identical to the previous poll's is the same cached packet - unless it
 # has been the same for longer than this: a unit standing still reports the same
 # values for real, and such a reading must still count (e.g. to confirm a held-
@@ -1054,6 +1090,8 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
     sensor_defs = [
         ("temperature", "Temperature", "°C", "temperature", None),
         ("humidity", "Humidity", "%", "humidity", None),
+        ("temperature_avg", "Temperature (averaged)", "°C", "temperature", None),
+        ("humidity_avg", "Humidity (averaged)", "%", "humidity", None),
         ("air_quality", "Air Quality", None, None, "mdi:air-filter"),
         ("filters_status", "Filter Status", None, None, "mdi:air-filter"),
         ("filters_status_raw", "Filter Status raw", None, None, "mdi:air-filter"),
@@ -1072,7 +1110,8 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
     # nach rund zehn Tagen weg - gerade der Feuchteverlauf ueber die
     # Heizperiode ist aber die Auswertung, die man haben will. Die uebrigen
     # Eintraege dieser Liste sind Textwerte, dort waere measurement falsch.
-    MEASUREMENT_KEYS = {"temperature", "humidity"}
+    # Die gemittelten Werte (*_avg, siehe AVERAGE_WINDOW_S) sind ebenfalls Messwerte.
+    MEASUREMENT_KEYS = {"temperature", "humidity", "temperature_avg", "humidity_avg"}
     for key, name, unit, dc, icon in sensor_defs:
         p = {
             "name": name,
@@ -2361,6 +2400,9 @@ class AmbientikaBridge:
         # the unit's upload rhythm the same packet is read several times, and a
         # repeat must not count as a new reading (see _plausible).
         self._last_status: dict = {}
+        # serial -> {"temperature": [(monotonic t, value or None), ...], ...}:
+        # readings for the averaged sensors (see AVERAGE_WINDOW_S and _average).
+        self._avg_buf: dict = {}
 
     # ----- values shown for a unit -----
     def _shown_mode(self, serial: str, device, own):
@@ -2479,6 +2521,65 @@ class AmbientikaBridge:
         st["out"] = (None, value)
         return None
 
+    def _measured(self, serial: str, key: str, value, fresh: bool):
+        """(published value, averaged value) of one measured value.
+
+        The published value comes from _plausible. Only a reading that is really
+        published counts for the average: a held-back one (the last plausible
+        value stands in for it) or an unknown one is recorded as a gap.
+        """
+        shown = self._plausible(serial, key, value, fresh)
+        st = self._last_plausible.get(serial, {}).get(key)
+        held = st is not None and st.get("bad", 0) > 0
+        return shown, self._average(serial, key, None if held else shown)
+
+    def _average(self, serial: str, key: str, value, now: Optional[float] = None):
+        """Record a reading and return the time-weighted mean (see AVERAGE_WINDOW_S).
+
+        `value` None records a gap. Each reading stands for the time since the
+        previous record, at most AVERAGE_MAX_GAP_POLLS poll intervals (the first
+        one: one poll interval), clipped to the window.
+        """
+        if now is None:
+            now = time.monotonic()
+        try:
+            interval = max(1.0, float(self.cfg.poll_interval))
+        except (TypeError, ValueError):
+            interval = 30.0
+        window = max(AVERAGE_WINDOW_S, AVERAGE_MIN_POLLS * interval)
+        cap = AVERAGE_MAX_GAP_POLLS * interval
+        start = now - window
+        buf = self._avg_buf.setdefault(serial, {}).setdefault(key, [])
+        try:
+            v = None if value is None or isinstance(value, bool) else float(value)
+        except (TypeError, ValueError):
+            v = None
+        if v is not None and v != v:          # NaN
+            v = None
+        buf.append((now, v))
+        # Keep one record before the window as the anchor of the first one inside.
+        while len(buf) > 1 and buf[1][0] <= start:
+            del buf[0]
+        num = den = 0.0
+        n = 0
+        prev_t = None
+        last_ok = None
+        for t, x in buf:
+            span = min(cap, interval if prev_t is None else t - prev_t)
+            prev_t = t
+            w = t - max(t - span, start)
+            if x is None or w <= 0:
+                continue
+            num += x * w
+            den += w
+            n += 1
+            last_ok = t
+        if n < 2 or den < min(AVERAGE_MIN_COVER_S, window) or den <= 0:
+            return None
+        if now - last_ok > max(PLAUSIBLE_HOLD_S, AVERAGE_MAX_GAP_POLLS * interval):
+            return None
+        return round(num / den, 1)
+
     def _state_payload(self, serial: str, device, s: dict) -> dict:
         """Build the published state of one unit from its status.
 
@@ -2499,14 +2600,18 @@ class AmbientikaBridge:
             fresh = True
         if fresh:
             self._last_status[serial] = (dict(s), now_m)
+        temp, temp_avg = self._measured(serial, "temperature", s["temperature"], fresh)
+        hum, hum_avg = self._measured(serial, "humidity", s["humidity"], fresh)
         return {
             "operating_mode": shown.name,
             "operating_mode_raw": own.name,
             "fan_speed": s["fan_speed"].name,
             "humidity_level": s["humidity_level"].name,
             "light_sensor_level": s["light_sensor_level"].name,
-            "temperature": self._plausible(serial, "temperature", s["temperature"], fresh),
-            "humidity": self._plausible(serial, "humidity", s["humidity"], fresh),
+            "temperature": temp,
+            "humidity": hum,
+            "temperature_avg": temp_avg,
+            "humidity_avg": hum_avg,
             "air_quality": s["air_quality"],
             "humidity_alarm": s["humidity_alarm"],
             "filters_status": fs_eff,
@@ -4004,6 +4109,8 @@ def main() -> None:
     log.info("MQTT broker   : %s:%s", cfg.mqtt_host, cfg.mqtt_port)
     log.info("Topic prefix  : %s", cfg.topic_prefix)
     log.info("Poll interval : %ss", cfg.poll_interval)
+    log.info("Averaging     : %.0f min (humidity_avg, temperature_avg)",
+             max(AVERAGE_WINDOW_S, AVERAGE_MIN_POLLS * max(1, cfg.poll_interval)) / 60.0)
 
     if not cfg.username or not cfg.password:
         log.error("Ambientika username/password missing. Set 'ambientika_username' and "

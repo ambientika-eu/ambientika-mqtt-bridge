@@ -16,6 +16,8 @@ from returns.result import Success
 OM, FS, HL, LS = bridge.OperatingMode, bridge.FanSpeed, bridge.HumidityLevel, bridge.LightSensorLevel
 
 PORT = 18830
+# poll_interval is 2 s here: let the averaged sensors appear after a few polls
+bridge.AVERAGE_MIN_COVER_S = 4.0
 FAILS = []
 SPY = None
 def check(name, cond, extra=""):
@@ -198,6 +200,15 @@ async def scenario():
         cfgd = json.loads(disc[0]) if disc[0] else {}
         check("HA discovery 'Radon Meter Connected' retained", disc[1] == 1 and cfgd.get("device_class") == "connectivity", disc)
         check("discovery points to neuracell/state", cfgd.get("state_topic") == "ambientika/neuracell/state")
+        # 1.4.33: averaged sensors next to the raw values
+        da = retained("homeassistant/sensor/A0F262D56A3C_humidity_avg/config")
+        dac = json.loads(da[0]) if da[0] else {}
+        check("HA discovery 'Humidity (averaged)' retained", da[1] == 1 and dac.get("state_class") == "measurement"
+              and dac.get("value_template") == "{{ value_json.humidity_avg }}", da)
+        st = lambda: json.loads(spy.get("ambientika/A0F262D56A3C/state")[0] or "{}")
+        check("state carries humidity_avg / temperature_avg (55 / 21)",
+              await aw(lambda: st().get("humidity_avg") == 55.0 and st().get("temperature_avg") == 21.0), st())
+        check("raw humidity unchanged next to it", st().get("humidity") == 55, st())
         check("before any meter: connected = None", await aw(lambda: "radon_meter_connected" in spy.nc()) and spy.nc()["radon_meter_connected"] is None, spy.nc())
 
         print("\n[2] Meter comes online, sends start-up 0")

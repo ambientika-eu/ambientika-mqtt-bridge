@@ -13,6 +13,7 @@ LOG_LEVEL=$(bashio::config 'log_level')
 SLAVE_FILTER_SOFT_RESET=$(bashio::config 'slave_filter_soft_reset')
 FILTER_ACK_TTL_DAYS=$(bashio::config 'filter_ack_ttl_days')
 COMMAND_COALESCE_MS=$(bashio::config 'command_coalesce_ms')
+AVERAGE_WINDOW_MIN=$(bashio::config 'average_window_min')
 
 bashio::log.info "Starting Ambientika MQTT Bridge..."
 bashio::log.info "MQTT Broker: ${MQTT_HOST}:${MQTT_PORT}"
@@ -32,6 +33,7 @@ export LOG_LEVEL
 export SLAVE_FILTER_SOFT_RESET
 export FILTER_ACK_TTL_DAYS
 export COMMAND_COALESCE_MS
+export AVERAGE_WINDOW_MIN
 
 # Run the bridge
 exec python3 /app/bridge.py

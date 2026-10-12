@@ -2637,6 +2637,212 @@ async def test_mode_confirmed_slave_note():
     check("confirmed: Master-Zeile unveraendert", conf[1] == "operating mode Night confirmed on FLUR", conf)
 
 
+class _Clock:
+    """Ersetzt time.monotonic der Bridge fuer Zeitreihen ohne echtes Warten."""
+
+    def __init__(self, t=10000.0):
+        self.t = t
+        self._real = None
+
+    def __enter__(self):
+        self._real = bridge.time.monotonic
+        bridge.time.monotonic = lambda: self.t
+        return self
+
+    def __exit__(self, *a):
+        bridge.time.monotonic = self._real
+
+
+def _avg_bridge(poll=30):
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.enable_discovery = False
+    cfg.poll_interval = poll
+    b = bridge.AmbientikaBridge(cfg)
+    dev = FakeDevice(serial="BAD", name="Gaeste-Bad", zone=0, status=mkstatus(op=OM.Smart))
+    dev.role = "Master"
+    return b, dev
+
+
+def _avg_poll(b, dev, clock, h, t=21, dt=None):
+    if dt is not None:
+        clock.t += dt
+    dev._status["humidity"] = h
+    dev._status["temperature"] = t
+    return b._state_payload("BAD", dev, dict(dev._status))
+
+
+async def test_average():
+    """Gemittelte Sensoren (humidity_avg / temperature_avg): stabiler Wert ueber den
+    Wechseltakt, Rohwert unveraendert daneben (Vorschlag Kunde, Bridge 1.4.33)."""
+    # A) Kundenfall: Wechsel 90 % / 56 % bei jedem Abruf (30 s) -> Mittel 73 %
+    b, dev = _avg_bridge(30)
+    with _Clock() as c:
+        out = [_avg_poll(b, dev, c, 90 if i % 2 == 0 else 56, dt=30) for i in range(60)]
+    raw = [p["humidity"] for p in out]
+    avg = [p["humidity_avg"] for p in out]
+    check("avg: Rohwert bleibt unveraendert (90/56 im Wechsel)",
+          raw == [90 if i % 2 == 0 else 56 for i in range(60)], raw[:6])
+    check("avg: vor 2 min Abdeckung noch unbekannt", avg[:3] == [None, None, None], avg[:5])
+    check("avg: ab 4 Abrufen veroeffentlicht", all(v is not None for v in avg[3:]), avg[3:8])
+    check("avg: Mittel 73 %, ueber das volle Fenster stabil (+-1)",
+          all(72.0 <= v <= 74.0 for v in avg[20:]), avg[20:])
+    check("avg: eine Nachkommastelle", all(v == round(v, 1) for v in avg[3:]))
+    check("avg: Temperatur gemittelt (konstant 21)", all(p["temperature_avg"] == 21.0 for p in out[3:]),
+          [p["temperature_avg"] for p in out[:6]])
+
+    # B) kurzes Abrufintervall: dasselbe Paket wird dreimal gelesen (Geraet sendet alle
+    #    30 s, Abruf alle 10 s) - jede Lesung zaehlt nur fuer ihre 10 s, kein Ungleichgewicht
+    b, dev = _avg_bridge(10)
+    with _Clock() as c:
+        out = [_avg_poll(b, dev, c, 90 if (i // 3) % 2 == 0 else 56, dt=10) for i in range(180)]
+    avg = [p["humidity_avg"] for p in out]
+    check("avg: Wiederholungspakete gewichten richtig (Mittel 73 +-1)",
+          all(72.0 <= v <= 74.0 for v in avg[60:]), (min(avg[60:]), max(avg[60:])))
+
+    # C) Zusatzveroeffentlichung zwischen zwei Abrufen (z. B. Quittung) verschiebt nichts
+    b, dev = _avg_bridge(30)
+    with _Clock() as c:
+        for i in range(40):
+            _avg_poll(b, dev, c, 90 if i % 2 == 0 else 56, dt=30)
+            if i % 5 == 0:
+                _avg_poll(b, dev, c, 90 if i % 2 == 0 else 56, dt=0.5)
+        v = _avg_poll(b, dev, c, 90, dt=29.5)["humidity_avg"]
+    check("avg: Zusatzveroeffentlichung ohne Einfluss", 72.0 <= v <= 74.0, v)
+
+    # D) zurueckgehaltener Ausreisser (6 %) zaehlt nicht ins Mittel
+    b, dev = _avg_bridge(30)
+    with _Clock() as c:
+        out = [_avg_poll(b, dev, c, h, dt=30) for h in [55] * 10 + [6] + [55] * 5]
+    check("avg: Ausreisser 6 % nicht im Mittel", all(p["humidity_avg"] == 55.0 for p in out[3:]),
+          [p["humidity_avg"] for p in out])
+    check("avg: Rohwert haelt wie bisher den letzten plausiblen Wert",
+          [p["humidity"] for p in out] == [55] * 16)
+
+    # E) Duschspitze: Rohwert springt sofort, Mittel steigt verzoegert und faellt wieder
+    b, dev = _avg_bridge(30)
+    with _Clock() as c:
+        seq = [60] * 30 + [95] * 6 + [60] * 70
+        out = [_avg_poll(b, dev, c, h, dt=30) for h in seq]
+    avg = [p["humidity_avg"] for p in out]
+    check("avg: Duschspitze im Rohwert sofort", out[30]["humidity"] == 95)
+    check("avg: Mittel steigt mit der Spitze, aber gedaempft",
+          60.0 < avg[35] < 95.0 and avg[35] == max(avg[3:]), (avg[29:40], max(avg[3:])))
+    check("avg: nach dem Fenster wieder 60", avg[-1] == 60.0, avg[-5:])
+
+    # F) toter Sensor: nach dem Fenster ohne plausiblen Wert -> unbekannt
+    alt = bridge.PLAUSIBLE_HOLD_S
+    bridge.PLAUSIBLE_HOLD_S = 0.0
+    try:
+        b, dev = _avg_bridge(30)
+        with _Clock() as c:
+            out = [_avg_poll(b, dev, c, h, dt=30) for h in [55] * 10 + [0] * 50]
+        avg = [p["humidity_avg"] for p in out]
+        check("avg: toter Sensor -> Rohwert sofort unbekannt", out[10]["humidity"] is None)
+        check("avg: Mittel nur aus echten Werten, dann unbekannt",
+              avg[10] == 55.0 and avg[-1] is None, avg[8:])
+    finally:
+        bridge.PLAUSIBLE_HOLD_S = alt
+    # toter Sensor mit normaler Haltezeit: Mittel wird nach 10 min unbekannt wie der Rohwert
+    b, dev = _avg_bridge(30)
+    with _Clock() as c:
+        out = [_avg_poll(b, dev, c, h, dt=30) for h in [55] * 30 + [0] * 25]
+    raw = [p["humidity"] for p in out]
+    avg = [p["humidity_avg"] for p in out]
+    # (der Rohwert zaehlt die Haltezeit ab dem letzten neuen Paket, das Mittel ab der
+    #  letzten gezaehlten Lesung - beide sind spaetestens 10,5 min nach dem letzten
+    #  plausiblen Wert unbekannt)
+    check("avg: toter Sensor -> Mittel nach 10 min unbekannt wie der Rohwert",
+          avg[45] == 55.0 and all(v is None for v in avg[50:]) and all(v is None for v in raw[50:]),
+          (raw[44:52], avg[44:52]))
+    alt = bridge.PLAUSIBLE_HOLD_S
+    try:
+        pass
+    finally:
+        bridge.PLAUSIBLE_HOLD_S = alt
+
+    # G) langes Abrufintervall (300 s): Fenster mind. 10 Abrufe, nach 2 Abrufen sichtbar
+    b, dev = _avg_bridge(300)
+    with _Clock() as c:
+        out = [_avg_poll(b, dev, c, 90 if i % 2 == 0 else 56, dt=300) for i in range(40)]
+    # Fenster = max(1800 s, 20 x 300 s) = 100 min
+    avg = [p["humidity_avg"] for p in out]
+    check("avg: 300 s Abruf -> ab dem 2. Abruf ein Wert", avg[0] is None and avg[1] is not None, avg[:3])
+    check("avg: 300 s Abruf -> Fenster 20 Abrufe (100 min), danach stabil 73",
+          all(v == 73.0 for v in avg[20:]) and all(72.0 <= v <= 75.0 for v in avg[10:]), avg[10:])
+
+    # H) Ausfall: nach langer Luecke zaehlt der erste neue Wert nicht fuer die ganze Luecke
+    b, dev = _avg_bridge(30)
+    with _Clock() as c:
+        for _ in range(80):
+            _avg_poll(b, dev, c, 40, dt=30)
+        a1 = _avg_poll(b, dev, c, 80, dt=420)["humidity_avg"]    # 7 min ohne Abruf
+    # Fenster 1800 s: 40 % fuer die 1380 s vor der Luecke, 80 % nur fuer 60 s (2 Abrufe)
+    check("avg: Luecke wird nicht dem neuen Wert zugeschlagen", a1 == round((40 * 1380 + 80 * 60) / 1440, 1), a1)
+
+    # I) Werte aus Text, bool und NaN zaehlen nie (direkt ueber _average)
+    b, _ = _avg_bridge(30)
+    r = [b._average("X", "humidity", v, now=1000.0 + 30 * i)
+         for i, v in enumerate([50, True, float("nan"), "x", 50, 50, 50, 50])]
+    check("avg: bool/NaN/Text sind Luecken", r[-1] == 50.0 and r[3] is None, r)
+
+    # J) Slave: eigener Sensor, eigenes Mittel (kein Master-Wert)
+    b, dev = _avg_bridge(30)
+    with _Clock() as c:
+        for _ in range(6):
+            _avg_poll(b, dev, c, 70, dt=30)
+            b._state_payload("OTHER", dev, dict(dev._status, humidity=40))
+    check("avg: getrennt je Geraet",
+          b._average("BAD", "humidity", 70, now=c.t + 30) == 70.0
+          and b._average("OTHER", "humidity", 40, now=c.t + 30) == 40.0)
+
+    # K) Payload als JSON: unbekannt -> null (HA: unknown)
+    b, dev = _avg_bridge(30)
+    with _Clock() as c:
+        p = _avg_poll(b, dev, c, 55, dt=30)
+    js = json.loads(json.dumps(p))
+    check("avg: Felder im Payload, anfangs null", "humidity_avg" in js and js["humidity_avg"] is None
+          and "temperature_avg" in js and js["temperature_avg"] is None, js)
+
+    # L) Speicher bleibt begrenzt
+    b, dev = _avg_bridge(10)
+    with _Clock() as c:
+        for i in range(5000):
+            _avg_poll(b, dev, c, 50 + i % 7, dt=10)
+    n = len(b._avg_buf["BAD"]["humidity"])
+    check("avg: Puffer auf das Fenster begrenzt", n <= 181 + 1, n)
+
+
+def test_average_discovery_and_env():
+    cfg = bridge.BridgeConfig()
+    ents = dict(bridge.build_discovery_configs(cfg, "AMB-2", "Kitchen"))
+    h = ents.get("homeassistant/sensor/AMB-2_humidity_avg/config")
+    t = ents.get("homeassistant/sensor/AMB-2_temperature_avg/config")
+    check("disc: Humidity (averaged)", h and h["name"] == "Humidity (averaged)"
+          and h["value_template"] == "{{ value_json.humidity_avg }}"
+          and h["device_class"] == "humidity" and h["unit_of_measurement"] == "%"
+          and h["state_class"] == "measurement" and h["unique_id"] == "ambientika_AMB-2_humidity_avg", h)
+    check("disc: Temperature (averaged)", t and t["name"] == "Temperature (averaged)"
+          and t["device_class"] == "temperature" and t["unit_of_measurement"] == "°C"
+          and t["state_class"] == "measurement", t)
+    raw = ents.get("homeassistant/sensor/AMB-2_humidity/config")
+    check("disc: roher Feuchtesensor unveraendert", raw and raw["unique_id"] == "ambientika_AMB-2_humidity"
+          and raw["value_template"] == "{{ value_json.humidity }}")
+    check("avg: Standardfenster 30 min", bridge.AVERAGE_WINDOW_S == 1800.0, bridge.AVERAGE_WINDOW_S)
+    import subprocess
+    code = ("import importlib.util,sys;s=importlib.util.spec_from_file_location('b',sys.argv[1]);"
+            "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);print(m.AVERAGE_WINDOW_S)")
+    res = {}
+    for val in ("5", "abc", "0", "2000", "", "nan"):
+        env = dict(os.environ, AVERAGE_WINDOW_MIN=val)
+        r = subprocess.run([sys.executable, "-c", code, os.path.join(HERE, "bridge.py")],
+                           env=env, capture_output=True, text=True)
+        res[val] = r.stdout.strip() or r.stderr[-200:]
+    check("avg: AVERAGE_WINDOW_MIN wird gelesen und begrenzt",
+          res == {"5": "300.0", "abc": "1800.0", "0": "60.0", "2000": "86400.0", "": "1800.0", "nan": "1800.0"}, res)
+
+
 async def _async_suite():
     await test_neuracell()
     await test_neuracell_scoped()
@@ -2659,6 +2865,7 @@ async def _async_suite():
     await test_duplicate_packets()
     await test_log_rate_limit()
     await test_mode_confirmed_slave_note()
+    await test_average()
 
 
 def main():
@@ -2668,6 +2875,7 @@ def main():
     test_config()
     test_filter_ack_robust()
     test_discovery_raw_mode()
+    test_average_discovery_and_env()
     asyncio.run(_async_suite())
     print("\nRESULT:", "ALL PASS" if not FAILS else f"{len(FAILS)} FAIL -> {FAILS}")
     return 1 if FAILS else 0

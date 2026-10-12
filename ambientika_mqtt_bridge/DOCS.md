@@ -45,6 +45,7 @@ Then save and start the add-on. Your units appear under
 | `availability_failure_threshold` | `3` | Consecutive failed reads before a unit is shown as unavailable. Prevents flickering on a single cloud hiccup |
 | `log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR` |
 | `command_coalesce_ms` | `800` | Commands for the same unit within this window are applied in one call. `0` applies every command immediately |
+| `average_window_min` | `30` | Window of the averaged sensors *Humidity (averaged)* and *Temperature (averaged)*, in minutes (1–240; at least twenty poll intervals), see below |
 | `slave_filter_soft_reset` | `false` | Maintenance acknowledgement for Slave units, see below |
 | `filter_ack_ttl_days` | `90` | How long such an acknowledgement stays valid |
 
@@ -135,6 +136,35 @@ status packet again within two minutes (the cloud keeps the unit's last packet)
 does not count as a new reading. Meanwhile the last plausible value stays, for at most ten minutes, then
 the value shows as unknown - a failed sensor never looks live. Both events are
 written to the log once, at most once an hour for a flapping sensor.
+
+## Averaged humidity and temperature
+
+The unit reverses its airflow about every half minute, so its sensor sees room
+air and incoming air in turn and the humidity reading jumps by up to about 20
+percentage points between two reads. A single reading is therefore hard to use:
+a dashboard tile shows something different at every look, and an automation on
+a humidity threshold fires depending on the phase it happens to read.
+
+Each unit therefore has two more sensors, **Humidity (averaged)** and
+**Temperature (averaged)**: the time-weighted mean of the published readings over
+the last `average_window_min` minutes (30 by default, at least twenty poll
+intervals). Use them for the dashboard, for history and for automations with a
+threshold. The raw *Humidity* and *Temperature* stay unchanged next to them and
+react at once, e.g. to a shower. The mean covers the whole reversing cycle, room
+air and incoming air - a steady value, not a pure room-air value.
+
+What to expect: the cloud hands out about one packet per half minute, i.e. about
+one reading per reversal. Which phase of the cycle it catches drifts slowly, so
+the mean is much calmer than the raw value but can still wander by several
+points over an hour - with an upload rhythm close to the reversal rhythm more,
+with an irregular one less. A longer window (60 min) halves that swing at the
+price of a slower reaction. Keep `poll_interval` at 30 s (the default) or
+shorter; at 60 s and above the mean needs many more reads and scatters more.
+
+Held-back readings (see above) do not count. After a restart the averaged sensors
+show *unknown* until about two minutes of readings are in (with a long poll
+interval: two reads). Like the raw values they turn *unknown* when the sensor has
+delivered no plausible reading for ten minutes.
 
 ## What SMART is currently doing
 
