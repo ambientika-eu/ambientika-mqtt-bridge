@@ -11,15 +11,23 @@ Connects **Ambientika ventilation units** to the **Matter** smart home standard,
 enabling native control via **Apple Home**, **Google Home**, **Amazon Alexa**,
 **Samsung SmartThings** and any other Matter-compatible ecosystem.
 
-> This bridge runs as a local Python process on your network.
-> No cloud dependency, full privacy.
+> This component runs as a local Python process on your network and talks to
+> Matter and MQTT only. Where the unit data comes from depends on the bridge in
+> front of it: the [Ambientika MQTT Bridge](../README.md) reads the units through
+> the Ambientika server (the default, proven in the field), while the
+> [standalone local server](https://github.com/ambientika-eu/ambientika-local-standalone)
+> speaks to the units directly in the LAN (TCP 11000), so nothing leaves the
+> house once the units are commissioned. Both publish the same MQTT topics, so
+> this Matter bridge works unchanged with either.
 
 ## Architecture
 
 ```
 Ambientika Device (WiFi)
        |
-  [Ambientika MQTT Bridge]   <-- converts device REST/WebSocket to MQTT
+  [Ambientika MQTT Bridge]   <-- reads the units via the Ambientika server and
+       |                         publishes MQTT (or: the standalone local
+       |                         server, which reads the units directly in the LAN)
        |  (MQTT topics: ambientika/+/status)
        v
   [Mosquitto MQTT Broker]
@@ -154,6 +162,7 @@ directly in Apple Home.
 ## Related
 
 - [Main Repository](https://github.com/ambientika-eu/ambientika-mqtt-bridge)
+- [Standalone local server](https://github.com/ambientika-eu/ambientika-local-standalone) (runs the units without the Ambientika server)
 - [Home Assistant Add-on](../ha-addon/)
 - [Homebridge Plugin](../homebridge-plugin/) (alternative for Apple Home)
 - [Node-RED Flow](../examples/node-red/)
