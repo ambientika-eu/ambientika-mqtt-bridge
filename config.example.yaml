@@ -23,6 +23,10 @@ bridge:
   # 1 = flag offline on the first miss (old behaviour).
   availability_failure_threshold: 3
   log_level: "INFO"
+  # Own window of the averaged sensors (humidity_avg / temperature_avg) for
+  # single units: "name=minutes" by unit name or serial number, 1-240. Units
+  # not listed use AVERAGE_WINDOW_MIN (env, default 30).
+  average_window_devices: ""   # e.g. "Gäste-Bad=15, Schlafzimmer Eltern=60"
 
 # --- NeuraCell-X radon protection ---
 # Radon alarm -> all devices Intake (Zuluft/supply) at fan Low (Stufe 1).

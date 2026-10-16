@@ -258,6 +258,7 @@ back. Set `COMMAND_COALESCE_MS=0` to apply every command on its own, immediately
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `COMMAND_COALESCE_MS` | `800` | Commands for the same device within this window are applied in one call (`0` = off) |
 | `AVERAGE_WINDOW_MIN` | `30` | Window of `humidity_avg` / `temperature_avg` in minutes, 1-1440 (at least twenty poll intervals) |
+| `AVERAGE_WINDOW_DEVICES` | *(empty)* | Own window for single units: `name=minutes` entries, comma-separated, by unit name or serial number, 1-240 (e.g. `Gäste-Bad=15, Schlafzimmer Eltern=60`). Add-on option / `config.yaml` (`bridge:` section): `average_window_devices` |
 | `SLAVE_FILTER_SOFT_RESET` | `0` | Record a bridge-side "serviced" acknowledgement when a Slave's filter counter cannot be cleared remotely (see below) |
 | `FILTER_ACK_TTL_DAYS` | `90` | How long such an acknowledgement stays valid |
 | `FILTER_ACK_PATH` | `/data/filter_ack.json` | Where the acknowledgements are stored (needs a persistent volume) |
@@ -434,6 +435,26 @@ of 30-45 s, the raw value jumps by ~35 points, the 30-min mean wanders by up to 
 over hours and the 60-min mean by ~5-10; with an irregular upload rhythm (25-35 s)
 the mean stays within 1-2 points. Keep `POLL_INTERVAL` at 30 s or shorter; at 60 s
 and above the mean needs many more reads and scatters more.
+In a real installation (five units, three days, 30-min window) the mean varied by
+about 2.5 points within an hour against about 9 for the raw value, with daily means
+equal to the raw ones within 0.1 points; the unit reports humidity in steps of 2-3
+points, so a longer window gains little there and mainly adds delay.
+
+Since 1.4.34 single units can have their own window: `AVERAGE_WINDOW_DEVICES`
+(add-on option and `config.yaml` key `average_window_devices`) takes `name=minutes`
+entries separated by commas, semicolons or line breaks, matched case-insensitively
+against the unit name from the app or its serial number, 1-240 minutes each (plain
+number with a decimal point; a trailing `min` is fine; in `config.yaml` quote the
+value). Example: `Gäste-Bad=15, Schlafzimmer Eltern=60` - the bathroom follows a
+shower quickly, the bedroom is smoothed more, all other units keep
+`AVERAGE_WINDOW_MIN`. The floor of twenty poll intervals applies per unit as well.
+A shorter window follows a change faster but shows more of the residual swing
+described above (simulated: the 15-min mean swings about twice as much within an
+hour as the 30-min mean, the 60-min mean about half as much).
+The log shows the windows in force once the units are found (`Averaging per unit:
+...`); an entry that matches no unit or cannot be read is named there and
+ignored. For a name containing a comma or semicolon use the serial number. Names
+are matched at start-up.
 
 ### Availability debounce
 

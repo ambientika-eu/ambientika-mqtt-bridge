@@ -41,6 +41,7 @@ import os
 import signal
 import sys
 import time
+import unicodedata
 from typing import Any, Optional
 
 import paho.mqtt.client as mqtt
@@ -156,12 +157,17 @@ PLAUSIBLE_HOLD_S = 600.0
 #    window, if shorter); otherwise None (unknown), e.g. right after start. Like
 #    the raw value, it turns unknown when no plausible reading counted for
 #    PLAUSIBLE_HOLD_S (at least two poll intervals) - a dead sensor never looks live.
+#  * per unit: average_window_devices ("name=minutes", see BridgeConfig) gives
+#    single units their own window, e.g. a bathroom a short one that follows a
+#    shower quickly, a bedroom a long one. Range AVERAGE_DEVICE_WINDOW_MIN; the
+#    floor of AVERAGE_MIN_POLLS poll intervals applies here too.
 try:
     _aw = float(os.environ.get("AVERAGE_WINDOW_MIN", "30"))
     AVERAGE_WINDOW_S = 1800.0 if _aw != _aw else min(1440.0, max(1.0, _aw)) * 60.0   # NaN -> default
 except Exception:
     AVERAGE_WINDOW_S = 1800.0
 AVERAGE_MIN_POLLS = 20
+AVERAGE_DEVICE_WINDOW_MIN = (1.0, 240.0)   # minutes, as the add-on option average_window_min
 AVERAGE_MAX_GAP_POLLS = 2
 AVERAGE_MIN_COVER_S = 120.0
 # A status identical to the previous poll's is the same cached packet - unless it
@@ -531,6 +537,13 @@ def _env(*names: str, default: str = "") -> str:
     return default
 
 
+def _name_key(value) -> str:
+    """A device name or serial number as compared in per-unit options:
+    Unicode NFC, inner whitespace collapsed, case-insensitive - so "Gäste-Bad"
+    typed in the add-on matches the name from the app however it is encoded."""
+    return " ".join(unicodedata.normalize("NFC", str(value or "")).split()).casefold()
+
+
 class BridgeConfig:
     def __init__(self) -> None:
         self.username = ""
@@ -552,6 +565,12 @@ class BridgeConfig:
         # behaviour (offline on every single miss).
         self.availability_failure_threshold = 3
         self.log_level = "INFO"
+        # Own window of the averaged sensors for single units, overriding
+        # AVERAGE_WINDOW_MIN: "name=minutes" entries separated by commas or
+        # semicolons, by device name or serial number (case-insensitive).
+        # Empty = every unit uses AVERAGE_WINDOW_MIN. Example:
+        # "Gäste-Bad=15, Schlafzimmer Eltern=60".
+        self.average_window_devices = ""
 
         # --- NeuraCell-X radon protection ---
         self.neuracell_enabled = True
@@ -663,6 +682,51 @@ class BridgeConfig:
         """
         raw = str(self.dewpoint_block_devices or "").replace(";", ",")
         return {t.strip().lower() for t in raw.split(",") if t.strip()}
+
+    def average_window_entries(self):
+        """Parse average_window_devices.
+
+        Returns (entries, problems): entries is a list of (key, label, minutes) in
+        the order given - key as compared by _name_key, label as typed; problems
+        lists unusable or corrected entries in plain words for the log. Entries
+        are separated by commas, semicolons or line breaks; an entry is
+        "name=minutes". Without "=" in the entry, ":" separates instead. The last
+        separator counts, so "Bad: oben=15" names "Bad: oben"; a name containing
+        "=" cannot be written (use the serial number). Minutes are a plain
+        number with a decimal point, optionally followed by "min"; outside
+        AVERAGE_DEVICE_WINDOW_MIN they are clamped; anything else is ignored.
+        """
+        entries, problems = [], []
+        lo, hi = AVERAGE_DEVICE_WINDOW_MIN
+        raw = str(self.average_window_devices or "")
+        for ch in (";", "\r", "\n"):
+            raw = raw.replace(ch, ",")
+        for part in (p.strip() for p in raw.split(",")):
+            if not part:
+                continue
+            sep = "=" if "=" in part else (":" if ":" in part else "")
+            name, _, num = part.rpartition(sep) if sep else ("", "", "")
+            name = name.strip()
+            if not name:
+                problems.append("%r is not of the form name=minutes - ignored" % part)
+                continue
+            num = num.strip()
+            if num.lower().endswith("min"):
+                num = num[:-3].strip()
+            try:
+                minutes = float(num)
+            except ValueError:
+                minutes = float("nan")
+            if minutes != minutes or minutes in (float("inf"), float("-inf")):
+                problems.append("%r: %r is not a number of minutes - ignored" % (name, num.strip()))
+                continue
+            if not lo <= minutes <= hi:
+                clamped = min(hi, max(lo, minutes))
+                problems.append("%r: %g min is outside %g-%g - using %g"
+                                % (name, minutes, lo, hi, clamped))
+                minutes = clamped
+            entries.append((_name_key(name), name, minutes))
+        return entries, problems
 
     @property
     def dewpoint_device_block_mode_set(self) -> set:
@@ -791,6 +855,7 @@ class BridgeConfig:
             ("dewpoint_lost_action", ("DEWPOINT_LOST_ACTION",)),
             ("dewpoint_controller_topic", ("DEWPOINT_CONTROLLER_TOPIC",)),
             ("dewpoint_controller_key", ("DEWPOINT_CONTROLLER_KEY",)),
+            ("average_window_devices", ("AVERAGE_WINDOW_DEVICES",)),
         ):
             v = _env(*names)
             if v:
@@ -894,6 +959,8 @@ class BridgeConfig:
         cfg.availability_failure_threshold = int(br.get(
             "availability_failure_threshold", cfg.availability_failure_threshold))
         cfg.log_level = br.get("log_level", cfg.log_level)
+        awd = br.get("average_window_devices")
+        cfg.average_window_devices = "" if awd is None else str(awd)
 
         extras = {}
         extras.update(raw.get("neuracell", {}) or {})
@@ -924,6 +991,8 @@ class BridgeConfig:
         cfg.availability_failure_threshold = int(raw.get(
             "availability_failure_threshold", cfg.availability_failure_threshold))
         cfg.log_level = raw.get("log_level", cfg.log_level)
+        awd = raw.get("average_window_devices")
+        cfg.average_window_devices = "" if awd is None else str(awd)
         cfg._apply_extras(raw.get)
         cfg.apply_env_overrides()
         return cfg
@@ -2403,6 +2472,9 @@ class AmbientikaBridge:
         # serial -> {"temperature": [(monotonic t, value or None), ...], ...}:
         # readings for the averaged sensors (see AVERAGE_WINDOW_S and _average).
         self._avg_buf: dict = {}
+        # serial -> own averaging window in seconds, for the units listed in
+        # cfg.average_window_devices (see _resolve_average_windows).
+        self._avg_window: dict = {}
 
     # ----- values shown for a unit -----
     def _shown_mode(self, serial: str, device, own):
@@ -2533,6 +2605,62 @@ class AmbientikaBridge:
         held = st is not None and st.get("bad", 0) > 0
         return shown, self._average(serial, key, None if held else shown)
 
+    def _average_window_s(self, serial: str, interval: float) -> float:
+        """Effective averaging window of one unit in seconds: its own from
+        average_window_devices, else AVERAGE_WINDOW_S - at least
+        AVERAGE_MIN_POLLS poll intervals either way."""
+        return max(self._avg_window.get(serial, AVERAGE_WINDOW_S), AVERAGE_MIN_POLLS * interval)
+
+    def _resolve_average_windows(self) -> None:
+        """Map cfg.average_window_devices onto the discovered units (by serial
+        number or name, see _name_key) and log the result once.
+
+        Entries that match no unit, or that are unusable, are named in the log
+        and otherwise ignored - the unit keeps the global window. A later entry
+        for the same unit wins.
+        """
+        self._avg_window = {}
+        entries, problems = self.cfg.average_window_entries()
+        for p in problems:
+            log.warning("average_window_devices: %s.", p)
+        if not entries:
+            return
+        try:
+            interval = max(1.0, float(self.cfg.poll_interval))
+        except (TypeError, ValueError):
+            interval = 30.0
+        by_serial = {_name_key(s): s for s in self.devices}
+        by_name: dict = {}
+        for s, d in self.devices.items():
+            by_name.setdefault(_name_key(getattr(d, "name", "")), []).append(s)
+        set_by: dict = {}
+        for key, label, minutes in entries:
+            targets = [by_serial[key]] if key in by_serial else by_name.get(key, [])
+            if not targets:
+                log.warning("average_window_devices: no unit named %r - entry ignored. "
+                            "Units: %s.", label, ", ".join(
+                                sorted("%s (%s)" % (getattr(d, "name", "?"), s)
+                                       for s, d in self.devices.items())) or "(none)")
+                continue
+            for s in targets:
+                if s in set_by and self._avg_window[s] != minutes * 60.0:
+                    log.warning("average_window_devices: %s is listed more than once (%r, %r) "
+                                "- using %g min.", s, set_by[s], label, minutes)
+                self._avg_window[s] = minutes * 60.0
+                set_by[s] = label
+        shown = []
+        for s in sorted(self._avg_window, key=lambda x: str(getattr(self.devices[x], "name", x))):
+            own = self._avg_window[s]
+            eff = self._average_window_s(s, interval)
+            note = "" if eff == own else " (set %g, at least %d polls)" % (own / 60.0, AVERAGE_MIN_POLLS)
+            shown.append("%s %g min%s" % (getattr(self.devices[s], "name", s), eff / 60.0, note))
+        if not shown:                   # nothing matched - the warnings above say why
+            return
+        rest = len(self.devices) - len(self._avg_window)
+        log.info("Averaging per unit: %s%s.", ", ".join(shown),
+                 ("; all others %g min" % (max(AVERAGE_WINDOW_S, AVERAGE_MIN_POLLS * interval) / 60.0))
+                 if rest > 0 else "")
+
     def _average(self, serial: str, key: str, value, now: Optional[float] = None):
         """Record a reading and return the time-weighted mean (see AVERAGE_WINDOW_S).
 
@@ -2546,7 +2674,7 @@ class AmbientikaBridge:
             interval = max(1.0, float(self.cfg.poll_interval))
         except (TypeError, ValueError):
             interval = 30.0
-        window = max(AVERAGE_WINDOW_S, AVERAGE_MIN_POLLS * interval)
+        window = self._average_window_s(serial, interval)
         cap = AVERAGE_MAX_GAP_POLLS * interval
         start = now - window
         buf = self._avg_buf.setdefault(serial, {}).setdefault(key, [])
@@ -3875,6 +4003,13 @@ class AmbientikaBridge:
             else:
                 log.info("Radon source device: %s (serial %s) - read-only, not exposed as a fan.",
                          self.radon_device.name, serial)
+
+        try:
+            self._resolve_average_windows()
+        except Exception as e:      # an option typo must never stop the bridge
+            self._avg_window = {}
+            log.error("average_window_devices could not be applied (%r) - every unit "
+                      "uses the global window.", e)
 
     def _publish_discovery(self) -> None:
         if not self.cfg.enable_discovery or self.client is None:

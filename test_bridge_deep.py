@@ -2843,6 +2843,302 @@ def test_average_discovery_and_env():
           res == {"5": "300.0", "abc": "1800.0", "0": "60.0", "2000": "86400.0", "": "1800.0", "nan": "1800.0"}, res)
 
 
+class _LogCapture:
+    """Sammelt die Logzeilen der Bridge (Level >= INFO) fuer Pruefungen."""
+
+    def __init__(self):
+        import logging
+        self.lines = []
+        self._h = logging.Handler()
+        self._h.emit = lambda r: self.lines.append((r.levelname, r.getMessage()))
+        self._h.setLevel(logging.INFO)
+        self._lvl = None
+
+    def __enter__(self):
+        import logging
+        self._lvl = bridge.log.level
+        bridge.log.addHandler(self._h)
+        if bridge.log.getEffectiveLevel() > logging.INFO:
+            bridge.log.setLevel(logging.INFO)
+        return self
+
+    def __exit__(self, *a):
+        bridge.log.removeHandler(self._h)
+        bridge.log.setLevel(self._lvl)
+
+    def has(self, level, *parts):
+        return any(lv == level and all(p in msg for p in parts) for lv, msg in self.lines)
+
+
+def _house_bridge(names, poll=30, awd=""):
+    """Bridge mit Geraeten wie beim Kunden (Name -> Serial = Name in Grossbuchstaben)."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.enable_discovery = False
+    cfg.poll_interval = poll
+    cfg.average_window_devices = awd
+    b = bridge.AmbientikaBridge(cfg)
+    devs = {}
+    for i, n in enumerate(names):
+        d = FakeDevice(serial="SN-%d" % i, name=n, zone=0, status=mkstatus(op=OM.Smart))
+        d.role = "Master"
+        devs[d.serial_number] = d
+    b.devices = devs
+    return b, devs
+
+
+def test_average_per_device():
+    """Fenster je Geraet (average_window_devices), Vorschlag Kunde, Bridge 1.4.34."""
+    import unicodedata as _ud
+    C = bridge.BridgeConfig
+
+    def parse(s):
+        c = C()
+        c.average_window_devices = s
+        return c.average_window_entries()
+
+    # A) Parsen
+    e, p = parse("Gäste-Bad=15, Schlafzimmer Eltern=60; AMB-9:45")
+    check("win: drei Eintraege, keine Probleme",
+          [(k, m) for k, _, m in e] == [("gäste-bad", 15.0), ("schlafzimmer eltern", 60.0), ("amb-9", 45.0)]
+          and p == [], (e, p))
+    check("win: Bezeichnung wie eingegeben", [lbl for _, lbl, _ in e] == ["Gäste-Bad", "Schlafzimmer Eltern", "AMB-9"], e)
+    for s in ("", "  ", " , ; ", None):
+        e, p = parse(s)
+        check("win: leer %r -> nichts" % (s,), e == [] and p == [], (e, p))
+    e, p = parse("Bad, =10, Bad=, Küche=abc, Flur=nan, Keller=inf, WC=-inf")
+    check("win: unbrauchbare Eintraege ignoriert, je einmal gemeldet", e == [] and len(p) == 7, (e, p))
+    e, p = parse("Bad=0, Flur=500, WC=7.5, Keller= 20 ")
+    check("win: ausserhalb 1-240 begrenzt, Kommazahl und Leerzeichen ok",
+          [m for _, _, m in e] == [1.0, 240.0, 7.5, 20.0] and len(p) == 2
+          and "using 1" in p[0] and "using 240" in p[1], (e, p))
+    e, p = parse("Bad:EG=20, Bad OG : 30")
+    check("win: letztes Trennzeichen zaehlt, Namen mit ':'",
+          [(lbl, m) for _, lbl, m in e] == [("Bad:EG", 20.0), ("Bad OG", 30.0)], e)
+    e, p = parse("Bad=15 min\nWC=20min\r\nFlur = 45 MIN")
+    check("win: Zeilenumbruch trennt, 'min' hinter der Zahl erlaubt",
+          [(lbl, m) for _, lbl, m in e] == [("Bad", 15.0), ("WC", 20.0), ("Flur", 45.0)] and p == [], (e, p))
+    e, p = parse("A=B:15")
+    check("win: mit '=' trennt immer '=' (Name mit '=' -> Seriennummer)", e == [] and len(p) == 1, (e, p))
+    for v in (15, True, ["Bad=15"], {"Bad": 15}):
+        try:
+            e, p = parse(v)
+            ok = isinstance(e, list) and isinstance(p, list)
+        except Exception as ex:      # noqa: BLE001
+            ok, e = False, ex
+        check("win: Nicht-Text aus options.json %r -> kein Absturz" % (v,), ok, e)
+
+    # B) Zuordnung zu den Geraeten: Name (NFC/NFD, Gross/Klein, Leerzeichen) oder Serial
+    nfd = _ud.normalize("NFD", "Gäste-Bad")
+    b, devs = _house_bridge(["Flur", nfd, "Kinderzimmer", "Wohnzimmer", "Schlafzimmer Eltern"],
+                            awd="gäste-bad=15, SCHLAFZIMMER  ELTERN=60, sn-2=45, Keller=20")
+    with _LogCapture() as lc:
+        b._resolve_average_windows()
+    check("win: Bad (NFD im Geraetenamen) 15 min", b._avg_window.get("SN-1") == 900.0, b._avg_window)
+    check("win: Schlafzimmer (Gross, doppeltes Leerzeichen) 60 min", b._avg_window.get("SN-4") == 3600.0)
+    check("win: Kinderzimmer per Seriennummer 45 min", b._avg_window.get("SN-2") == 2700.0)
+    check("win: nicht genannte Geraete ohne eigenes Fenster",
+          "SN-0" not in b._avg_window and "SN-3" not in b._avg_window, b._avg_window)
+    check("win: unbekannter Name gewarnt, mit Geraeteliste",
+          lc.has("WARNING", "no unit named 'Keller'", "Flur (SN-0)"), lc.lines)
+    check("win: Startlog nennt die Fenster je Geraet",
+          lc.has("INFO", "Averaging per unit:", "15 min", "Schlafzimmer Eltern 60 min", "all others 30 min"),
+          lc.lines)
+    check("win: wirksames Fenster je Geraet",
+          b._average_window_s("SN-1", 30) == 900.0 and b._average_window_s("SN-0", 30) == 1800.0)
+
+    # C) Untergrenze 20 Abrufe gilt auch je Geraet, und der Log sagt es
+    b, devs = _house_bridge(["Bad"], poll=30, awd="Bad=5")
+    with _LogCapture() as lc:
+        b._resolve_average_windows()
+    check("win: 5 min bei 30 s Abruf -> wirksam 10 min",
+          b._average_window_s("SN-0", 30) == 600.0, b._average_window_s("SN-0", 30))
+    check("win: Log nennt die Untergrenze", lc.has("INFO", "Bad 10 min (set 5, at least 20 polls)"), lc.lines)
+
+    # D) Doppelt genannt: der spaetere Eintrag gilt, mit Warnung; gleicher Wert ohne Warnung
+    b, devs = _house_bridge(["Bad"], awd="Bad=15, SN-0=20")
+    with _LogCapture() as lc:
+        b._resolve_average_windows()
+    check("win: doppelt -> spaeterer Eintrag, Warnung",
+          b._avg_window["SN-0"] == 1200.0 and lc.has("WARNING", "listed more than once"), lc.lines)
+    b, devs = _house_bridge(["Bad"], awd="Bad=15, SN-0=15")
+    with _LogCapture() as lc:
+        b._resolve_average_windows()
+    check("win: doppelt mit gleichem Wert -> keine Warnung",
+          b._avg_window["SN-0"] == 900.0 and not lc.has("WARNING", "listed more than once"), lc.lines)
+
+    # E) Zwei Geraete mit gleichem Namen (zwei Haeuser): beide bekommen das Fenster
+    b, devs = _house_bridge(["Bad", "Bad"], awd="Bad=15")
+    b._resolve_average_windows()
+    check("win: gleicher Name -> beide", b._avg_window == {"SN-0": 900.0, "SN-1": 900.0}, b._avg_window)
+
+    # F) Leer -> keine Zuordnung, kein Log
+    b, devs = _house_bridge(["Bad"], awd="")
+    with _LogCapture() as lc:
+        b._resolve_average_windows()
+    check("win: leer -> nichts, kein Log", b._avg_window == {} and not lc.lines, lc.lines)
+    # Nichts passt -> nur die Warnung, keine leere Infozeile
+    b, devs = _house_bridge(["Bad"], awd="Keller=15")
+    with _LogCapture() as lc:
+        b._resolve_average_windows()
+    check("win: nichts passt -> keine leere Infozeile",
+          b._avg_window == {} and not lc.has("INFO", "Averaging per unit") and lc.has("WARNING", "Keller"),
+          lc.lines)
+    # Alle genannt -> ohne "all others"
+    b, devs = _house_bridge(["Bad", "WC"], awd="Bad=15, WC=20")
+    with _LogCapture() as lc:
+        b._resolve_average_windows()
+    check("win: alle genannt -> kein 'all others'",
+          lc.has("INFO", "Averaging per unit: Bad 15 min, WC 20 min.")
+          and not lc.has("INFO", "all others"), lc.lines)
+    # Seriennummer geht vor einem gleichlautenden Geraetenamen
+    b, devs = _house_bridge(["SN-1", "Flur"], awd="sn-1=15")
+    b._resolve_average_windows()
+    check("win: Seriennummer vor gleichlautendem Namen", b._avg_window == {"SN-1": 900.0}, b._avg_window)
+
+    # F2) Nicht genannte Geraete rechnen exakt wie ohne Option (Zufallsfolge)
+    import random as _rnd
+    rng = _rnd.Random(11)
+    seq = [(rng.choice([0, 5, 10, 30, 30, 30, 31, 60, 400]),
+            rng.choice([None, 40, 55, 56, 90, 12.5, float("nan"), True, "x"])) for _ in range(3000)]
+    b0, _ = _house_bridge(["Bad", "Flur"], awd="")
+    b1, _ = _house_bridge(["Bad", "Flur"], awd="Bad=7")
+    b1._resolve_average_windows()
+    t, same = 50000.0, True
+    for dt, v in seq:
+        t += dt
+        a0 = b0._average("SN-1", "humidity", v, now=t)
+        b1._average("SN-0", "humidity", v, now=t)
+        a1 = b1._average("SN-1", "humidity", v, now=t)
+        same = same and a0 == a1
+    check("win: nicht genanntes Geraet unveraendert (3000 Zufallswerte)",
+          same and b0._avg_buf["SN-1"] == b1._avg_buf["SN-1"])
+
+    # G) Wirkung: Sprung 50 -> 90 %; 15/30/60 min erreichen den neuen Wert nach ihrem Fenster
+    b, devs = _house_bridge(["Bad", "Flur", "Schlafzimmer"], awd="Bad=15, Schlafzimmer=60")
+    b._resolve_average_windows()
+    res = {s: [] for s in devs}
+    with _Clock() as c:
+        for i in range(120 + 80):              # 60 min 50 %, dann 40 min 90 %
+            c.t += 30
+            h = 50 if i < 120 else 90
+            for s, d in devs.items():
+                d._status["humidity"] = h
+                res[s].append(b._state_payload(s, d, dict(d._status))["humidity_avg"])
+    at = lambda s, m: res[s][120 + int(m * 2) - 1]  # m Minuten nach dem Sprung
+    check("win: vor dem Sprung alle 50", all(res[s][119] == 50.0 for s in devs), [res[s][119] for s in devs])
+    check("win: 15 min nach dem Sprung: Bad 90, Flur ~70, Schlafzimmer ~60",
+          at("SN-0", 15) == 90.0 and 69.0 <= at("SN-1", 15) <= 71.0 and 59.0 <= at("SN-2", 15) <= 61.0,
+          (at("SN-0", 15), at("SN-1", 15), at("SN-2", 15)))
+    check("win: 30 min nach dem Sprung: Flur 90, Schlafzimmer ~70",
+          at("SN-1", 30) == 90.0 and 69.0 <= at("SN-2", 30) <= 71.0, (at("SN-1", 30), at("SN-2", 30)))
+    check("win: 7,5 min nach dem Sprung: Bad ~70", 69.0 <= at("SN-0", 7.5) <= 71.0, at("SN-0", 7.5))
+    check("win: Puffer je Geraet auf sein Fenster begrenzt",
+          len(b._avg_buf["SN-0"]["humidity"]) <= 31 + 1 and len(b._avg_buf["SN-2"]["humidity"]) <= 121 + 1,
+          (len(b._avg_buf["SN-0"]["humidity"]), len(b._avg_buf["SN-2"]["humidity"])))
+
+    # H) Kundenrhythmus 90/56 im Wechsel: Bad (15 min) und Schlafzimmer (60 min) mitteln beide auf 73
+    b, devs = _house_bridge(["Bad", "Schlafzimmer"], awd="Bad=15, Schlafzimmer=60")
+    b._resolve_average_windows()
+    out = {s: [] for s in devs}
+    with _Clock() as c:
+        for i in range(200):
+            c.t += 30
+            for s, d in devs.items():
+                d._status["humidity"] = 90 if i % 2 == 0 else 56
+                out[s].append(b._state_payload(s, d, dict(d._status))["humidity_avg"])
+    check("win: Wechseltakt -> Bad 73 +-1 ab 15 min", all(72.0 <= v <= 74.0 for v in out["SN-0"][30:]),
+          (min(out["SN-0"][30:]), max(out["SN-0"][30:])))
+    check("win: Wechseltakt -> Schlafzimmer 73 +-1 ab 60 min", all(72.0 <= v <= 74.0 for v in out["SN-1"][120:]),
+          (min(out["SN-1"][120:]), max(out["SN-1"][120:])))
+
+    # I) Konfiguration: options.json, YAML (bridge:), Umgebungsvariable, null
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    old_env = os.environ.pop("AVERAGE_WINDOW_DEVICES", None)
+    try:
+        pj = os.path.join(tmp, "options.json")
+        with open(pj, "w") as f:
+            json.dump({"ambientika_username": "u", "average_window_devices": "Gäste-Bad=15"}, f)
+        check("cfg: options.json", C.from_ha_options(pj).average_window_devices == "Gäste-Bad=15")
+        with open(pj, "w") as f:
+            json.dump({"ambientika_username": "u", "average_window_devices": None}, f)
+        check("cfg: options.json null -> leer", C.from_ha_options(pj).average_window_devices == "")
+        with open(pj, "w") as f:
+            json.dump({"ambientika_username": "u"}, f)
+        check("cfg: options.json ohne Schluessel -> leer", C.from_ha_options(pj).average_window_devices == "")
+        yp = os.path.join(tmp, "config.yaml")
+        with open(yp, "w") as f:
+            f.write("bridge:\n  poll_interval: 30\n  average_window_devices: \"Bad=15, Flur=45\"\n")
+        check("cfg: YAML bridge-Abschnitt", C.from_yaml(yp).average_window_devices == "Bad=15, Flur=45")
+        with open(yp, "w") as f:
+            f.write("bridge:\n  poll_interval: 30\n")
+        check("cfg: YAML ohne Schluessel -> leer", C.from_yaml(yp).average_window_devices == "")
+        os.environ["AVERAGE_WINDOW_DEVICES"] = "WC=20"
+        check("cfg: Umgebungsvariable", C.from_env().average_window_devices == "WC=20")
+        os.environ["AVERAGE_WINDOW_DEVICES"] = "null"
+        check("cfg: Umgebungsvariable 'null' (bashio) -> leer", C.from_env().average_window_devices == "")
+    finally:
+        os.environ.pop("AVERAGE_WINDOW_DEVICES", None)
+        if old_env is not None:
+            os.environ["AVERAGE_WINDOW_DEVICES"] = old_env
+
+
+class _FakeRoom:
+    def __init__(self, devices):
+        self.devices = devices
+
+
+class _FakeHouse:
+    def __init__(self, hid, rooms):
+        self.id = hid
+        self.rooms = rooms
+
+
+class _FakeApi:
+    def __init__(self, houses):
+        self._houses = houses
+
+    async def houses(self):
+        return Success(self._houses)
+
+
+async def test_average_per_device_discovery():
+    """average_window_devices wird bei der Geraetesuche aufgeloest - ein Fehler darin
+    haelt die Bridge nie an."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = True
+    cfg.dewpoint_source = "device"
+    cfg.dewpoint_device_serial = "TPS-1"
+    cfg.average_window_devices = "Bad=15, Taupunkt=20"
+    b = bridge.AmbientikaBridge(cfg)
+    bad = FakeDevice(serial="B-1", name="Bad", zone=0)
+    tps = FakeDevice(serial="TPS-1", name="Taupunkt", zone=0)
+    b.api = _FakeApi([_FakeHouse(1, [_FakeRoom([bad, tps])])])
+    with _LogCapture() as lc:
+        await b._discover_devices()
+    check("disc-win: Bad 15 min nach der Geraetesuche", b._avg_window == {"B-1": 900.0}, b._avg_window)
+    check("disc-win: TPS (kein Luefter) gilt als unbekannt", lc.has("WARNING", "no unit named 'Taupunkt'"), lc.lines)
+
+    cfg2 = bridge.BridgeConfig()
+    cfg2.neuracell_enabled = False
+    cfg2.dewpoint_enabled = False
+    cfg2.average_window_devices = "Bad=15"
+    b2 = bridge.AmbientikaBridge(cfg2)
+    b2.api = _FakeApi([_FakeHouse(1, [_FakeRoom([FakeDevice(serial="B-1", name="Bad", zone=0)])])])
+
+    def boom():
+        raise RuntimeError("kaputt")
+    cfg2.average_window_entries = boom
+    with _LogCapture() as lc:
+        await b2._discover_devices()
+    check("disc-win: Fehler -> Geraetesuche laeuft durch, globales Fenster",
+          "B-1" in b2.devices and b2._avg_window == {} and lc.has("ERROR", "could not be applied"),
+          (list(b2.devices), b2._avg_window, lc.lines))
+
+
 async def _async_suite():
     await test_neuracell()
     await test_neuracell_scoped()
@@ -2866,6 +3162,7 @@ async def _async_suite():
     await test_log_rate_limit()
     await test_mode_confirmed_slave_note()
     await test_average()
+    await test_average_per_device_discovery()
 
 
 def main():
@@ -2876,6 +3173,7 @@ def main():
     test_filter_ack_robust()
     test_discovery_raw_mode()
     test_average_discovery_and_env()
+    test_average_per_device()
     asyncio.run(_async_suite())
     print("\nRESULT:", "ALL PASS" if not FAILS else f"{len(FAILS)} FAIL -> {FAILS}")
     return 1 if FAILS else 0

@@ -46,6 +46,7 @@ Then save and start the add-on. Your units appear under
 | `log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR` |
 | `command_coalesce_ms` | `800` | Commands for the same unit within this window are applied in one call. `0` applies every command immediately |
 | `average_window_min` | `30` | Window of the averaged sensors *Humidity (averaged)* and *Temperature (averaged)*, in minutes (1–240; at least twenty poll intervals), see below |
+| `average_window_devices` | *(empty)* | Own window for single units, e.g. `Gäste-Bad=15, Schlafzimmer Eltern=60` (unit name or serial number `=` minutes, 1–240). Units not listed use `average_window_min`, see below |
 | `slave_filter_soft_reset` | `false` | Maintenance acknowledgement for Slave units, see below |
 | `filter_ack_ttl_days` | `90` | How long such an acknowledgement stays valid |
 
@@ -160,6 +161,35 @@ points over an hour - with an upload rhythm close to the reversal rhythm more,
 with an irregular one less. A longer window (60 min) halves that swing at the
 price of a slower reaction. Keep `poll_interval` at 30 s (the default) or
 shorter; at 60 s and above the mean needs many more reads and scatters more.
+
+In a real installation with five units over three days, the 30-minute mean
+varied by about 2.5 percentage points within an hour (raw: about 9), and its daily
+mean matched the raw daily mean to 0.1 points. The unit reports humidity in steps
+of 2–3 points, so a longer window gains little there and mainly adds delay.
+
+**A window per unit.** A bathroom should follow a shower quickly, a bedroom can
+take much more smoothing. `average_window_devices` gives single units their own
+window: `name=minutes` entries separated by commas, by the unit's name as in the
+Ambientika app or its serial number (upper/lower case does not matter), for
+example
+
+```yaml
+average_window_devices: "Gäste-Bad=15, Schlafzimmer Eltern=60"
+```
+
+Units not listed keep `average_window_min`. Each entry takes 1–240 minutes; the
+floor of twenty poll intervals applies here too (10 minutes at the default 30 s).
+A shorter window follows a change faster but shows more of the residual swing
+described above: simulated with an irregular upload rhythm, the 15-minute mean
+swings about twice as much within an hour as the 30-minute mean, the 60-minute
+mean about half as much. 15 minutes is a sensible lower end for a bathroom.
+The add-on log shows the windows in force right after the units are found, e.g.
+`Averaging per unit: Gäste-Bad 15 min, Schlafzimmer Eltern 60 min; all others
+30 min.` The minutes are a plain number (decimal point, e.g. `7.5`; a trailing
+`min` is fine). A name that matches no unit, or an entry the bridge cannot read,
+is named in the log and ignored. For a unit whose name contains a comma or
+semicolon, use its serial number. Names are read at start-up: after renaming a
+unit in the app, restart the add-on.
 
 Held-back readings (see above) do not count. After a restart the averaged sensors
 show *unknown* until about two minutes of readings are in (with a long poll
