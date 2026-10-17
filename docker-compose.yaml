@@ -4,13 +4,21 @@ services:
     image: ambientika-mqtt-bridge
     build: .
     restart: unless-stopped
-    volumes:
-      - ./config.yaml:/config/config.yaml:ro
+    # Either fill in ./config.yaml (see config.example.yaml) or set these in .env
+    # (see .env.example); a variable set here overrides the YAML value. Only the
+    # variables listed here reach the container - for anything else use
+    # config.yaml or add the variable to this list.
     environment:
       - AMBIENTIKA_USER=${AMBIENTIKA_USER:-}
       - AMBIENTIKA_PASS=${AMBIENTIKA_PASS:-}
       - MQTT_HOST=${MQTT_HOST:-mosquitto}
       - MQTT_PORT=${MQTT_PORT:-1883}
+      - MQTT_USER=${MQTT_USER:-}
+      - MQTT_PASSWORD=${MQTT_PASSWORD:-}
+      - SLAVE_FILTER_SOFT_RESET=${SLAVE_FILTER_SOFT_RESET:-0}
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - bridge_data:/data
     depends_on:
       - mosquitto
 
@@ -24,5 +32,6 @@ services:
       - mosquitto_log:/mosquitto/log
 
 volumes:
+  bridge_data:
   mosquitto_data:
   mosquitto_log:

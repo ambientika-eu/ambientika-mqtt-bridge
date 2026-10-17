@@ -48,9 +48,11 @@ def check(name, cond, extra=""):
 class FakeClient:
     def __init__(self):
         self.pub = []
+        self.pubr = []          # (topic, payload, retain)
 
     def publish(self, t, p, qos=0, retain=False):
         self.pub.append((t, p))
+        self.pubr.append((t, p, retain))
 
     def subscribe(self, *a, **k):
         pass
@@ -2079,6 +2081,256 @@ async def test_filter_ack_poll_path():
         bridge._FILTER_ACK_ODD_RAW.clear()
 
 
+def test_filter_ack_status_sensor():
+    """Quittung sichtbar machen (Kundenfall Okt. 2026, Bridge 1.4.35).
+
+    Vorher: nach einem Neustart/Update stand "Filter Reset Status" bei jedem
+    Geraet auf idle - auch bei einem Slave mit gueltiger Quittung -, und wann
+    die Quittung ablaeuft, war nirgends zu sehen. Jetzt: Startzustand
+    "acknowledged", solange die Quittung gilt; zwei Zeitstempel-Sensoren
+    "quittiert seit" / "gueltig bis"; faellt die Quittung weg, geht der
+    Status-Sensor auf idle zurueck, ohne Neustart.
+    """
+    import time as _t
+    AB = bridge.AmbientikaBridge
+    old_env = {k: os.environ.get(k) for k in ("SLAVE_FILTER_SOFT_RESET", "FILTER_ACK_PATH", "FILTER_ACK_TTL_DAYS")}
+    os.environ["SLAVE_FILTER_SOFT_RESET"] = "1"
+    os.environ["FILTER_ACK_PATH"] = os.path.join(_tempfile.mkdtemp(), "filter_ack.json")
+    os.environ["FILTER_ACK_TTL_DAYS"] = "90"
+    pfx = "ambientika"
+
+    def resets(client, serial):
+        return [p for t, p in client.pub if t == bridge.reset_state_topic(pfx, serial)]
+
+    def mk():
+        cfg = bridge.BridgeConfig()
+        cfg.neuracell_enabled = False
+        cfg.dewpoint_enabled = False
+        cfg.enable_discovery = False
+        b = bridge.AmbientikaBridge(cfg)
+        b.client = FakeClient()
+        master = FakeDevice(serial="FLUR", name="Flur", zone=0, status=mkstatus(op=OM.Smart))
+        master.role = "Master"
+        slave = FakeDevice(serial="WOZI", name="Wohnzimmer", zone=0, status=mkstatus(op=OM.Surveillance))
+        slave._status["filters_status"] = "Bad"
+        b.devices = {"FLUR": master, "WOZI": slave}
+        return b, master, slave
+
+    try:
+        check("ackui: ISO 8601 mit Offset", bridge._iso_utc(0) == "1970-01-01T00:00:00+00:00", bridge._iso_utc(0))
+
+        # Discovery: die beiden Zeitstempel nur mit eingeschalteter Option
+        ents = bridge.build_discovery_configs(bridge.BridgeConfig(), "WOZI", "Wohnzimmer")
+        ts = {t: p for t, p in ents if t.endswith(("_filter_ack_since/config", "_filter_ack_until/config"))}
+        check("ackui: zwei Zeitstempel-Sensoren in der Discovery", len(ts) == 2, list(ts))
+        check("ackui: device_class timestamp, diagnostic, eigene unique_id",
+              all(p["device_class"] == "timestamp" and p["entity_category"] == "diagnostic"
+                  and p["unique_id"] in ("ambientika_WOZI_filter_ack_since", "ambientika_WOZI_filter_ack_until")
+                  and p["value_template"] in ("{{ value_json.filter_ack_since | default('None', true) }}",
+                                              "{{ value_json.filter_ack_until | default('None', true) }}")
+                  for p in ts.values()), ts)
+        check("ackui: Option an -> nichts zu entfernen", bridge.discovery_removals(bridge.BridgeConfig(), "WOZI") == [])
+        os.environ["SLAVE_FILTER_SOFT_RESET"] = "0"
+        ents = bridge.build_discovery_configs(bridge.BridgeConfig(), "WOZI", "Wohnzimmer")
+        check("ackui: Option aus -> keine Zeitstempel-Sensoren",
+              not any("filter_ack_" in t for t, _ in ents))
+        check("ackui: Option aus -> die beiden Config-Topics werden geleert",
+              sorted(bridge.discovery_removals(bridge.BridgeConfig(), "WOZI")) == sorted(ts), bridge.discovery_removals(bridge.BridgeConfig(), "WOZI"))
+        # ueber den echten Discovery-Pfad: leere, retained Nachricht je Topic
+        cfg0 = bridge.BridgeConfig(); cfg0.neuracell_enabled = False; cfg0.dewpoint_enabled = False
+        b0 = bridge.AmbientikaBridge(cfg0); b0.client = FakeClient()
+        b0.devices = {"WOZI": FakeDevice(serial="WOZI", name="Wohnzimmer", zone=0)}
+        b0._publish_discovery()
+        cleared = [(t, p, r) for t, p, r in b0.client.pubr if "_filter_ack_" in t]
+        check("ackui: Discovery-Pfad leert die Topics (leer, retained)",
+              len(cleared) == 2 and all(p == "" and r is True for _, p, r in cleared), cleared)
+        os.environ["SLAVE_FILTER_SOFT_RESET"] = "1"
+        b0.client = FakeClient(); b0._publish_discovery()
+        check("ackui: Option an -> Discovery-Pfad veroeffentlicht die Sensoren, leert nichts",
+              sum(1 for t, p in b0.client.pub if "_filter_ack_" in t and p != "") == 2
+              and not any(p == "" for t, p in b0.client.pub if "_filter_ack_" in t), b0.client.pub)
+
+        # Ohne Quittung: Start idle, Felder null
+        b, master, slave = mk()
+        check("ackui: ohne Quittung kein Datensatz", AB._filter_ack_record("WOZI") is None)
+        b._publish_initial_reset_states()
+        check("ackui: Start ohne Quittung -> idle fuer alle",
+              resets(b.client, "WOZI") == ["idle"] and resets(b.client, "FLUR") == ["idle"], b.client.pub)
+        pl = b._state_payload("WOZI", slave, dict(slave._status))
+        check("ackui: ohne Quittung since/until null",
+              pl["filter_ack_since"] is None and pl["filter_ack_until"] is None and pl["filters_status"] == "Bad", pl)
+        check("ackui: Payload bleibt JSON", json.dumps(pl) is not None)
+
+        # Mit Quittung: Start acknowledged (nur der Slave), Log nennt sie, Felder gefuellt
+        AB._filter_ack_write("WOZI", "Bad")
+        rec = AB._filter_ack_record("WOZI")
+        check("ackui: Datensatz mit acked_at/valid_until (90 Tage)",
+              rec and abs(rec["valid_until"] - rec["acked_at"] - 90 * 86400) < 1e-6
+              and abs(rec["acked_at"] - _t.time()) < 5 and rec["raw_when_acked"] == "Bad", rec)
+        b, master, slave = mk()
+        with _LogCatch() as lc:
+            b._publish_initial_reset_states()
+        check("ackui: Start mit Quittung -> acknowledged fuer den Slave, idle fuer den Master",
+              resets(b.client, "WOZI") == ["acknowledged"] and resets(b.client, "FLUR") == ["idle"], b.client.pub)
+        check("ackui: Startlog nennt Geraet, Datum und Ablauf",
+              lc.has("INFO", "filter acknowledgement for WOZI (Wohnzimmer) still in force")
+              and lc.has("INFO", "runs out 20"), lc.lines)
+        pl = b._state_payload("WOZI", slave, dict(slave._status))
+        exp_since = bridge._iso_utc(rec["acked_at"])
+        exp_until = bridge._iso_utc(rec["acked_at"] + 90 * 86400)
+        check("ackui: since/until im Payload, effektiv Good, roh Bad",
+              pl["filter_ack_since"] == exp_since and pl["filter_ack_until"] == exp_until
+              and pl["filters_status"] == "Good" and pl["filters_status_raw"] == "Bad", pl)
+        check("ackui: Zeitstempel von HA lesbar (fromisoformat, mit Zeitzone)",
+              bridge.datetime.fromisoformat(pl["filter_ack_since"]).tzinfo is not None)
+        plm = b._state_payload("FLUR", master, dict(master._status))
+        check("ackui: Master ohne Quittung -> null", plm["filter_ack_since"] is None and plm["filter_ack_until"] is None)
+
+        # Laufender Betrieb: Quittung erscheint -> acknowledged einmal; nichts doppelt
+        b, master, slave = mk()
+        b._publish_reset_state("WOZI", "idle")
+        b._publish_state("WOZI", b._state_payload("WOZI", slave, dict(slave._status)))
+        b._publish_state("WOZI", b._state_payload("WOZI", slave, dict(slave._status)))
+        check("ackui: Quittung im Betrieb -> Status einmal auf acknowledged",
+              resets(b.client, "WOZI") == ["idle", "acknowledged"], resets(b.client, "WOZI"))
+        # Waehrend eines laufenden Resets bleibt der Status unangetastet
+        b._reset_inflight.add("WOZI")
+        b._publish_reset_state("WOZI", "running")
+        b._publish_state("WOZI", b._state_payload("WOZI", slave, dict(slave._status)))
+        check("ackui: laufender Reset wird nicht ueberschrieben",
+              resets(b.client, "WOZI")[-1] == "running", resets(b.client, "WOZI"))
+        b._reset_inflight.discard("WOZI")
+        b._publish_reset_state("WOZI", "acknowledged")
+        # Ablauf der Frist: der Poll entfernt die Quittung (mit Logzeile) -> idle, Felder null
+        data = AB._filter_ack_load()
+        data["WOZI"]["acked_at"] = _t.time() - 91 * 86400
+        AB._filter_ack_save(data)
+        with _LogCatch() as lc:
+            pl = b._state_payload("WOZI", slave, dict(slave._status))
+            b._publish_state("WOZI", pl)
+        check("ackui: nach Ablauf -> Rohwert, Felder null, Status idle, Logzeile",
+              pl["filters_status"] == "Bad" and pl["filter_ack_since"] is None
+              and resets(b.client, "WOZI")[-1] == "idle" and lc.has("INFO", "validity of 90 days ran out"),
+              (pl, resets(b.client, "WOZI"), lc.lines))
+        n = len(resets(b.client, "WOZI"))
+        b._publish_state("WOZI", b._state_payload("WOZI", slave, dict(slave._status)))
+        check("ackui: ohne Quittung bleibt idle, keine weitere Meldung", len(resets(b.client, "WOZI")) == n)
+        # Ein abgeschlossener Master-Reset ("confirmed") bleibt stehen
+        b._publish_reset_state("FLUR", "confirmed")
+        b._publish_state("FLUR", b._state_payload("FLUR", master, dict(master._status)))
+        check("ackui: confirmed ohne Quittung bleibt confirmed", resets(b.client, "FLUR")[-1] == "confirmed")
+
+        # Option aus: gespeicherte Quittung zaehlt nicht
+        AB._filter_ack_write("WOZI", "Bad")
+        os.environ["SLAVE_FILTER_SOFT_RESET"] = "0"
+        b, master, slave = mk()
+        b._publish_initial_reset_states()
+        pl = b._state_payload("WOZI", slave, dict(slave._status))
+        check("ackui: Option aus -> idle und null trotz Datensatz",
+              resets(b.client, "WOZI") == ["idle"] and pl["filter_ack_since"] is None and pl["filters_status"] == "Bad",
+              (resets(b.client, "WOZI"), pl))
+        # Kaputter Datensatz -> kein Absturz, kein acknowledged
+        os.environ["SLAVE_FILTER_SOFT_RESET"] = "1"
+        data = AB._filter_ack_load()
+        data["WOZI"]["acked_at"] = "kaputt"
+        AB._filter_ack_save(data)
+        check("ackui: kaputtes acked_at -> idle", AB._filter_ack_record("WOZI") is None
+              and mk()[0]._initial_reset_state("WOZI") == "idle")
+
+        # Review-Befunde: beschaedigte Datei darf weder den Start noch den Abruf kosten
+        def damaged(label, content):
+            with open(os.environ["FILTER_ACK_PATH"], "w", encoding="utf-8") as f:
+                f.write(content)
+            bb, _mm, ss = mk()
+            try:
+                bb._publish_initial_reset_states()
+                pl2 = bb._state_payload("WOZI", ss, dict(ss._status))
+                bb._publish_state("WOZI", pl2)
+                ok = (resets(bb.client, "WOZI") == ["idle"] and pl2["filters_status"] == "Bad"
+                      and pl2["filter_ack_since"] is None and AB._filter_ack_record("WOZI") is None)
+                check("ackui: %s -> kein Absturz, idle, Rohwert" % label, ok, (resets(bb.client, "WOZI"), pl2))
+            except Exception as ex:      # noqa: BLE001
+                check("ackui: %s -> kein Absturz" % label, False, repr(ex))
+        damaged("Datensatz kein Objekt", json.dumps({"WOZI": "Bad"}))
+        damaged("Datei kein Objekt", json.dumps([1, 2]))
+        damaged("Datei kein JSON", "{kaputt")
+        damaged("acked_at in Millisekunden", json.dumps({"WOZI": {"acked_at": _t.time() * 1000, "raw_when_acked": "Bad"}}))
+        damaged("acked_at in der Zukunft", json.dumps({"WOZI": {"acked_at": _t.time() + 7 * 86400, "raw_when_acked": "Bad"}}))
+        damaged("acked_at NaN", '{"WOZI": {"acked_at": NaN, "raw_when_acked": "Bad"}}')
+        damaged("acked_at null", json.dumps({"WOZI": {"acked_at": None, "raw_when_acked": "Bad"}}))
+        with _LogCatch() as lc:
+            with open(os.environ["FILTER_ACK_PATH"], "w", encoding="utf-8") as f:
+                f.write(json.dumps({"WOZI": {"acked_at": _t.time() * 1000}}))
+            AB._filter_ack_effective("WOZI", "Bad")
+        check("ackui: unbrauchbarer Datensatz wird mit Logzeile entfernt",
+              lc.has("INFO", "removed: the stored record is unusable") and "WOZI" not in AB._filter_ack_load(), lc.lines)
+        check("ackui: _iso_utc ist total",
+              bridge._iso_utc(float("nan")) is None and bridge._iso_utc(1e12) is None
+              and bridge._iso_utc("x") is None and bridge._iso_utc(0) == "1970-01-01T00:00:00+00:00")
+
+        # Ein Urteil eines gedrueckten Resets (confirmed/unconfirmed) bleibt stehen
+        AB._filter_ack_write("WOZI", "Bad")
+        for verdict in ("unconfirmed", "confirmed"):
+            bb, _mm, ss = mk()
+            bb._publish_reset_state("WOZI", verdict)
+            bb._publish_state("WOZI", bb._state_payload("WOZI", ss, dict(ss._status)))
+            check("ackui: %s bleibt trotz gueltiger Quittung stehen" % verdict,
+                  resets(bb.client, "WOZI") == [verdict], resets(bb.client, "WOZI"))
+        bb, _mm, ss = mk()
+        bb._publish_state("WOZI", bb._state_payload("WOZI", ss, dict(ss._status)))
+        check("ackui: ohne veroeffentlichten Zustand -> acknowledged", resets(bb.client, "WOZI") == ["acknowledged"])
+
+        # Zweiter Wegfall-Grund: das Geraet meldet selbst lange genug Good -> idle
+        bb, _mm, ss = mk()
+        bb._publish_reset_state("WOZI", "acknowledged")
+        alt_min = bridge.FILTER_ACK_CLEAR_MIN_S
+        bridge.FILTER_ACK_CLEAR_MIN_S = 0.0
+        try:
+            ss._status["filters_status"] = "Good"
+            with _LogCatch() as lc:
+                for _ in range(bridge.FILTER_ACK_CLEAR_POLLS):
+                    bb._last_status.pop("WOZI", None)      # jeder Abruf zaehlt als neues Paket
+                    bb._publish_state("WOZI", bb._state_payload("WOZI", ss, dict(ss._status)))
+            check("ackui: Geraet selbst Good -> Quittung weg, Status idle, Logzeile",
+                  resets(bb.client, "WOZI") == ["acknowledged", "idle"] and "WOZI" not in AB._filter_ack_load()
+                  and lc.has("INFO", "no longer needed"), (resets(bb.client, "WOZI"), lc.lines))
+        finally:
+            bridge.FILTER_ACK_CLEAR_MIN_S = alt_min
+            bridge._FILTER_ACK_GOOD_STREAK.clear()
+
+        # Ohne Broker: paho liefert rc=4 statt einer Ausnahme -> nicht als gezeigt merken,
+        # naechster Abruf versucht es erneut; nach dem Reconnect wird alles Bekannte neu gesendet
+        class OfflineClient(FakeClient):
+            def publish(self, tp, pl, qos=0, retain=False):
+                super().publish(tp, pl, qos, retain)
+                class R:
+                    rc = 4
+                return R()
+        AB._filter_ack_write("WOZI", "Bad")
+        bb, _mm, ss = mk()
+        bb.client = OfflineClient()
+        bb._publish_state("WOZI", bb._state_payload("WOZI", ss, dict(ss._status)))
+        check("ackui: rc=4 -> nicht als gezeigt gemerkt", "WOZI" not in bb._reset_shown, bb._reset_shown)
+        bb.client = FakeClient()
+        bb._publish_state("WOZI", bb._state_payload("WOZI", ss, dict(ss._status)))
+        check("ackui: nach Rueckkehr des Brokers nachgeholt",
+              resets(bb.client, "WOZI") == ["acknowledged"] and bb._reset_shown.get("WOZI") == "acknowledged")
+        bb._publish_reset_state("FLUR", "confirmed")
+        bb.client = FakeClient()
+        bb._on_mqtt_connect(bb.client, None, None, 0)
+        check("ackui: Reconnect sendet die bekannten Zustaende erneut",
+              resets(bb.client, "WOZI") == ["acknowledged"] and resets(bb.client, "FLUR") == ["confirmed"],
+              [(tp, pl) for tp, pl in bb.client.pub if "reset_state" in tp])
+    finally:
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        bridge._FILTER_ACK_GOOD_STREAK.clear()
+        bridge._FILTER_ACK_ODD_RAW.clear()
+
+
 class _IgnoringDevice(FakeDevice):
     """Cloud nimmt change-mode an (HTTP 200), das Geraet uebernimmt den Modus nicht."""
 
@@ -2446,6 +2698,28 @@ async def test_ack_publish_now():
             res = await b._reset_filter(wozi)
         check("ack-now: ohne Verbindung -> naechster Abruf",
               res == "acknowledged" and lc.has("INFO", "published with the next poll"), lc.lines)
+        # Reset greift wirklich (Zaehler am Geraet geloescht) -> gespeicherte Quittung wird vergessen
+        b.client = FakeClient()
+        check("ack-now: Quittung vor dem Test gespeichert", "WOZI" in AB._filter_ack_load())
+
+        async def clearing_req(device, method, path, body):
+            wozi._status["filters_status"] = "Good"
+            return (200, None, "")
+        b._reset_request = clearing_req
+        with _LogCatch() as lc:
+            res = await b._reset_filter(wozi)
+        check("ack-now: bestaetigter Reset -> confirmed und Quittung entfernt",
+              res == "confirmed" and "WOZI" not in AB._filter_ack_load()
+              and lc.has("INFO", "removed: the counter really cleared"), (res, lc.lines))
+        # ueber _start_reset (echter Ablauf): running -> ... -> Endzustand, Sync greift nicht dazwischen
+        wozi._status["filters_status"] = "Bad"
+        b._reset_request = fake_req
+        b.client = FakeClient()
+        b._start_reset(wozi)
+        await asyncio.sleep(0.2)
+        seq = [pl for tp, pl in b.client.pub if tp == bridge.reset_state_topic("ambientika", "WOZI")]
+        check("ack-now: _start_reset -> running, dann acknowledged, nichts dazwischen",
+              seq == ["running", "acknowledged"], seq)
     finally:
         bridge.FILTER_RESET_VERIFY_DELAY = alt
         for k, v in old_env.items():
@@ -2900,9 +3174,15 @@ def test_average_per_device():
 
     # A) Parsen
     e, p = parse("Gäste-Bad=15, Schlafzimmer Eltern=60; AMB-9:45")
+    # Schluessel: Bindestrich/Unterstrich wie Leerzeichen (seit 1.4.35 - Kundengeraet
+    # hiess "Gäste Bad", das Doku-Beispiel "Gäste-Bad")
     check("win: drei Eintraege, keine Probleme",
-          [(k, m) for k, _, m in e] == [("gäste-bad", 15.0), ("schlafzimmer eltern", 60.0), ("amb-9", 45.0)]
+          [(k, m) for k, _, m in e] == [("gäste bad", 15.0), ("schlafzimmer eltern", 60.0), ("amb 9", 45.0)]
           and p == [], (e, p))
+    check("win: Schluessel - Bindestrich, Unterstrich, Leerzeichen gleich",
+          len({bridge._name_key(v) for v in ("Gäste-Bad", "Gäste Bad", "gäste_bad", " GÄSTE - BAD ")}) == 1
+          and bridge._name_key("Gäste-Bad") != bridge._name_key("Gästebad"),
+          [bridge._name_key(v) for v in ("Gäste-Bad", "Gäste Bad", "gäste_bad", "Gästebad")])
     check("win: Bezeichnung wie eingegeben", [lbl for _, lbl, _ in e] == ["Gäste-Bad", "Schlafzimmer Eltern", "AMB-9"], e)
     for s in ("", "  ", " , ; ", None):
         e, p = parse(s)
@@ -2996,6 +3276,19 @@ def test_average_per_device():
     b, devs = _house_bridge(["SN-1", "Flur"], awd="sn-1=15")
     b._resolve_average_windows()
     check("win: Seriennummer vor gleichlautendem Namen", b._avg_window == {"SN-1": 900.0}, b._avg_window)
+    # Kundenfall Okt. 2026: Geraet heisst in der App "Gäste Bad", die Option sagt
+    # "Gäste-Bad" (das Doku-Beispiel) -> seit 1.4.35 trotzdem zugeordnet; und
+    # umgekehrt. Ein zusammengeschriebener Name bleibt ein anderer Name.
+    b, devs = _house_bridge(["Flur", "Gäste Bad", "Gästebad"], awd="Gäste-Bad=15")
+    with _LogCapture() as lc:
+        b._resolve_average_windows()
+    check("win: 'Gäste-Bad' trifft 'Gäste Bad', nicht 'Gästebad'",
+          b._avg_window == {"SN-1": 900.0} and not lc.has("WARNING", "no unit named"), (b._avg_window, lc.lines))
+    b, devs = _house_bridge(["Gäste-Bad"], awd="gäste bad=15, SN_0=20")
+    with _LogCapture() as lc:
+        b._resolve_average_windows()
+    check("win: 'Gäste Bad' trifft 'Gäste-Bad'; Seriennummer mit '_' statt '-' ebenso (spaeterer Eintrag)",
+          b._avg_window == {"SN-0": 1200.0} and lc.has("WARNING", "listed more than once"), (b._avg_window, lc.lines))
 
     # F2) Nicht genannte Geraete rechnen exakt wie ohne Option (Zufallsfolge)
     import random as _rnd
@@ -3139,6 +3432,116 @@ async def test_average_per_device_discovery():
           (list(b2.devices), b2._avg_window, lc.lines))
 
 
+async def test_ack_startup_run_path():
+    """Kundenaufbau durch den echten run()-Pfad (Login, Geraetesuche, Broker, Startzustand,
+    Abrufschleife): Quittung 12 Tage alt fuer das Wohnzimmer in filter_ack.json."""
+    import time as _t
+    AB = bridge.AmbientikaBridge
+    old_env = {k: os.environ.get(k) for k in ("SLAVE_FILTER_SOFT_RESET", "FILTER_ACK_PATH", "FILTER_ACK_TTL_DAYS")}
+    os.environ["SLAVE_FILTER_SOFT_RESET"] = "1"
+    os.environ["FILTER_ACK_PATH"] = os.path.join(_tempfile.mkdtemp(), "filter_ack.json")
+    os.environ["FILTER_ACK_TTL_DAYS"] = "90"
+    pfx = "ambientika"
+
+    def mk():
+        cfg = bridge.BridgeConfig()
+        cfg.neuracell_enabled = False
+        cfg.dewpoint_enabled = False
+        cfg.poll_interval = 1
+        cfg.average_window_devices = "Gäste-Bad=15"     # Doku-Beispiel gegen App-Namen "Gäste Bad"
+        b = bridge.AmbientikaBridge(cfg)
+        flur = FakeDevice(serial="FLUR", name="Flur", zone=0, status=mkstatus(op=OM.Smart))
+        flur.role = "Master"
+        gbad = FakeDevice(serial="GBAD", name="Gäste Bad", zone=0, status=mkstatus(op=OM.Surveillance))
+        wozi = FakeDevice(serial="WOZI", name="Wohnzimmer", zone=0, status=mkstatus(op=OM.Surveillance))
+        wozi._status["filters_status"] = "Bad"
+        devs = {d.serial_number: d for d in (flur, gbad, wozi)}
+
+        async def _login():
+            b.api = object()
+
+        async def _discover():
+            b.devices = devs
+            b._device_house = {s: 1 for s in devs}
+            b._resolve_average_windows()
+
+        def _connect():
+            b.client = FakeClient()
+            b._publish_discovery()
+        b._login = _login
+        b._discover_devices = _discover
+        b._mqtt_connect = _connect
+        return b
+
+    async def run_for(b, seconds):
+        task = asyncio.create_task(b.run())
+        await asyncio.sleep(seconds)
+        b._stop_event.set()
+        await task
+
+    def resets(b, serial):
+        return [p for tp, p in b.client.pub if tp == bridge.reset_state_topic(pfx, serial)]
+
+    def states(b, serial):
+        return [json.loads(p) for tp, p in b.client.pub if tp == bridge.state_topic(pfx, serial)]
+
+    try:
+        acked = _t.time() - 12 * 86400
+        AB._filter_ack_save({"WOZI": {"acked_at": acked, "raw_when_acked": "Bad"}})
+        b = mk()
+        with _LogCatch() as lc:
+            await run_for(b, 2.6)
+        check("run: Wohnzimmer acknowledged, genau einmal; Rest idle",
+              resets(b, "WOZI") == ["acknowledged"] and resets(b, "FLUR") == ["idle"] and resets(b, "GBAD") == ["idle"],
+              {s: resets(b, s) for s in b.devices})
+        first_reset = next(i for i, (tp, _) in enumerate(b.client.pub) if tp.endswith("/reset_state"))
+        first_state = next(i for i, (tp, _) in enumerate(b.client.pub) if tp.endswith("/state") and "neuracell" not in tp)
+        check("run: Startzustand retained und vor dem ersten Statuspaket",
+              first_reset < first_state and all(r for tp, _, r in b.client.pubr if tp.endswith("/reset_state")),
+              (first_reset, first_state))
+        st = states(b, "WOZI")
+        check("run: Pakete mit Good/Bad und since/until",
+              len(st) >= 2 and all(s["filters_status"] == "Good" and s["filters_status_raw"] == "Bad"
+                                   and s["filter_ack_since"] == bridge._iso_utc(acked)
+                                   and s["filter_ack_until"] == bridge._iso_utc(acked + 90 * 86400) for s in st), st[-1:])
+        check("run: Startlog nennt die Quittung", lc.has("INFO", "still in force"), lc.lines[:30])
+        check("run: 'Gäste-Bad=15' trifft 'Gäste Bad'", lc.has("INFO", "Averaging per unit: Gäste Bad 15 min"), lc.lines[:30])
+        # Neustart (Update): gleiche Datei, neue Bridge -> wieder acknowledged
+        b2 = mk()
+        await run_for(b2, 1.6)
+        check("run: nach Neustart wieder acknowledged", resets(b2, "WOZI") == ["acknowledged"], resets(b2, "WOZI"))
+        # Frist laeuft im Betrieb ab -> idle, Paket ohne Datum, Datei bereinigt
+        os.environ["FILTER_ACK_TTL_DAYS"] = repr((_t.time() - acked + 1.5) / 86400.0)
+        b3 = mk()
+        with _LogCatch() as lc:
+            await run_for(b3, 3.6)
+        st = states(b3, "WOZI")
+        check("run: Ablauf im Betrieb -> acknowledged, dann idle; zuletzt Bad ohne Datum; Logzeile",
+              resets(b3, "WOZI") == ["acknowledged", "idle"] and st[0]["filters_status"] == "Good"
+              and st[-1]["filters_status"] == "Bad" and st[-1]["filter_ack_until"] is None
+              and lc.has("INFO", "ran out") and "WOZI" not in AB._filter_ack_load(),
+              (resets(b3, "WOZI"), st[0]["filters_status"], st[-1]["filters_status"]))
+        # beschaedigte Datei: run() startet trotzdem
+        with open(os.environ["FILTER_ACK_PATH"], "w", encoding="utf-8") as f:
+            f.write(json.dumps({"WOZI": "Bad", "FLUR": {"acked_at": _t.time() * 1000}}))
+        b4 = mk()
+        try:
+            await run_for(b4, 1.6)
+            check("run: beschaedigte filter_ack.json -> Start laeuft durch, idle",
+                  resets(b4, "WOZI") == ["idle"] and resets(b4, "FLUR") == ["idle"] and len(states(b4, "WOZI")) >= 1,
+                  {s: resets(b4, s) for s in b4.devices})
+        except Exception as ex:      # noqa: BLE001
+            check("run: beschaedigte filter_ack.json -> Start laeuft durch", False, repr(ex))
+    finally:
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        bridge._FILTER_ACK_GOOD_STREAK.clear()
+        bridge._FILTER_ACK_ODD_RAW.clear()
+
+
 async def _async_suite():
     await test_neuracell()
     await test_neuracell_scoped()
@@ -3157,6 +3560,7 @@ async def _async_suite():
     await test_plausibility()
     await test_zone_master_houses_and_order()
     await test_ack_publish_now()
+    await test_ack_startup_run_path()
     await test_live_roles()
     await test_duplicate_packets()
     await test_log_rate_limit()
@@ -3171,6 +3575,7 @@ def main():
     test_dewpoint()
     test_config()
     test_filter_ack_robust()
+    test_filter_ack_status_sensor()
     test_discovery_raw_mode()
     test_average_discovery_and_env()
     test_average_per_device()

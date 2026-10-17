@@ -52,9 +52,12 @@
 git clone https://github.com/ambientika-eu/ambientika-mqtt-bridge.git
 cd ambientika-mqtt-bridge
 cp .env.example .env
-# Edit .env with your Ambientika credentials and MQTT broker settings
+cp config.example.yaml config.yaml
+# Edit .env (or config.yaml) with your Ambientika credentials and MQTT broker settings
 docker compose up -d
 ```
+
+All settings are listed under [Configuration](#configuration).
 
 ---
 
@@ -159,7 +162,7 @@ See [`iobroker-adapter/README.md`](iobroker-adapter/README.md)
 | `dew-point/<id>/state`, `dew-point/<id>/sensors`, `dew-point/<id>/availability/state` | Controller → Broker | Ambientika Taupunktsteuerung: `{"ventilating": …, "reason": …}`, sensor values, Last Will |
 
 `<serial>` is the device serial number as reported by the cloud; it is printed in
-the log at start-up. `ambientika` is the default prefix (`MQTT_PREFIX`).
+the log at start-up. `ambientika` is the default prefix (`MQTT_TOPIC_PREFIX`).
 
 ### Status Payload Example
 
@@ -178,6 +181,8 @@ the log at start-up. `ambientika` is the default prefix (`MQTT_PREFIX`).
   "humidity_alarm": false,
   "filters_status": "Good",
   "filters_status_raw": "Good",
+  "filter_ack_since": null,
+  "filter_ack_until": null,
   "night_alarm": false,
   "device_role": "SlaveEqualMaster",
   "last_operating_mode": "Smart",
@@ -196,6 +201,8 @@ the log at start-up. `ambientika` is the default prefix (`MQTT_PREFIX`).
 
 Every categorical value comes with a numeric companion (`*_num`) so long-term
 statistics and Grafana work without a translation table of your own.
+`filter_ack_since` / `filter_ack_until` carry the maintenance acknowledgement of a
+Slave (ISO 8601, see *Filter reset on Master/Slave groups*), `null` without one.
 
 ### Commands
 
@@ -241,27 +248,90 @@ back. Set `COMMAND_COALESCE_MS=0` to apply every command on its own, immediately
 
 ---
 
-## Environment Variables
+## Configuration
+
+The bridge reads its configuration from the first of these it finds: the add-on
+options (`/data/options.json`, Home Assistant), a `config.yaml` (path in
+`CONFIG_YAML`, `/config/config.yaml` in the Docker image - see
+[`config.example.yaml`](config.example.yaml)) or environment variables. An
+environment variable overrides the same setting from `config.yaml`.
+
+### General
+
+| Variable | `config.yaml` | Default | Description |
+|---|---|---|---|
+| `AMBIENTIKA_USERNAME` (or `AMBIENTIKA_USER`) | `ambientika.username` | — | Ambientika account e-mail address |
+| `AMBIENTIKA_PASSWORD` (or `AMBIENTIKA_PASS`) | `ambientika.password` | — | Ambientika account password |
+| `MQTT_HOST` | `mqtt.host` | `localhost` | MQTT broker host |
+| `MQTT_PORT` | `mqtt.port` | `1883` | MQTT broker port |
+| `MQTT_USERNAME` (or `MQTT_USER`) | `mqtt.username` | *(empty)* | MQTT username (**required** for most brokers) |
+| `MQTT_PASSWORD` (or `MQTT_PASS`) | `mqtt.password` | *(empty)* | MQTT password (**required** for most brokers) |
+| — | `mqtt.tls` | `false` | TLS to the broker |
+| `MQTT_TOPIC_PREFIX` | `bridge.topic_prefix` | `ambientika` | MQTT topic prefix |
+| `DISCOVERY_PREFIX` | `bridge.discovery_prefix` | `homeassistant` | Home Assistant discovery prefix |
+| — | `bridge.enable_discovery` | `true` | Publish Home Assistant Auto-Discovery |
+| `POLL_INTERVAL` | `bridge.poll_interval` | `30` | Device poll interval in seconds |
+| `AVAILABILITY_FAILURE_THRESHOLD` | `bridge.availability_failure_threshold` | `3` | Consecutive failed polls before a device is flagged offline |
+| `LOG_LEVEL` | `bridge.log_level` | `INFO` | Logging level |
+| `COMMAND_COALESCE_MS` | — | `800` | Commands for the same device within this window are applied in one call (`0` = off) |
+| `AVERAGE_WINDOW_MIN` | — | `30` | Window of `humidity_avg` / `temperature_avg` in minutes, 1-1440 (add-on option `average_window_min`: 1-240; at least twenty poll intervals either way) |
+| `AVERAGE_WINDOW_DEVICES` | `bridge.average_window_devices` | *(empty)* | Own window for single units: `unit=minutes` entries, comma-separated, by serial number or unit name as in the app, 1-240 (e.g. `A1B2C3D4E5F6=15, Schlafzimmer Eltern=60`). The serial number is the safe way; in a name, upper/lower case does not matter and a hyphen, underscore or space count as the same separator (see *Averaged humidity and temperature*) |
+| `SLAVE_FILTER_SOFT_RESET` | — | `0` | Record a bridge-side "serviced" acknowledgement when a Slave's filter counter cannot be cleared remotely (see below) |
+| `FILTER_ACK_TTL_DAYS` | — | `90` | How long such an acknowledgement stays valid |
+| `FILTER_ACK_PATH` | — | `/data/filter_ack.json` | Where the acknowledgements are stored (needs a persistent volume) |
+| `AMBIENTIKA_HOST` | `ambientika.host` | `https://app.ambientika.eu:4521` | Ambientika cloud endpoint (see *Running without our server*) |
+
+### NeuraCell-X: radon protection
+
+In `config.yaml` these live in the `neuracell:` section under the same name as
+the add-on option (lower case, e.g. `radon_threshold`); the add-on options are
+the same names. Radon alarm: every unit to Intake (supply air) at
+`RADON_PROTECTION_FAN` until the value is back below the threshold minus the
+hysteresis.
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `AMBIENTIKA_EMAIL` | — | Ambientika account email |
-| `AMBIENTIKA_PASSWORD` | — | Ambientika account password |
-| `MQTT_BROKER` | `localhost` | MQTT broker host |
-| `MQTT_PORT` | `1883` | MQTT broker port |
-| `MQTT_USER` | *(empty)* | MQTT username (**required** for most brokers) |
-| `MQTT_PASSWORD` | *(empty)* | MQTT password (**required** for most brokers) |
-| `MQTT_PREFIX` | `ambientika` | MQTT topic prefix |
-| `POLL_INTERVAL` | `30` | Device poll interval in seconds |
-| `AVAILABILITY_FAILURE_THRESHOLD` | `3` | Consecutive failed polls before a device is flagged offline |
-| `HA_DISCOVERY` | `true` | Enable Home Assistant Auto-Discovery |
-| `LOG_LEVEL` | `INFO` | Logging level |
-| `COMMAND_COALESCE_MS` | `800` | Commands for the same device within this window are applied in one call (`0` = off) |
-| `AVERAGE_WINDOW_MIN` | `30` | Window of `humidity_avg` / `temperature_avg` in minutes, 1-1440 (at least twenty poll intervals) |
-| `AVERAGE_WINDOW_DEVICES` | *(empty)* | Own window for single units: `name=minutes` entries, comma-separated, by unit name or serial number, 1-240 (e.g. `Gäste-Bad=15, Schlafzimmer Eltern=60`). Add-on option / `config.yaml` (`bridge:` section): `average_window_devices` |
-| `SLAVE_FILTER_SOFT_RESET` | `0` | Record a bridge-side "serviced" acknowledgement when a Slave's filter counter cannot be cleared remotely (see below) |
-| `FILTER_ACK_TTL_DAYS` | `90` | How long such an acknowledgement stays valid |
-| `FILTER_ACK_PATH` | `/data/filter_ack.json` | Where the acknowledgements are stored (needs a persistent volume) |
+|---|---|---|
+| `NEURACELL_ENABLED` | `true` | Radon protection on or off |
+| `RADON_SOURCE` | `signal` | `signal`: the radon value and alarm come from the MQTT topics below. `device`: the radon meter's status is read from the Ambientika cloud, no MQTT signal needed |
+| `RADON_THRESHOLD` | `300` | Bq/m³ at which radon protection starts (300 is the German reference value). With `RADON_SOURCE=device` also the limit for a numeric alarm field |
+| `RADON_HYSTERESIS` | `50` | Bq/m³ the value must fall below the threshold before protection ends |
+| `RADON_PROTECTION_FAN` | `Low` | Fan speed during radon protection: `Low`, `Medium` or `High` |
+| `RADON_METER_TOPIC` | `radon/+/state` | Native topic of the Ambientika radon meter (MQTT mode 4, `{"mittelwert": …}`), read directly. `off` switches the direct read off (`none` in `config.yaml` / the add-on; as an environment variable `none` counts as unset) |
+| `RADON_METER_TIMEOUT` | `30` | Minutes without any message from an Ambientika radon meter before it counts as disconnected (0 = off; the meter reports every 10 minutes, 20 or more is recommended) |
+| `RADON_TOPIC` | `ambientika/radon/value` | Topic with a radon value in Bq/m³ from any other source: a plain number or JSON (see `RADON_VALUE_KEY`); MQTT wildcards allowed. With several sources the highest current value decides |
+| `RADON_ALARM_TOPIC` | `ambientika/radon/alarm` | Topic with an explicit alarm (`ON`/`OFF`, `true`/`false`). Value and alarm are combined, either one keeps protection on. `off` (`none` in `config.yaml` / the add-on) = ignored, so a stale retained `ON` can never hold protection |
+| `RADON_VALUE_KEY` | `mittelwert` | JSON key of the radon value when `RADON_TOPIC` or the meter topic carries JSON |
+| `RADON_DEVICE_SERIAL` | *(empty)* | `RADON_SOURCE=device`: serial number of the radon meter (shown in the log). The meter is read only, never exposed as a fan |
+| `RADON_DEVICE_ALARM_FIELD` | `air_quality` | `RADON_SOURCE=device`: the status field of the meter that carries its alarm or level. A numeric field is compared with `RADON_THRESHOLD`, a text field with the values below |
+| `RADON_DEVICE_ALARM_VALUES` | `Bad,Poor,Very Bad,Alarm,Alert` | `RADON_SOURCE=device`: text values of that field that mean "radon alarm" (comma-separated, upper/lower case does not matter) |
+
+### NeuraCell-X: dew-point control
+
+In `config.yaml` these live in the `dewpoint:` section under the same name as
+the add-on option. Ventilating would raise indoor humidity: the units in
+`DEWPOINT_BLOCK_DEVICES` switch off until conditions are favourable again.
+Radon protection always has priority.
+
+| Variable | Default | Description |
+|---|---|---|
+| `DEWPOINT_ENABLED` | `true` | Dew-point control on or off |
+| `DEWPOINT_SOURCE` | `signal` | `signal`: a block signal from MQTT - the Ambientika Taupunktsteuerung on its own topic (below) or a third-party source on `DEWPOINT_BLOCK_TOPIC`. `computed`: the bridge computes indoor and outdoor dew point from four sensor topics. `device`: the Taupunktsteuerung's status is read from the Ambientika cloud |
+| `DEWPOINT_BLOCK_DEVICES` | *(empty)* | Units the block applies to, by name as in the app or serial number, comma-separated (e.g. the basement units). Empty = all units |
+| `DEWPOINT_CONTROLLER_TOPIC` | `dew-point/+/state` | Native topic of the Ambientika Taupunktsteuerung (MQTT firmware), read directly; its Last Will on `dew-point/<id>/availability/state` and its sensor messages are watched automatically. `off` switches the direct read off (`none` in `config.yaml` / the add-on) |
+| `DEWPOINT_CONTROLLER_KEY` | `ventilating` | JSON key in those messages; `false` means: block ventilation |
+| `DEWPOINT_BLOCK_TOPIC` | `ambientika/dewpoint/block` | `signal`: topic of a third-party block signal (`ON`/`true`/`1` = block). The last message wins. Leave it at its default so it does not overlap the controller topic |
+| `DEWPOINT_BLOCK_KEY` | *(empty)* | JSON key of the block flag when `DEWPOINT_BLOCK_TOPIC` carries a JSON object |
+| `DEWPOINT_AVAILABILITY_TOPIC` | *(empty)* | `signal`: availability topic with Last Will of a third-party controller (`online`/`offline`, `true`/`false` or JSON with `state`). The Ambientika controller needs none |
+| `DEWPOINT_SIGNAL_TIMEOUT` | `0` | `signal`: minutes without any message from the controller before it counts as disconnected (0 = off). For controllers without Last Will; not applied while a Last Will reports online |
+| `DEWPOINT_LOST_ACTION` | `keep` | While the controller counts as disconnected: `keep` the last block state, `release` ventilation, or `block` the units. Radon keeps priority either way |
+| `dewpoint_indoor_temp_topic` *(config.yaml / add-on only)* | `ambientika/dewpoint/indoor_temp` | `computed`: indoor temperature in °C |
+| `dewpoint_indoor_humidity_topic` *(config.yaml / add-on only)* | `ambientika/dewpoint/indoor_humidity` | `computed`: indoor relative humidity in % |
+| `dewpoint_outdoor_temp_topic` *(config.yaml / add-on only)* | `ambientika/dewpoint/outdoor_temp` | `computed`: outdoor temperature in °C |
+| `dewpoint_outdoor_humidity_topic` *(config.yaml / add-on only)* | `ambientika/dewpoint/outdoor_humidity` | `computed`: outdoor relative humidity in % |
+| `DEWPOINT_MARGIN` | `1.0` | `computed`: block as soon as the outdoor dew point reaches the indoor dew point minus this margin (°C) - ventilating would then add moisture |
+| `DEWPOINT_HYSTERESIS` | `0.5` | `computed`: release only once the outdoor dew point is this much (°C) below that line again |
+| `DEWPOINT_DEVICE_SERIAL` | *(empty)* | `DEWPOINT_SOURCE=device`: serial number of the Taupunktsteuerung (shown in the log). It is read only, never exposed as a fan |
+| `DEWPOINT_DEVICE_BLOCK_MODES` | `Off` | `DEWPOINT_SOURCE=device`: operating modes of the Taupunktsteuerung that mean "block" (comma-separated) |
 
 > **MQTT credentials are required for most brokers.** The official Home Assistant Mosquitto add-on and most production setups disable anonymous MQTT access. If `MQTT_USER` / `MQTT_PASSWORD` are empty the bridge will fail to connect with `Not authorized`. Create a dedicated MQTT user for the bridge (e.g. via the Mosquitto add-on's `logins` option) and set both variables.
 
@@ -340,6 +410,17 @@ reset, as opposed to `confirmed` (the counter really cleared) and `unconfirmed`
 once, not with the next poll, and an acknowledgement that cannot be stored (no
 writable `/data`) is reported as a warning and `unconfirmed` instead of
 `acknowledged`.
+
+Since 1.4.35 the status sensor keeps saying `acknowledged` for as long as the
+acknowledgement is in force - also after a restart or an update (before, every
+unit started as `idle`, so nothing showed that one was in force) - and drops
+back to `idle` the moment it ends. The state carries the acknowledgement
+itself: `filter_ack_since` and `filter_ack_until` (ISO 8601 with offset, `null`
+without one), and with `SLAVE_FILTER_SOFT_RESET=1` Home Assistant discovers them
+as the diagnostic timestamp sensors *Filter Acknowledged Since* and *Filter
+Acknowledgement Valid Until*, so the day the effective status falls back to the
+raw value is visible in advance. At start-up the log names every acknowledgement
+still in force with its date and the day it runs out.
 
 Since 1.4.30 an acknowledgement ends only when `FILTER_ACK_TTL_DAYS` run out or
 when the device itself reports `Good` for at least 10 polls in a row spanning at
@@ -441,20 +522,24 @@ equal to the raw ones within 0.1 points; the unit reports humidity in steps of 2
 points, so a longer window gains little there and mainly adds delay.
 
 Since 1.4.34 single units can have their own window: `AVERAGE_WINDOW_DEVICES`
-(add-on option and `config.yaml` key `average_window_devices`) takes `name=minutes`
-entries separated by commas, semicolons or line breaks, matched case-insensitively
-against the unit name from the app or its serial number, 1-240 minutes each (plain
-number with a decimal point; a trailing `min` is fine; in `config.yaml` quote the
-value). Example: `Gäste-Bad=15, Schlafzimmer Eltern=60` - the bathroom follows a
-shower quickly, the bedroom is smoothed more, all other units keep
-`AVERAGE_WINDOW_MIN`. The floor of twenty poll intervals applies per unit as well.
+(add-on option and `config.yaml` key `average_window_devices`) takes `unit=minutes`
+entries separated by commas, semicolons or line breaks, by the unit's serial
+number or its name as in the app, 1-240 minutes each (plain number with a decimal
+point; a trailing `min` is fine; in `config.yaml` quote the value). Example:
+`A1B2C3D4E5F6=15, Schlafzimmer Eltern=60` - the bathroom follows a shower quickly,
+the bedroom is smoothed more, all other units keep `AVERAGE_WINDOW_MIN`. The
+serial number is the safe way: it is unique, it stands in the log (`Device: <name>
+(serial: …)`) and in the app, and it cannot be misspelt the way a name can. A name
+has to match the app's spelling; upper/lower case does not matter, and a hyphen,
+underscore or space count as the same separator (since 1.4.35 - `Gäste-Bad` finds
+a unit called `Gäste Bad`, `Gästebad` does not); anything else does matter. The floor of twenty poll intervals applies per unit as well.
 A shorter window follows a change faster but shows more of the residual swing
 described above (simulated: the 15-min mean swings about twice as much within an
 hour as the 30-min mean, the 60-min mean about half as much).
 The log shows the windows in force once the units are found (`Averaging per unit:
-...`); an entry that matches no unit or cannot be read is named there and
-ignored. For a name containing a comma or semicolon use the serial number. Names
-are matched at start-up.
+...`); an entry that matches no unit or cannot be read is named there, with the
+list of units and their serial numbers, and ignored. For a name containing a
+comma or semicolon use the serial number. Names are matched at start-up.
 
 ### Availability debounce
 

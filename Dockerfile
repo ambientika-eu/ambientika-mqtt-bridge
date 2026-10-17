@@ -15,6 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bridge.py .
 
-ENV CONFIG_PATH=/config/config.yaml
+# bridge.py looks for its YAML at CONFIG_YAML (docker-compose mounts ./config.yaml
+# there). Without the file it falls back to the environment variables.
+ENV CONFIG_YAML=/config/config.yaml
 
 CMD ["python", "bridge.py"]

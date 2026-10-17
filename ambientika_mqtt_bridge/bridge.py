@@ -42,6 +42,7 @@ import signal
 import sys
 import time
 import unicodedata
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import paho.mqtt.client as mqtt
@@ -537,11 +538,39 @@ def _env(*names: str, default: str = "") -> str:
     return default
 
 
+# Characters _name_key reads as a space: hyphen-minus, underscore, and the dashes
+# a phone or Mac keyboard puts in for a hyphen (soft hyphen, hyphen, non-breaking
+# hyphen, figure dash, en dash, em dash, horizontal bar, minus sign).
+_NAME_KEY_SEPARATORS = {ord(c): " " for c in "-_\u00ad\u2010\u2011\u2012\u2013\u2014\u2015\u2212"}
+
+
 def _name_key(value) -> str:
     """A device name or serial number as compared in per-unit options:
-    Unicode NFC, inner whitespace collapsed, case-insensitive - so "Gäste-Bad"
-    typed in the add-on matches the name from the app however it is encoded."""
-    return " ".join(unicodedata.normalize("NFC", str(value or "")).split()).casefold()
+    Unicode NFC, hyphens and underscores read as spaces, inner whitespace
+    collapsed, case-insensitive - so "Gäste-Bad" typed in the add-on matches
+    a unit the app calls "Gäste Bad", however it is encoded. (A customer's
+    unit was named "Gäste Bad" while the documented example said "Gäste-Bad";
+    the serial number is the safe way regardless.)"""
+    text = unicodedata.normalize("NFC", str(value or "")).translate(_NAME_KEY_SEPARATORS)
+    return " ".join(text.split()).casefold()
+
+
+
+
+def _slave_soft_reset_enabled() -> bool:
+    """SLAVE_FILTER_SOFT_RESET (add-on option slave_filter_soft_reset)."""
+    return os.environ.get("SLAVE_FILTER_SOFT_RESET", "0") in ("1", "true", "True", "yes")
+
+
+def _iso_utc(ts) -> Optional[str]:
+    """Unix time as ISO 8601 with offset ("2026-10-05T12:03:22+00:00"), the
+    form Home Assistant's timestamp sensors parse; HA shows it in local time.
+    None for anything that is not a representable time (NaN, a millisecond
+    timestamp, text) - a bad value must never cost a poll or the start-up."""
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).replace(microsecond=0).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
 
 
 class BridgeConfig:
@@ -1297,7 +1326,45 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
         },
     ))
 
+    # Maintenance acknowledgement of a Slave (SLAVE_FILTER_SOFT_RESET): when it
+    # was recorded and until when it holds. Without these a dashboard shows the
+    # effective "Good" but not why, and the day it runs out and the raw "Bad"
+    # shows through again comes as a surprise. Only published when the option
+    # is on; "None" in the payload (no acknowledgement) is "unknown" in HA.
+    if _slave_soft_reset_enabled():
+        for key, name, icon in (
+                ("filter_ack_since", "Filter Acknowledged Since", "mdi:calendar-check"),
+                ("filter_ack_until", "Filter Acknowledgement Valid Until", "mdi:calendar-clock")):
+            entities.append((
+                f"{base}/sensor/{serial}_{key}/config",
+                {
+                    "name": name,
+                    "unique_id": f"ambientika_{serial}_{key}",
+                    "state_topic": state,
+                    # default('None', true): a state from before 1.4.35 has no such
+                    # key (rendered "" otherwise), null must read as "None" too -
+                    # both mean "unknown" to Home Assistant, nothing to warn about.
+                    "value_template": f"{{{{ value_json.{key} | default('None', true) }}}}",
+                    "availability_topic": avail,
+                    "device": device_info,
+                    "device_class": "timestamp",
+                    "icon": icon,
+                    "entity_category": "diagnostic",
+                },
+            ))
+
     return entities
+
+
+def discovery_removals(cfg: BridgeConfig, serial: str):
+    """Config topics of entities this configuration does not offer, to be cleared
+    with an empty retained message so Home Assistant drops them: the two
+    acknowledgement timestamps once SLAVE_FILTER_SOFT_RESET is switched off
+    again (discovery is retained, so they would otherwise linger as unknown)."""
+    if _slave_soft_reset_enabled():
+        return []
+    base = cfg.discovery_prefix
+    return [f"{base}/sensor/{serial}_{key}/config" for key in ("filter_ack_since", "filter_ack_until")]
 
 
 def build_neuracell_discovery(cfg: BridgeConfig):
@@ -2428,6 +2495,10 @@ class AmbientikaBridge:
         self._reset_tasks: set = set()
         self._reset_inflight: set = set()
         self._pending_resets: set = set()
+        # serial -> reset status last published (idle / running / ...), so the
+        # poll loop can switch "acknowledged" <-> "idle" exactly when a
+        # maintenance acknowledgement appears or runs out (see _state_payload).
+        self._reset_shown: dict = {}
         self._reauth_ts: float = 0.0
         # Pending command attributes per serial + their flush timers
         # (see COMMAND_COALESCE_S).
@@ -2720,6 +2791,7 @@ class AmbientikaBridge:
         shown = self._shown_mode(serial, device, own)
         fs_raw = s["filters_status"]
         fs_eff = self._filter_ack_effective(serial, fs_raw)
+        ack = self._filter_ack_record(serial)     # after _filter_ack_effective: it drops a run-out one
         now_m = time.monotonic()
         try:
             prev = self._last_status.get(serial)
@@ -2744,6 +2816,10 @@ class AmbientikaBridge:
             "humidity_alarm": s["humidity_alarm"],
             "filters_status": fs_eff,
             "filters_status_raw": fs_raw,
+            # Maintenance acknowledgement (SLAVE_FILTER_SOFT_RESET): recorded
+            # when, valid until - ISO 8601; null without one.
+            "filter_ack_since": _iso_utc(ack["acked_at"]) if ack else None,
+            "filter_ack_until": _iso_utc(ack["valid_until"]) if ack else None,
             "night_alarm": s["night_alarm"],
             "device_role": s["device_role"],
             "last_operating_mode": s["last_operating_mode"].name,
@@ -2767,6 +2843,7 @@ class AmbientikaBridge:
                             json.dumps(payload), qos=0, retain=True)
         self.client.publish(avail_topic(self.cfg.topic_prefix, serial),
                             "online", qos=0, retain=True)
+        self._sync_reset_state_with_ack(serial, payload.get("filter_ack_since") is not None)
 
     # ----- operating-mode check after a command -----
     def _check_mode_applied(self, serial: str, device, reported) -> None:
@@ -3018,10 +3095,67 @@ class AmbientikaBridge:
         if self.client is None:
             return
         try:
-            self.client.publish(reset_state_topic(self.cfg.topic_prefix, serial),
-                                state, qos=0, retain=True)
+            info = self.client.publish(reset_state_topic(self.cfg.topic_prefix, serial),
+                                       state, qos=0, retain=True)
+            # paho does not raise without a connection, it returns rc=4: then the
+            # value is not on the broker, so do not note it as shown - the next
+            # poll (or the reconnect, see _on_mqtt_connect) sends it again.
+            if getattr(info, "rc", mqtt.MQTT_ERR_SUCCESS) == mqtt.MQTT_ERR_SUCCESS:
+                self._reset_shown[serial] = state
+            else:
+                log.debug("reset_state %s for %s not sent (rc=%s), retried later",
+                          state, serial, getattr(info, "rc", "?"))
         except Exception as e:
             log.warning("could not publish reset_state for %s: %s", serial, e)
+
+    def _publish_initial_reset_states(self) -> None:
+        """Give every unit that is not resuming a reset its start-up reset
+        status, and say in the log which acknowledgements are still in force."""
+        for serial, device in self.devices.items():
+            if serial in self._reset_inflight:
+                continue
+            state = self._initial_reset_state(serial)
+            self._publish_reset_state(serial, state)
+            if state == "acknowledged":
+                rec = self._filter_ack_record(serial) or {}
+                log.info("filter acknowledgement for %s (%s) still in force: recorded %s, "
+                         "runs out %s - effective filter status Good, raw value as reported.",
+                         serial, getattr(device, "name", "?"),
+                         _iso_utc(rec.get("acked_at", 0)), _iso_utc(rec.get("valid_until", 0)))
+
+    def _initial_reset_state(self, serial: str) -> str:
+        """Reset status to publish at start-up: "acknowledged" while a stored
+        maintenance acknowledgement of this unit is still valid, else "idle".
+
+        Before 1.4.35 every unit started as "idle", so a restart or an update
+        hid that an acknowledgement was in force - the effective filter status
+        said Good, the status sensor said nothing (customer report, Oct 2026).
+        """
+        return "acknowledged" if self._filter_ack_record(serial) else "idle"
+
+    def _sync_reset_state_with_ack(self, serial: str, acked: bool) -> None:
+        """Keep the reset status sensor in step with the acknowledgement.
+
+        Called with every published state (`acked`: the state carries an
+        acknowledgement in force): one that is in force turns an "idle" sensor
+        to "acknowledged", one that ran out (TTL, or the unit itself went Good
+        for long enough, see _filter_ack_effective) drops "acknowledged" back
+        to "idle" - instead of leaving it standing until the next restart. A
+        reset that is running right now is left alone (its own result is
+        published when it finishes), and so is a "confirmed" / "unconfirmed"
+        verdict of a reset the user pressed.
+        """
+        if serial in self._reset_inflight:
+            return
+        shown = self._reset_shown.get(serial)
+        if acked:
+            # Only from idle (or not yet published): a "confirmed" or
+            # "unconfirmed" verdict of a reset the user pressed stands, as it
+            # always has, until the next reset or restart.
+            if shown in (None, "idle"):
+                self._publish_reset_state(serial, "acknowledged")
+        elif shown == "acknowledged":
+            self._publish_reset_state(serial, "idle")
 
     def _load_pending(self) -> None:
         try:
@@ -3176,6 +3310,8 @@ class AmbientikaBridge:
                     or (before_num is not None and after_num < before_num)):
                 log.info("filter reset for %s: confirmed - filters_status %s -> %s",
                          serial, before_fs or "?", after_fs)
+                self._filter_ack_forget(serial, "the counter really cleared (%s -> %s)"
+                                        % (before_fs or "?", after_fs))
                 return "confirmed"
         acknowledged = False
         if is_slave:
@@ -3223,7 +3359,50 @@ class AmbientikaBridge:
     # gewarteten, weiterhin roten Slave "Good", bis FILTER_ACK_TTL_DAYS ablaufen.
     @staticmethod
     def _soft_reset_enabled() -> bool:
-        return os.environ.get("SLAVE_FILTER_SOFT_RESET", "0") in ("1", "true", "True", "yes")
+        return _slave_soft_reset_enabled()
+
+    @classmethod
+    def _filter_ack_record(cls, serial: str) -> Optional[dict]:
+        """The acknowledgement of this unit if one is in force, else None.
+
+        {"acked_at": unix time, "valid_until": unix time, "raw_when_acked": str}
+        - only with SLAVE_FILTER_SOFT_RESET on, a readable record and the TTL
+        not yet over. Reads only; a run-out record is removed (with its log
+        line) by _filter_ack_effective on the next poll, not here.
+        """
+        if not cls._soft_reset_enabled():
+            return None
+        try:
+            rec = cls._filter_ack_load().get(serial)
+            times = cls._filter_ack_times(rec)
+            if times is None:
+                return None
+            acked_at, valid_until = times
+            if time.time() > valid_until:
+                return None
+            return {"acked_at": acked_at, "valid_until": valid_until,
+                    "raw_when_acked": str(rec.get("raw_when_acked", ""))}
+        except Exception as e:      # a damaged file is reported by the poll, never a crash
+            log.debug("filter acknowledgement for %s not readable: %s", serial, e)
+            return None
+
+    @classmethod
+    def _filter_ack_times(cls, rec) -> Optional[tuple]:
+        """(acked_at, valid_until) of a stored record, or None if the record is
+        unusable: not an object, acked_at missing, not a finite number, not
+        positive, or in the future by more than a day (a millisecond timestamp
+        or a clock set wrong - such a record would never run out). One rule for
+        the effective filter status and for the sensors, so they cannot
+        disagree."""
+        if not isinstance(rec, dict):
+            return None
+        try:
+            acked_at = float(rec.get("acked_at", 0))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(acked_at) or acked_at <= 0 or acked_at > time.time() + 86400.0:
+            return None
+        return acked_at, acked_at + cls._filter_ack_ttl()
 
     @staticmethod
     def _filter_ack_path() -> str:
@@ -3240,7 +3419,8 @@ class AmbientikaBridge:
     def _filter_ack_load(cls) -> dict:
         try:
             with open(cls._filter_ack_path(), "r", encoding="utf-8") as f:
-                return json.load(f) or {}
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
         except Exception:
             return {}
 
@@ -3275,6 +3455,15 @@ class AmbientikaBridge:
         return rec.get("acked_at") == acked_at
 
     @classmethod
+    def _filter_ack_forget(cls, serial: str, why: str) -> None:
+        """Drop a stored acknowledgement of this unit, if there is one."""
+        if not cls._soft_reset_enabled():
+            return
+        data = cls._filter_ack_load()
+        if serial in data:
+            cls._filter_ack_drop(data, serial, why)
+
+    @classmethod
     def _filter_ack_drop(cls, data: dict, serial: str, why: str) -> None:
         data.pop(serial, None)
         cls._filter_ack_save(data)
@@ -3301,10 +3490,14 @@ class AmbientikaBridge:
         rec = data.get(serial)
         if not rec:
             return raw_status
-        try:
-            acked_at = float(rec.get("acked_at", 0))
-        except Exception:
-            acked_at = 0.0
+        times = cls._filter_ack_times(rec)
+        if times is None:
+            cls._filter_ack_drop(
+                data, serial,
+                "the stored record is unusable (%r) - showing the device value %r again"
+                % (rec, raw_status))
+            return raw_status
+        acked_at = times[0]
         age = time.time() - acked_at
         ttl = cls._filter_ack_ttl()
         if age > ttl:
@@ -3507,6 +3700,11 @@ class AmbientikaBridge:
                 # (e.g. after a broker restart without persistence).
                 self.publish_known_meters()
             self.publish_neuracell_state()
+            # Same for the reset status of every unit: a broker restart without
+            # persistence loses the retained values, and a flip that happened
+            # while the broker was away was never stored.
+            for serial, state in list(self._reset_shown.items()):
+                self._publish_reset_state(serial, state)
         except Exception as e:
             # Runs in paho's network thread: an exception here would end that thread.
             log.exception("Error after connecting to the MQTT broker: %s", e)
@@ -4017,6 +4215,8 @@ class AmbientikaBridge:
         for serial, device in self.devices.items():
             for topic, payload in build_discovery_configs(self.cfg, serial, device.name):
                 self.client.publish(topic, json.dumps(payload), qos=0, retain=True)
+            for topic in discovery_removals(self.cfg, serial):
+                self.client.publish(topic, "", qos=0, retain=True)
         if self.cfg.neuracell_enabled or self.cfg.dewpoint_enabled:
             for topic, payload in build_neuracell_discovery(self.cfg):
                 self.client.publish(topic, json.dumps(payload), qos=0, retain=True)
@@ -4149,9 +4349,7 @@ class AmbientikaBridge:
             else:
                 self._pending_resets.discard(serial)
         self._save_pending()
-        for serial in self.devices:
-            if serial not in self._reset_inflight:
-                self._publish_reset_state(serial, "idle")
+        self._publish_initial_reset_states()
 
         log.info("Starting poll loop (every %ss) ...", self.cfg.poll_interval)
         if self.cfg.neuracell_enabled:
@@ -4225,9 +4423,11 @@ class AmbientikaBridge:
 def load_config() -> BridgeConfig:
     ha_options = "/data/options.json"
     yaml_path = os.environ.get("CONFIG_YAML", "config.yaml")
-    if os.path.exists(ha_options):
+    if os.path.isfile(ha_options):
         return BridgeConfig.from_ha_options(ha_options)
-    if os.path.exists(yaml_path):
+    # isfile, not exists: a docker-compose bind mount of a config.yaml that does
+    # not exist on the host turns up as an empty directory inside the container.
+    if os.path.isfile(yaml_path):
         return BridgeConfig.from_yaml(yaml_path)
     return BridgeConfig.from_env()
 
