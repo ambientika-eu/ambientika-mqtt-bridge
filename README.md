@@ -375,13 +375,19 @@ number 900+) went straight into `change_mode` and the cloud answered
 
 ### Filter reset on Master/Slave groups
 
-The filter reset is applied by the **Master** of a coupled zone. Each Slave keeps
-its own counter, which the cloud cannot reach: a reset addressed to a Slave is
-acknowledged with HTTP 200 but never carried out. The bridge sends the documented
+The manufacturer resets filters per zone through the **Master** only. Each Slave
+keeps its own counter, which nothing clears: a reset addressed to a Slave is
+acknowledged with HTTP 200 but never carried out, the app shows only the Master's
+filter status, and there is nothing to press at the unit either (the unit's own
+filter alarm is active on Masters only). The bridge sends the documented
 `device/reset-filter` to the device and to its zone Master, then checks the real
 device status and reports what actually happened - for a Slave it says plainly
-that the reset has to be done at the unit itself, instead of promising a change on
-a later poll.
+that its counter stays, instead of promising a change on a later poll.
+
+The only way to clear a Slave's own counter is a reset while the unit is a Master:
+set it up in the app as a standalone unit for the moment, reset the filter, then
+couple it as a Slave again. For everyday use the maintenance acknowledgement below
+is the simpler way.
 
 A counter is only skipped when it is positively `Good`. `Medium` (yellow) is a
 real reset case, since filters are usually cleaned before the alarm turns red.
@@ -424,7 +430,8 @@ still in force with its date and the day it runs out.
 
 Since 1.4.30 an acknowledgement ends only when `FILTER_ACK_TTL_DAYS` run out or
 when the device itself reports `Good` for at least 10 polls in a row spanning at
-least 10 minutes (filter reset at the unit; a rebooting unit or a short cloud
+least 10 minutes (its counter was cleared after all, e.g. by a reset as a
+temporary standalone unit; a rebooting unit or a short cloud
 hiccup reporting a default `Good` does not count); both are logged
 (`filter acknowledgement for <serial> removed: ...`). A poll with an unrecognised
 raw value keeps the acknowledgement and is logged once per new value. Before
@@ -443,10 +450,6 @@ and the check never costs a poll - if it ever failed internally the status would
 still be published.
 For a Slave the warning names the zone Master: a coupled Slave runs with its
 Master, so the mode belongs on the Master.
-
-Truly zeroing a Slave's counter is only possible at the device: configure the unit
-in the app temporarily as a standalone device, reset the filter, then set it up as
-a Slave again.
 
 ### Operating mode of a Slave
 

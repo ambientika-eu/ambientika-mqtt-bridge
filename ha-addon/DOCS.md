@@ -115,11 +115,17 @@ protection always has priority.
 
 ## Filter reset on Master/Slave groups
 
-The filter reset is carried out by the **Master** of a coupled zone. Every Slave
-keeps its own counter, which the cloud cannot reach: a reset sent to a Slave is
-acknowledged but never carried out. The bridge says so in plain words instead of
-promising a change that will not come. Resetting a Slave's counter for real is
-only possible at the unit itself.
+The manufacturer resets filters per zone through the **Master** only. Every Slave
+keeps its own counter, which nothing clears: a reset sent to a Slave is
+acknowledged but never carried out, the app shows only the Master's filter
+status, and there is nothing to press at the unit either (the unit's own filter
+alarm is active on Masters only). The bridge says so in plain words instead of
+promising a change that will not come.
+
+The only way to clear a Slave's own counter is a reset while the unit is a
+Master: set it up in the app as a standalone unit for the moment, reset the
+filter, then couple it as a Slave again. For everyday use the acknowledgement
+below is the simpler way.
 
 Switch on `slave_filter_soft_reset` to record such a maintenance yourself. The
 serviced unit then reads green, while the unchanged device value stays visible:
@@ -146,7 +152,8 @@ value is visible in advance, not a surprise.
 
 An acknowledgement ends for exactly two reasons, and both are written to the log:
 `filter_ack_ttl_days` has run out, or the unit itself reports `Good` for at least
-ten polls in a row and at least ten minutes (its filter was reset at the device).
+ten polls in a row and at least ten minutes (its counter was cleared after all,
+e.g. by a reset as a temporary standalone unit).
 A single poll with an unknown or briefly green value no longer removes it. Up to
 1.4.29 one such poll was enough, silently, so an acknowledgement could vanish long
 before its time. At start-up the log names every acknowledgement still in force,

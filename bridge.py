@@ -3257,12 +3257,16 @@ class AmbientikaBridge:
             times until the counter has demonstrably improved, instead of trusting
             the fire-and-forget HTTP 200. This runs for a Medium (yellow) counter
             just as for a red one; only a counter already at Good is skipped.
-          * Slave: the cloud CANNOT clear a Slave's counter at all - the reset is
-            applied only by the zone Master to the Master's own counter, while the
-            Slave keeps its own. So we do NOT claim the status "will follow on the
-            next poll"; we say plainly that a reset directly at the unit is needed,
-            and (if SLAVE_FILTER_SOFT_RESET is on) record a bridge-side "serviced"
-            acknowledgement so dashboards can go green without faking the raw value.
+          * Slave: the cloud CANNOT clear a Slave's counter at all - the
+            manufacturer resets filters per zone through the Master only: the
+            reset clears the Master's own counter, a Slave keeps its own, and
+            there is nothing to press at the unit either. So we do NOT claim the
+            status "will follow on the next poll"; we say plainly that the counter
+            stays (the only way to clear it is a reset while the unit is a Master:
+            set it up as a standalone unit in the app for the moment, reset,
+            couple it back), and (if SLAVE_FILTER_SOFT_RESET is on) record a
+            bridge-side "serviced" acknowledgement so dashboards can go green
+            without faking the raw value.
         """
         serial = device.serial_number
         is_slave = self._zone_master(device) is not None
@@ -3324,10 +3328,13 @@ class AmbientikaBridge:
                             serial, self._filter_ack_path())
             log.warning(
                 "filter reset for %s: this is a SLAVE - its filter counter cannot be "
-                "reset remotely. The cloud reset is applied only by the zone Master to "
-                "the Master's own counter; the Slave keeps its own. Reset the filter "
-                "DIRECTLY AT THE UNIT (physical WallPanel / at the device). This is a "
-                "device-side limitation, not a transient delay.", serial)
+                "cleared remotely. The manufacturer resets filters per zone through the "
+                "Master only: the reset clears the Master's counter, a Slave keeps its "
+                "own, and there is nothing to press at the unit either. To clear this "
+                "unit's own counter, set it up in the app as a standalone unit for the "
+                "moment, reset the filter, then couple it as a Slave again - or record "
+                "the maintenance acknowledgement (SLAVE_FILTER_SOFT_RESET=1). This is "
+                "how the units work, not a transient delay.", serial)
         else:
             log.info(
                 "filter reset for %s: sent to the device and its zone Master; the device "
@@ -3478,8 +3485,9 @@ class AmbientikaBridge:
         Die Quittung endet nur aus zwei Gruenden, und beide stehen im Log:
           * die Frist FILTER_ACK_TTL_DAYS ist abgelaufen, oder
           * das Geraet meldet selbst mindestens FILTER_ACK_CLEAR_POLLS Abrufe in
-            Folge und mindestens FILTER_ACK_CLEAR_MIN_S lang "Good" (Filter
-            direkt am Geraet zurueckgesetzt).
+            Folge und mindestens FILTER_ACK_CLEAR_MIN_S lang "Good" (sein Zaehler
+            wurde doch geloescht, z. B. nach dem Reset als voruebergehendes
+            Einzelgeraet).
         Ein einzelner unbekannter oder kurz gruener Rohwert loescht sie nicht
         mehr - frueher genuegte dafuer ein einziger Abruf, ohne Logeintrag.
         """
