@@ -3542,10 +3542,178 @@ async def test_ack_startup_run_path():
         bridge._FILTER_ACK_ODD_RAW.clear()
 
 
+async def test_neuracell_timed_expulsion():
+    """1.4.37: Die zeitgesteuerte Abluft (TimedExpulsion) ist eine 20-Minuten-Aktion,
+    kein Modus, zu dem ein Geraet zurueckkehrt - sie wird nie zur Baseline."""
+    def mk(op, last):
+        cfg = bridge.BridgeConfig()
+        cfg.radon_threshold = 300
+        cfg.radon_hysteresis = 50
+        b = bridge.AmbientikaBridge(cfg)
+        b.client = FakeClient()
+        b.loop = asyncio.get_running_loop()
+        dev = FakeDevice(serial="FLUR", name="Flur", zone=1,
+                         status=mkstatus(op=op, last=last, fan=FS.High, hum=HL.Normal))
+        dev.role = "Master"
+        b.devices = {dev.serial_number: dev}
+        return b, dev, b.neuracell
+
+    # A) Taupunktsperre waehrend der Abluft: Baseline = Modus, zu dem das Geraet zurueckkehrt
+    b, dev, nc = mk(OM.TimedExpulsion, OM.Auto)
+    with _LogCapture() as lc:
+        await nc.on_dewpoint_block("ON")
+    check("timed: Sperre -> Geraet Off", dev._status["operating_mode"] == OM.Off, dev._status["operating_mode"])
+    check("timed: Baseline ist Auto (last_operating_mode), nicht TimedExpulsion",
+          nc._saved_modes.get("FLUR", {}).get("operating_mode") == OM.Auto, nc._saved_modes.get("FLUR"))
+    check("timed: Luefterstufe/Feuchteschwelle wie gemeldet",
+          nc._saved_modes["FLUR"]["fan_speed"] == FS.High and nc._saved_modes["FLUR"]["humidity_level"] == HL.Normal)
+    check("timed: Log nennt den uebernommenen Modus", lc.has("INFO", "timed extraction", "FLUR", "Auto"), lc.lines[-3:])
+    await nc.on_dewpoint_block("OFF")
+    check("timed: Freigabe -> Auto wiederhergestellt, nicht TimedExpulsion",
+          dev.mode_calls[-1]["operating_mode"] == OM.Auto, dev.mode_calls[-1:])
+    check("timed: Baseline geloescht", "FLUR" not in nc._saved_modes)
+
+    # B) Radonschutz: gleicher Weg
+    b, dev, nc = mk(OM.TimedExpulsion, OM.Smart)
+    await nc.on_radon_value("500")
+    check("timed/radon: Geraet Intake", dev._status["operating_mode"] == bridge.RADON_PROTECTION_MODE)
+    check("timed/radon: Baseline Smart", nc._saved_modes.get("FLUR", {}).get("operating_mode") == OM.Smart)
+    await nc.on_radon_value("100")
+    check("timed/radon: Smart wiederhergestellt", dev.mode_calls[-1]["operating_mode"] == OM.Smart, dev.mode_calls[-1:])
+
+    # C) kein brauchbarer vorheriger Modus -> altes Verhalten, mit Warnung
+    b, dev, nc = mk(OM.TimedExpulsion, OM.TimedExpulsion)
+    with _LogCapture() as lc:
+        await nc.on_dewpoint_block("ON")
+    check("timed/unbrauchbar: Baseline bleibt TimedExpulsion",
+          nc._saved_modes.get("FLUR", {}).get("operating_mode") == OM.TimedExpulsion)
+    check("timed/unbrauchbar: Warnung im Log", lc.has("WARNING", "no usable", "FLUR"), lc.lines[-3:])
+    with _LogCapture() as lc:
+        await nc.on_dewpoint_block("OFF")
+    check("timed/unbrauchbar: Restore warnt (TimedExpulsion als Baseline)",
+          lc.has("WARNING", "saved baseline", "FLUR", "TimedExpulsion"), lc.lines[-3:])
+
+    # D) normaler Modus unveraendert: Baseline = gemeldeter Modus (kein Rueckgriff auf last)
+    b, dev, nc = mk(OM.ManualHeatRecovery, OM.Auto)
+    await nc.on_dewpoint_block("ON")
+    check("timed/normal: Baseline bleibt der gemeldete Modus",
+          nc._saved_modes.get("FLUR", {}).get("operating_mode") == OM.ManualHeatRecovery)
+    await nc.on_dewpoint_block("OFF")
+
+    # E) manuelles TimedExpulsion waehrend des Schutzes: verworfen, Baseline unveraendert, nichts gesendet
+    b, dev, nc = mk(OM.Auto, OM.Auto)
+    await nc.on_dewpoint_block("ON")
+    sent = len(dev.mode_calls)
+    with _LogCapture() as lc:
+        await b._handle_command("FLUR", "operating_mode", "TimedExpulsion")
+        await asyncio.sleep(0.05)
+    check("timed/manuell: Baseline bleibt Auto", nc._saved_modes.get("FLUR", {}).get("operating_mode") == OM.Auto,
+          nc._saved_modes.get("FLUR"))
+    check("timed/manuell: nichts ans Geraet gesendet", len(dev.mode_calls) == sent, dev.mode_calls[sent:])
+    check("timed/manuell: Warnung 'not carried over'", lc.has("WARNING", "TimedExpulsion", "not carried over", "FLUR"), lc.lines[-3:])
+    # ... ein normaler Modus wird wie bisher vorgemerkt
+    await b._handle_command("FLUR", "operating_mode", "Night")
+    await asyncio.sleep(0.05)
+    check("timed/manuell: Night wird als neue Baseline vorgemerkt",
+          nc._saved_modes.get("FLUR", {}).get("operating_mode") == OM.Night, nc._saved_modes.get("FLUR"))
+    await nc.on_dewpoint_block("OFF")
+    check("timed/manuell: Freigabe -> Night", dev.mode_calls[-1]["operating_mode"] == OM.Night, dev.mode_calls[-1:])
+
+    # F) Freigabe, aber Restore steht noch aus (Geraet war nicht erreichbar): TimedExpulsion
+    #    darf nicht aus dem Schutzmodus heraus starten - erst Restore, dann Abluft.
+    from returns.result import Failure as _Failure
+    import types as _types
+    b, dev, nc = mk(OM.Auto, OM.Auto)
+    await nc.on_dewpoint_block("ON")
+    check("timed/pending: Sperre -> Off, Baseline Auto",
+          dev._status["operating_mode"] == OM.Off and nc._saved_modes["FLUR"]["operating_mode"] == OM.Auto)
+    real_change_mode = dev.change_mode
+    async def _unreachable(mode):
+        return _Failure({"status_code": 500})
+    dev.change_mode = _unreachable
+    await nc.on_dewpoint_block("OFF")
+    check("timed/pending: Restore schlaegt fehl -> Baseline bleibt, Geraet weiter Off",
+          "FLUR" in nc._saved_modes and dev._status["operating_mode"] == OM.Off, nc._saved_modes.get("FLUR"))
+    sent = len(dev.mode_calls)
+    with _LogCapture() as lc:
+        await b._handle_command("FLUR", "operating_mode", "TimedExpulsion")
+    check("timed/pending: Geraet weiter unerreichbar -> Abluft nicht gestartet, Warnung",
+          lc.has("WARNING", "TimedExpulsion", "FLUR", "restore pending", "not started"), lc.lines[-3:])
+    check("timed/pending: Baseline bleibt Auto", nc._saved_modes.get("FLUR", {}).get("operating_mode") == OM.Auto)
+    dev.change_mode = real_change_mode
+    with _LogCapture() as lc:
+        await b._handle_command("FLUR", "operating_mode", "TimedExpulsion")
+    sent_modes = [c["operating_mode"] for c in dev.mode_calls[sent:]]
+    check("timed/pending: erreichbar -> erst Auto (Restore), dann TimedExpulsion",
+          sent_modes == [OM.Auto, OM.TimedExpulsion], sent_modes)
+    check("timed/pending: Abluft startet aus Auto heraus (Luefter/Feuchte aus der Baseline)",
+          dev.mode_calls[-1]["fan_speed"] == FS.High and dev.mode_calls[-1]["humidity_level"] == HL.Normal, dev.mode_calls[-1])
+    check("timed/pending: Baseline danach geloescht", "FLUR" not in nc._saved_modes, nc._saved_modes)
+    check("timed/pending: Log 'restored first'", lc.has("INFO", "FLUR", "restored first"), lc.lines[-4:])
+
+    # G) kombinierter Befehl waehrend des Schutzes: Modus verworfen, Luefterstufe vorgemerkt, nichts gesendet
+    b, dev, nc = mk(OM.Auto, OM.Auto)
+    await nc.on_dewpoint_block("ON")
+    sent = len(dev.mode_calls)
+    with _LogCapture() as lc:
+        await b._handle_command_set("FLUR", {"mode": "TimedExpulsion", "fanSpeed": "Low"})
+    check("timed/kombiniert: Luefterstufe Low vorgemerkt, Modus bleibt Auto",
+          nc._saved_modes["FLUR"]["fan_speed"] == FS.Low and nc._saved_modes["FLUR"]["operating_mode"] == OM.Auto,
+          nc._saved_modes["FLUR"])
+    check("timed/kombiniert: nichts gesendet", len(dev.mode_calls) == sent, dev.mode_calls[sent:])
+    check("timed/kombiniert: Warnungen fuer beides (verworfen / vorgemerkt)",
+          lc.has("WARNING", "not carried over", "FLUR") and lc.has("WARNING", "deferring manual fan_speed change on FLUR"),
+          lc.lines[-4:])
+    await nc.on_dewpoint_block("OFF")
+    check("timed/kombiniert: Freigabe -> Auto mit Low", dev.mode_calls[-1]["operating_mode"] == OM.Auto
+          and dev.mode_calls[-1]["fan_speed"] == FS.Low, dev.mode_calls[-1:])
+
+    # H) TimedExpulsion + Lichtsensor waehrend des Schutzes: Licht geht durch, Modus bleibt Off
+    b, dev, nc = mk(OM.Auto, OM.Auto)
+    await nc.on_dewpoint_block("ON")
+    sent = len(dev.mode_calls)
+    await b._handle_command_set("FLUR", {"mode": "TimedExpulsion", "lightSensorLevel": "Low"})
+    check("timed/licht: ein Befehl, Lichtsensor Low, Modus Off (Schutz bleibt)",
+          len(dev.mode_calls) == sent + 1 and dev.mode_calls[-1]["light_sensor_level"] == LS.Low
+          and dev.mode_calls[-1]["operating_mode"] == OM.Off, dev.mode_calls[sent:])
+    check("timed/licht: Baseline unveraendert Auto", nc._saved_modes["FLUR"]["operating_mode"] == OM.Auto)
+    await nc.on_dewpoint_block("OFF")
+
+    # I) Zustandsdatei einer aelteren Version mit TimedExpulsion-Baseline: geladen, mit Warnung wiederhergestellt
+    b, dev, nc = mk(OM.Off, OM.Auto)
+    with open(bridge.NEURACELL_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"saved_modes": {"FLUR": {"operating_mode": "TimedExpulsion", "fan_speed": "High",
+                                              "humidity_level": "Normal"}},
+                   "applied": {"FLUR": {"operating_mode": "Off", "fan_speed": "Medium"}},
+                   "ts": time.time()}, f)
+    old_grace = bridge.STARTUP_GRACE_S
+    bridge.STARTUP_GRACE_S = 0.0
+    try:
+        with _LogCapture() as lc:
+            nc.load_persisted()
+            check("timed/legacy: Baseline aus Datei geladen",
+                  nc._saved_modes.get("FLUR", {}).get("operating_mode") == OM.TimedExpulsion, nc._saved_modes.get("FLUR"))
+            await nc.reconcile()
+            await nc.reconcile()
+        check("timed/legacy: wiederhergestellt (altes Verhalten)", dev._status["operating_mode"] == OM.TimedExpulsion,
+              dev._status["operating_mode"])
+        check("timed/legacy: genau eine Warnung dazu",
+              sum(1 for lv, m in lc.lines if lv == "WARNING" and "saved baseline" in m and "timed extraction" in m
+                  and "FLUR" in m) == 1,
+              [m for lv, m in lc.lines if "saved baseline" in m])
+    finally:
+        bridge.STARTUP_GRACE_S = old_grace
+        try:
+            os.remove(bridge.NEURACELL_STATE_FILE)
+        except OSError:
+            pass
+
+
 async def _async_suite():
     await test_neuracell()
     await test_neuracell_scoped()
     await test_neuracell_robust()
+    await test_neuracell_timed_expulsion()
     await test_radon_meter()
     await test_dewpoint_watch()
     await test_meter_watch()

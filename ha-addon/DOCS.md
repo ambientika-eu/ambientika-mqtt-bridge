@@ -90,7 +90,12 @@ hysteresis.
 
 **Dew-point control** - ventilating would raise indoor humidity: the units in
 `dewpoint_block_devices` switch off until conditions are favourable again. Radon
-protection always has priority.
+protection always has priority. When a protection ends, every unit gets back the
+mode it had before; a unit that was in its 20-minute timed extraction
+(`TimedExpulsion`) gets back the mode that extraction would have returned to (its
+`last_operating_mode`), since 1.4.37 - not the extraction itself, which would run
+again and then leave the unit in the protection mode. A timed extraction
+requested while protection controls a unit is not carried over; the log says so.
 
 | Option | Default | Description |
 |---|---|---|

@@ -380,6 +380,11 @@ RADON_PROTECTION_MODE = OperatingMode.Intake
 RADON_PROTECTION_FAN_DEFAULT = FanSpeed.Low
 # Dew-point "do not ventilate" == switch the unit off.
 DEWPOINT_BLOCK_MODE = OperatingMode.Off
+# The 20-minute timed extraction (app button "timed extraction"): the unit runs
+# it and then returns BY ITSELF to the mode it reports as last_operating_mode.
+# It is an action with an end, not a mode to come back to - so it never becomes
+# a NeuraCell-X baseline (see NeuraCellXController._baseline_mode).
+TIMED_MODE = OperatingMode.TimedExpulsion
 
 
 def _truthy(value: str) -> bool:
@@ -1515,6 +1520,7 @@ class NeuraCellXController:
         # The cloud can report the old (protection) mode for a while after a
         # restore; a partial manual command must not copy that stale mode back.
         self._recent_restore: dict = {}
+        self._timed_warned: set = set()  # serials whose TimedExpulsion baseline was named in the log
         self._persisted: Optional[str] = None
         self._persist_warned = False
         self._lock = asyncio.Lock()
@@ -2176,6 +2182,34 @@ class NeuraCellXController:
             return fallback
         return value
 
+    def _baseline_mode(self, serial: str, status: dict):
+        """The operating mode a unit gets back once protection clears.
+
+        Normally the mode it reports now. TIMED_MODE (TimedExpulsion) is the
+        exception: the unit is in its 20-minute timed extraction and will return
+        by itself to the mode it reports as last_operating_mode. Saving
+        TimedExpulsion would restore an action that has long since ended -
+        another 20 minutes of full extraction when protection clears, after
+        which the unit falls back to the mode it was in just before, which by
+        then is the protection mode itself (Off or Intake). So the baseline is
+        the mode the extraction returns to. If the unit reports no usable one
+        (missing, TimedExpulsion again, or a read-only value the API would not
+        accept back), the old behaviour stays and the log says so.
+        """
+        mode = status["operating_mode"]
+        if mode != TIMED_MODE:
+            return mode
+        last = status.get("last_operating_mode")
+        if last is None or last == TIMED_MODE or is_compat_member(OperatingMode, last):
+            log.warning("NeuraCell-X: %s is in its timed extraction and reports no usable "
+                        "previous mode (%s) - saving TimedExpulsion as its baseline after all.",
+                        serial, getattr(last, "name", last))
+            self._timed_warned.discard(serial)     # the restore of this baseline warns once
+            return mode
+        log.info("NeuraCell-X: %s is in its timed extraction - saving the mode it returns "
+                 "to (%s) as its baseline, not TimedExpulsion.", serial, last.name)
+        return last
+
     def _still_protected(self, serial: str, status: dict) -> bool:
         """Is the unit still in the protection state we put it in (restart check)?"""
         applied = self._applied.get(serial)
@@ -2213,6 +2247,15 @@ class NeuraCellXController:
                 return True
         snapshot = dict(saved)
         applied = self._applied.get(serial)
+        if snapshot["operating_mode"] == TIMED_MODE and serial not in self._timed_warned:
+            # The unit was in its timed extraction when protection started and no
+            # usable previous mode was known (see _baseline_mode), or the state
+            # file was written before 1.4.37. The extraction ends by itself after
+            # 20 minutes; the mode the unit falls back to then is its own.
+            self._timed_warned.add(serial)
+            log.warning("NeuraCell-X: the saved baseline of %s is the timed extraction "
+                        "(TimedExpulsion - no usable previous mode was known) - restoring it; "
+                        "the unit ends it after 20 minutes. Check the mode it settles on.", serial)
         ok = await self.bridge.set_device_mode(
             device, snapshot["operating_mode"], snapshot["fan_speed"], snapshot["humidity_level"])
         if not ok:
@@ -2223,6 +2266,7 @@ class NeuraCellXController:
             del self._saved_modes[serial]
             self._applied.pop(serial, None)
             self._from_disk.discard(serial)
+            self._timed_warned.discard(serial)
             return True
         return False    # changed during the restore -> apply the newer baseline next poll
 
@@ -2263,7 +2307,7 @@ class NeuraCellXController:
         # targeted dew-point block never disturbs the other units.
         if serial not in self._saved_modes:
             base = {
-                "operating_mode": status["operating_mode"],
+                "operating_mode": self._baseline_mode(serial, status),
                 "fan_speed": self._api_value(FanSpeed, status["fan_speed"], FanSpeed.Low),
                 "humidity_level": self._api_value(HumidityLevel, status["humidity_level"],
                                                   HumidityLevel.Normal),
@@ -3954,6 +3998,15 @@ class AmbientikaBridge:
         if self.neuracell._device_under_control(serial, device):
             nc = self.neuracell
             deferred = [a for a in parsed if a in self._BASELINE_ATTRS]
+            if parsed.get("operating_mode") == TIMED_MODE:
+                # A 20-minute action, not a mode to return to: carried over, it
+                # would run when protection clears and leave the unit in the
+                # protection mode afterwards. Dropped, and the log says so.
+                deferred.remove("operating_mode")
+                log.warning("NeuraCell-X active: timed extraction (TimedExpulsion) requested for "
+                            "%s while protection controls the unit - not possible now and not "
+                            "carried over (it is a 20-minute action, not a mode to return to).",
+                            serial)
             for attr in deferred:
                 if serial in nc._saved_modes:
                     nc._saved_modes[serial][attr] = parsed[attr]
@@ -3974,10 +4027,26 @@ class AmbientikaBridge:
             # newer choice becomes that baseline, so a later retry cannot
             # overwrite it with older values.
             nc = self.neuracell
+            if parsed.get("operating_mode") == TIMED_MODE and serial in nc._saved_modes:
+                # The unit still runs the protection mode and has not got its
+                # previous mode back. Started now, the 20-minute extraction would
+                # end in that protection mode - so restore first, then start it
+                # from the right mode. If the restore fails, nothing is sent; the
+                # next poll retries the restore. (unit_lock is held by the caller,
+                # as _restore_one requires.)
+                if not await nc._restore_one(serial, device):
+                    log.warning("timed extraction (TimedExpulsion) for %s: the unit has not got "
+                                "its previous mode back yet (restore pending) - not started. "
+                                "Please try again in a moment.", serial)
+                    return
+                log.info("%s: previous mode restored first, then the timed extraction.", serial)
             for store in (nc._saved_modes, nc._pending_manual):
                 if serial in store:
                     for attr in parsed:
-                        if attr in self._BASELINE_ATTRS:
+                        # TimedExpulsion is applied live below but never kept as
+                        # the baseline (see _baseline_mode).
+                        if attr in self._BASELINE_ATTRS and not (
+                                attr == "operating_mode" and parsed[attr] == TIMED_MODE):
                             store[serial][attr] = parsed[attr]
         self.neuracell.persist()
 
