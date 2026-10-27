@@ -22,11 +22,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # Trusted Publishing (OIDC): no NPM_TOKEN secret needed.
+      # npmjs.com -> homebridge-ambientika -> Settings -> Trusted Publisher:
+      #   GitHub Actions, ambientika-eu / ambientika-mqtt-bridge, workflow publish-npm.yml
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
+
+      - name: Update npm (Trusted Publishing needs npm >= 11.5.1)
+        run: npm install -g npm@latest && npm --version
 
       - name: Read package version
         id: pkg
@@ -57,11 +62,7 @@ jobs:
       - name: Verify package
         if: steps.check.outputs.should_publish == 'true'
         run: npm publish --dry-run
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Publish to npm
+      - name: Publish to npm (OIDC, provenance is added automatically)
         if: steps.check.outputs.should_publish == 'true'
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
