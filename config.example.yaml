@@ -28,6 +28,10 @@ bridge:
   # unit's name as in the app, 1-240. Units not listed use AVERAGE_WINDOW_MIN
   # (env, default 30).
   average_window_devices: ""   # e.g. "A1B2C3D4E5F6=15, Schlafzimmer Eltern=60"
+  # Hysteresis of humidity_avg for single units, in percentage points (0-10):
+  # the published value only moves once the mean has left it by at least that
+  # much. Same "unit=value" entries as above; empty = none.
+  humidity_avg_hysteresis_devices: ""   # e.g. "A1B2C3D4E5F6=1"
 
 # --- NeuraCell-X radon protection ---
 # Radon alarm -> all devices Intake (Zuluft/supply) at fan Low (Stufe 1).

@@ -1,6 +1,6 @@
 name: "Ambientika MQTT Bridge"
 description: "MQTT bridge for Ambientika ventilation units. Connects the Ambientika Cloud API to your local MQTT broker with Home Assistant Auto-Discovery support. Includes NeuraCell-X radon protection + dew-point control (Taupunktsteuerung)."
-version: "1.4.37"
+version: "1.4.38"
 slug: "ambientika_mqtt_bridge"
 init: false
 arch:
@@ -65,6 +65,8 @@ options:
   average_window_min: 30
   # Eigenes Fenster je Geraet: "Seriennummer=Minuten" (sicher) oder "Name wie in der App=Minuten", z. B. "A1B2C3D4E5F6=15, Schlafzimmer=60" (leer = alle wie oben)
   average_window_devices: ""
+  # Hysterese fuer Humidity (averaged) je Geraet in %-Punkten (0-10): "Seriennummer=1" oder "Name wie in der App=1" (leer = keine)
+  humidity_avg_hysteresis_devices: ""
   # --- Filter-Wartungsquittung fuer Slave-Einheiten ---
   slave_filter_soft_reset: false
   filter_ack_ttl_days: 90
@@ -116,6 +118,7 @@ schema:
   command_coalesce_ms: int(0,10000)
   average_window_min: int(1,240)
   average_window_devices: str?
+  humidity_avg_hysteresis_devices: str?
   # --- Filter-Wartungsquittung ---
   slave_filter_soft_reset: bool
   filter_ack_ttl_days: int(1,3650)

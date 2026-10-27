@@ -3144,14 +3144,15 @@ class _LogCapture:
         return any(lv == level and all(p in msg for p in parts) for lv, msg in self.lines)
 
 
-def _house_bridge(names, poll=30, awd=""):
-    """Bridge mit Geraeten wie beim Kunden (Name -> Serial = Name in Grossbuchstaben)."""
+def _house_bridge(names, poll=30, awd="", hyd=""):
+    """Bridge mit Geraeten wie beim Kunden (Geraet i -> Serial "SN-i")."""
     cfg = bridge.BridgeConfig()
     cfg.neuracell_enabled = False
     cfg.dewpoint_enabled = False
     cfg.enable_discovery = False
     cfg.poll_interval = poll
     cfg.average_window_devices = awd
+    cfg.humidity_avg_hysteresis_devices = hyd
     b = bridge.AmbientikaBridge(cfg)
     devs = {}
     for i, n in enumerate(names):
@@ -3378,6 +3379,182 @@ def test_average_per_device():
             os.environ["AVERAGE_WINDOW_DEVICES"] = old_env
 
 
+def test_humidity_hysteresis():
+    """Hysterese fuer Humidity (averaged) je Geraet (humidity_avg_hysteresis_devices),
+    Kundenvorschlag Okt. 2026: Gaeste-Bad mit 10-min-Fenster schwebte in ruhigen
+    Stunden um 1-2 Punkte. Bridge 1.4.38."""
+    import random as _rnd
+    C = bridge.BridgeConfig
+
+    def parse(v):
+        c = C()
+        c.humidity_avg_hysteresis_devices = v
+        return c.humidity_avg_hysteresis_entries()
+
+    # A) Parsen
+    e, p = parse("Gäste-Bad=1, SN-2=1.5 %rH; Flur:0.5%\nWC=2 % rF\r\nKeller=0.8%RF")
+    check("hyst: fuenf Eintraege, Einheiten erlaubt",
+          [(lbl, v) for _, lbl, v in e] == [("Gäste-Bad", 1.0), ("SN-2", 1.5), ("Flur", 0.5), ("WC", 2.0),
+                                            ("Keller", 0.8)] and p == [], (e, p))
+    check("hyst: Schluessel wie beim Fenster", e[0][0] == bridge._name_key("Gäste Bad"), e[0])
+    for v in ("", "  ", " , ; ", None):
+        e, p = parse(v)
+        check("hyst: leer %r -> nichts" % (v,), e == [] and p == [], (e, p))
+    e, p = parse("Bad=20, WC=-1, Flur=0")
+    check("hyst: ausserhalb 0-10 begrenzt, 0 erlaubt",
+          [v for _, _, v in e] == [10.0, 0.0, 0.0] and len(p) == 2
+          and "using 10" in p[0] and "20 %" in p[0] and "using 0" in p[1], (e, p))
+    e, p = parse("Bad=1,5")
+    check("hyst: Dezimalkomma -> 'Bad=1' plus gemeldeter Rest",
+          [(lbl, v) for _, lbl, v in e] == [("Bad", 1.0)] and len(p) == 1 and "name=percent" in p[0], (e, p))
+    e, p = parse("Bad, =1, Bad=, Küche=abc, Flur=nan, Keller=inf, WC=1 min")
+    check("hyst: unbrauchbare Eintraege ignoriert, je einmal gemeldet",
+          e == [] and len(p) == 7 and all("ignored" in x for x in p), (e, p))
+    for v in (1, True, ["Bad=1"], {"Bad": 1}):
+        try:
+            e, p = parse(v)
+            ok = isinstance(e, list) and isinstance(p, list)
+        except Exception as ex:      # noqa: BLE001
+            ok, e = False, ex
+        check("hyst: Nicht-Text aus options.json %r -> kein Absturz" % (v,), ok, e)
+
+    # B) Zuordnung und Startlog
+    b, devs = _house_bridge(["Flur", "Gäste Bad", "Kinderzimmer", "Wohnzimmer"],
+                            hyd="Gäste-Bad=1, sn-2=0, Keller=1")
+    with _LogCapture() as lc:
+        b._resolve_humidity_hysteresis()
+    check("hyst: Bad 1, Kinderzimmer 0 (Seriennummer)", b._hum_hyst == {"SN-1": 1.0, "SN-2": 0.0}, b._hum_hyst)
+    check("hyst: unbekannter Name gewarnt, mit Geraeteliste",
+          lc.has("WARNING", "humidity_avg_hysteresis_devices: no unit named 'Keller'", "Flur (SN-0)"), lc.lines)
+    check("hyst: Startlog nennt die Hysterese je Geraet",
+          lc.has("INFO", "Humidity (averaged) hysteresis per unit: Gäste Bad 1 %, Kinderzimmer 0 % (off);"
+                         " all others none."), lc.lines)
+    b, devs = _house_bridge(["Bad"], hyd="")
+    with _LogCapture() as lc:
+        b._resolve_humidity_hysteresis()
+    check("hyst: leer -> nichts, kein Log", b._hum_hyst == {} and not lc.lines, lc.lines)
+    b, devs = _house_bridge(["Bad", "WC"], hyd="Bad=1, WC=0.5, SN-0=2")
+    with _LogCapture() as lc:
+        b._resolve_humidity_hysteresis()
+    check("hyst: doppelt -> spaeterer Eintrag mit Warnung, alle genannt ohne 'all others'",
+          b._hum_hyst == {"SN-0": 2.0, "SN-1": 0.5} and lc.has("WARNING", "listed more than once", "using 2 %")
+          and lc.has("INFO", "per unit: Bad 2 %, WC 0.5 %.") and not lc.has("INFO", "all others"), lc.lines)
+    b, devs = _house_bridge(["Bad"], hyd="Keller=1")
+    with _LogCapture() as lc:
+        b._resolve_humidity_hysteresis()
+    check("hyst: nichts passt -> nur Warnung", b._hum_hyst == {} and not lc.has("INFO", "hysteresis"), lc.lines)
+
+    # C) Halten: Wert bleibt, bis das Mittel um mindestens H abweicht
+    b, devs = _house_bridge(["Bad", "Flur"], hyd="Bad=1")
+    b._resolve_humidity_hysteresis()
+    seq = [64.0, 64.4, 63.2, 64.9, 65.0, 65.6, 64.1, 63.9, None, 64.4, 64.9, 70.0, 100.0, 99.5, 98.9]
+    want = [64.0, 64.0, 64.0, 64.0, 65.0, 65.0, 65.0, 63.9, None, 64.4, 64.4, 70.0, 100.0, 100.0, 98.9]
+    got = [b._hold_humidity_avg("SN-0", v) for v in seq]
+    check("hyst: Halten, Schwelle genau 1 schaltet, unbekannt sofort und setzt zurueck", got == want, got)
+    check("hyst: Geraet ohne Eintrag unveraendert",
+          [b._hold_humidity_avg("SN-1", v) for v in seq] == seq)
+    b.cfg.humidity_avg_hysteresis_devices = "SN-0=0"
+    b._resolve_humidity_hysteresis()
+    check("hyst: 0 = aus", [b._hold_humidity_avg("SN-0", v) for v in seq] == seq)
+    # Aenderung der Hysterese verwirft den gehaltenen Wert, unveraenderte behalten ihn
+    b.cfg.humidity_avg_hysteresis_devices = "SN-0=1, SN-1=1"
+    b._resolve_humidity_hysteresis()
+    b._hold_humidity_avg("SN-0", 60.0)
+    b._hold_humidity_avg("SN-1", 50.0)
+    b.cfg.humidity_avg_hysteresis_devices = "SN-0=2, SN-1=1"
+    b._resolve_humidity_hysteresis()
+    check("hyst: neu aufgeloest - geaendert verworfen, gleich behalten",
+          b._hum_avg_held == {"SN-1": 50.0} and b._hold_humidity_avg("SN-0", 60.5) == 60.5
+          and b._hold_humidity_avg("SN-1", 50.5) == 50.0, b._hum_avg_held)
+
+    # D) Kundenbild ueber den echten Payload-Pfad: Rohwert springt nachts zwischen 62 und 65
+    #    (Umkehrtakt 34 s, Sendetakt 30 s +-10 %), Fenster 10 min; dann eine Dusche.
+    def house(hyd):
+        bb, dd = _house_bridge(["Gäste Bad", "Flur"], awd="Gäste Bad=10", hyd=hyd)
+        bb._resolve_average_windows()
+        bb._resolve_humidity_hysteresis()
+        return bb, dd
+    b0, d0 = house("")
+    b1, d1 = house("Gäste-Bad=1")
+    rng = _rnd.Random(5)
+    out0, out1, raw0, raw1, t0, t1, flur0, flur1 = [], [], [], [], [], [], [], []
+    with _Clock() as c:
+        t = c.t
+        for i in range(8 * 120):                 # 8 h nachts, danach 1 h mit Dusche
+            t += 30 * rng.uniform(0.9, 1.1)
+            c.t = t
+            room = 64.0
+            if i >= 6 * 120:
+                k = (i - 6 * 120) * 0.5            # Minuten seit Duschbeginn
+                room = 100.0 if k < 15 else max(64.0, 100.0 - (k - 15) * 3)
+            phase = int(t // 34) % 2
+            h = round((room if phase == 0 else room - 3.0) / 2.8) * 2.8
+            for bb, dd, out, raw, tt, fl in ((b0, d0, out0, raw0, t0, flur0), (b1, d1, out1, raw1, t1, flur1)):
+                for sn, dv in dd.items():
+                    dv._status["humidity"] = h
+                    dv._status["temperature"] = 21 + (i % 7) * 0.1
+                    pl = bb._state_payload(sn, dv, dict(dv._status))
+                    if sn == "SN-0":
+                        out.append(pl["humidity_avg"])
+                        raw.append(pl["humidity"])
+                        tt.append(pl["temperature_avg"])
+                    else:
+                        fl.append(pl["humidity_avg"])
+
+    def hourly_span(out, h0, h1):
+        spans = []
+        for hh in range(h0, h1):
+            v = [x for x in out[hh * 120:(hh + 1) * 120] if x is not None]
+            spans.append(max(v) - min(v))
+        return spans
+    s0, s1 = hourly_span(out0, 1, 6), hourly_span(out1, 1, 6)
+    check("hyst: Nacht - ohne Hysterese schwebt das 10-min-Mittel (Kundenbild)",
+          max(s0) >= 0.5, s0)
+    check("hyst: Nacht - mit 1 % Hysterese deutlich ruhiger",
+          sum(s1) <= 0.5 * sum(s0) and max(s1) <= 1.2, (s0, s1))
+    check("hyst: gezeigter Wert nie mehr als 1 % neben dem Mittel",
+          all(a is None and b_ is None or abs(a - b_) < 1.0 + 1e-9 for a, b_ in zip(out0, out1)),
+          max(abs(a - b_) for a, b_ in zip(out0, out1) if a is not None))
+    shower = 6 * 120
+    def first_at(out, level):
+        return next(i for i in range(shower, len(out)) if out[i] is not None and out[i] >= level) - shower
+    check("hyst: Dusche - Anstieg auf 90 genauso schnell (+-1 Abruf)",
+          abs(first_at(out1, 90.0) - first_at(out0, 90.0)) <= 1, (first_at(out0, 90.0), first_at(out1, 90.0)))
+    check("hyst: Rohwert, Temperatur-Mittel und anderes Geraet unveraendert",
+          raw0 == raw1 and t0 == t1 and flur0 == flur1)
+
+    # E) Konfiguration: options.json, YAML (bridge:), Umgebungsvariable, null
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    old_env = os.environ.pop("HUMIDITY_AVG_HYSTERESIS_DEVICES", None)
+    try:
+        pj = os.path.join(tmp, "options.json")
+        with open(pj, "w") as f:
+            json.dump({"ambientika_username": "u", "humidity_avg_hysteresis_devices": "Gäste-Bad=1"}, f)
+        check("hyst-cfg: options.json", C.from_ha_options(pj).humidity_avg_hysteresis_devices == "Gäste-Bad=1")
+        with open(pj, "w") as f:
+            json.dump({"ambientika_username": "u", "humidity_avg_hysteresis_devices": None}, f)
+        check("hyst-cfg: options.json null -> leer", C.from_ha_options(pj).humidity_avg_hysteresis_devices == "")
+        with open(pj, "w") as f:
+            json.dump({"ambientika_username": "u"}, f)
+        check("hyst-cfg: options.json ohne Schluessel -> leer",
+              C.from_ha_options(pj).humidity_avg_hysteresis_devices == "")
+        yp = os.path.join(tmp, "config.yaml")
+        with open(yp, "w") as f:
+            f.write("bridge:\n  poll_interval: 30\n  humidity_avg_hysteresis_devices: \"Bad=1, Flur=0.5\"\n")
+        check("hyst-cfg: YAML bridge-Abschnitt",
+              C.from_yaml(yp).humidity_avg_hysteresis_devices == "Bad=1, Flur=0.5")
+        os.environ["HUMIDITY_AVG_HYSTERESIS_DEVICES"] = "WC=2"
+        check("hyst-cfg: Umgebungsvariable", C.from_env().humidity_avg_hysteresis_devices == "WC=2")
+        os.environ["HUMIDITY_AVG_HYSTERESIS_DEVICES"] = "null"
+        check("hyst-cfg: Umgebungsvariable 'null' (bashio) -> leer",
+              C.from_env().humidity_avg_hysteresis_devices == "")
+    finally:
+        os.environ.pop("HUMIDITY_AVG_HYSTERESIS_DEVICES", None)
+        if old_env is not None:
+            os.environ["HUMIDITY_AVG_HYSTERESIS_DEVICES"] = old_env
+
+
 class _FakeRoom:
     def __init__(self, devices):
         self.devices = devices
@@ -3430,6 +3607,42 @@ async def test_average_per_device_discovery():
     check("disc-win: Fehler -> Geraetesuche laeuft durch, globales Fenster",
           "B-1" in b2.devices and b2._avg_window == {} and lc.has("ERROR", "could not be applied"),
           (list(b2.devices), b2._avg_window, lc.lines))
+
+
+async def test_humidity_hysteresis_discovery():
+    """humidity_avg_hysteresis_devices wird bei der Geraetesuche aufgeloest - ein Fehler
+    darin haelt die Bridge nie an, und das Fenster je Geraet bleibt davon unberuehrt."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.average_window_devices = "Bad=15"
+    cfg.humidity_avg_hysteresis_devices = "Gäste-Bad=1"
+    b = bridge.AmbientikaBridge(cfg)
+    b.api = _FakeApi([_FakeHouse(1, [_FakeRoom([FakeDevice(serial="B-1", name="Bad", zone=0),
+                                                FakeDevice(serial="G-1", name="Gäste Bad", zone=0)])])])
+    with _LogCapture() as lc:
+        await b._discover_devices()
+    check("disc-hyst: Gaeste Bad 1 % nach der Geraetesuche, Fenster unberuehrt",
+          b._hum_hyst == {"G-1": 1.0} and b._avg_window == {"B-1": 900.0}, (b._hum_hyst, b._avg_window))
+    check("disc-hyst: Startlog", lc.has("INFO", "hysteresis per unit: Gäste Bad 1 %"), lc.lines)
+
+    cfg2 = bridge.BridgeConfig()
+    cfg2.neuracell_enabled = False
+    cfg2.dewpoint_enabled = False
+    cfg2.average_window_devices = "Bad=15"
+    cfg2.humidity_avg_hysteresis_devices = "Bad=1"
+    b2 = bridge.AmbientikaBridge(cfg2)
+    b2.api = _FakeApi([_FakeHouse(1, [_FakeRoom([FakeDevice(serial="B-1", name="Bad", zone=0)])])])
+
+    def boom():
+        raise RuntimeError("kaputt")
+    cfg2.humidity_avg_hysteresis_entries = boom
+    with _LogCapture() as lc:
+        await b2._discover_devices()
+    check("disc-hyst: Fehler -> Geraetesuche laeuft durch, keine Hysterese, Fenster bleibt",
+          "B-1" in b2.devices and b2._hum_hyst == {} and b2._avg_window == {"B-1": 900.0}
+          and lc.has("ERROR", "humidity_avg_hysteresis_devices could not be applied")
+          and b2._hold_humidity_avg("B-1", 55.0) == 55.0, (b2._hum_hyst, lc.lines))
 
 
 async def test_ack_startup_run_path():
@@ -3735,6 +3948,7 @@ async def _async_suite():
     await test_mode_confirmed_slave_note()
     await test_average()
     await test_average_per_device_discovery()
+    await test_humidity_hysteresis_discovery()
 
 
 def main():
@@ -3747,6 +3961,7 @@ def main():
     test_discovery_raw_mode()
     test_average_discovery_and_env()
     test_average_per_device()
+    test_humidity_hysteresis()
     asyncio.run(_async_suite())
     print("\nRESULT:", "ALL PASS" if not FAILS else f"{len(FAILS)} FAIL -> {FAILS}")
     return 1 if FAILS else 0

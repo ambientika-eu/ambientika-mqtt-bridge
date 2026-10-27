@@ -276,6 +276,7 @@ environment variable overrides the same setting from `config.yaml`.
 | `COMMAND_COALESCE_MS` | — | `800` | Commands for the same device within this window are applied in one call (`0` = off) |
 | `AVERAGE_WINDOW_MIN` | — | `30` | Window of `humidity_avg` / `temperature_avg` in minutes, 1-1440 (add-on option `average_window_min`: 1-240; at least twenty poll intervals either way) |
 | `AVERAGE_WINDOW_DEVICES` | `bridge.average_window_devices` | *(empty)* | Own window for single units: `unit=minutes` entries, comma-separated, by serial number or unit name as in the app, 1-240 (e.g. `A1B2C3D4E5F6=15, Schlafzimmer Eltern=60`). The serial number is the safe way; in a name, upper/lower case does not matter and a hyphen, underscore or space count as the same separator (see *Averaged humidity and temperature*) |
+| `HUMIDITY_AVG_HYSTERESIS_DEVICES` | `bridge.humidity_avg_hysteresis_devices` | *(empty)* | Hysteresis of `humidity_avg` for single units in percentage points, `unit=points` entries as above, 0-10 (e.g. `A1B2C3D4E5F6=1`); the published value only moves once the mean has left it by at least that much (see *Averaged humidity and temperature*) |
 | `SLAVE_FILTER_SOFT_RESET` | — | `0` | Record a bridge-side "serviced" acknowledgement when a Slave's filter counter cannot be cleared remotely (see below) |
 | `FILTER_ACK_TTL_DAYS` | — | `90` | How long such an acknowledgement stays valid |
 | `FILTER_ACK_PATH` | — | `/data/filter_ack.json` | Where the acknowledgements are stored (needs a persistent volume) |
@@ -543,6 +544,26 @@ The log shows the windows in force once the units are found (`Averaging per unit
 ...`); an entry that matches no unit or cannot be read is named there, with the
 list of units and their serial numbers, and ignored. For a name containing a
 comma or semicolon use the serial number. Names are matched at start-up.
+A real bathroom confirmed the trade-off: with 10 instead of 15 minutes the mean
+reached its shower peak about 4 minutes earlier, but the swing in quiet night hours
+grew by about a third and the mean began to wander slowly with no real change.
+
+Since 1.4.38 single units can also get a hysteresis on `humidity_avg`:
+`HUMIDITY_AVG_HYSTERESIS_DEVICES` (add-on option and `config.yaml` key
+`humidity_avg_hysteresis_devices`) takes `unit=points` entries with the same syntax
+and name matching as `AVERAGE_WINDOW_DEVICES`, 0-10 percentage points (decimal
+point; a trailing `%`, `%rH` or `%rF` is fine). The published `humidity_avg` of such
+a unit only moves once the mean has left it by at least that many points, e.g.
+`A1B2C3D4E5F6=1`. On the unit's coarse raster a short window can sit on one phase of
+the drifting sampling for a while, so in quiet hours the mean wanders by one to two
+points with nothing changing in the room; the hysteresis hides that, while a shower
+(tens of points) passes at once. The price: the value can sit up to the hysteresis
+away from the true mean, and slow real changes arrive in steps. `null` (unknown)
+passes at once and the first mean afterwards is published as it is. Raw values,
+`temperature_avg` and the averaging itself are unchanged; 0 or not listed = none.
+A median instead of the mean was simulated and not taken: on the coarse raster it
+flips by a full step whenever one phase fills about half the window. The log shows
+the setting once the units are found (`Humidity (averaged) hysteresis per unit: ...`).
 
 ### Availability debounce
 

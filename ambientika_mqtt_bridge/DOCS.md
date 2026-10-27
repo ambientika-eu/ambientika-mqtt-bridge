@@ -47,6 +47,7 @@ Then save and start the add-on. Your units appear under
 | `command_coalesce_ms` | `800` | Commands for the same unit within this window are applied in one call. `0` applies every command immediately |
 | `average_window_min` | `30` | Window of the averaged sensors *Humidity (averaged)* and *Temperature (averaged)*, in minutes (1–240; at least twenty poll intervals), see below |
 | `average_window_devices` | *(empty)* | Own window for single units: `unit=minutes` entries, comma-separated, by serial number or by the unit's name as in the app (1–240 minutes), e.g. `A1B2C3D4E5F6=15, Schlafzimmer Eltern=60`. The serial number is the safe way (it is in the add-on log and in the app); a name must match the app's spelling - upper/lower case does not matter, and a hyphen, underscore or space count as the same separator; anything else does matter. Units not listed use `average_window_min`, see below |
+| `humidity_avg_hysteresis_devices` | *(empty)* | Hysteresis of *Humidity (averaged)* for single units, in percentage points: `unit=points` entries like `average_window_devices` (0–10), e.g. `A1B2C3D4E5F6=1`. The shown value only moves once the mean has left it by at least that much - calmer at night with a short window, a shower passes at once. Units not listed: none, see below |
 | `slave_filter_soft_reset` | `false` | Maintenance acknowledgement for Slave units, see below |
 | `filter_ack_ttl_days` | `90` | How long such an acknowledgement stays valid (1–3650) |
 
@@ -259,6 +260,10 @@ A shorter window follows a change faster but shows more of the residual swing
 described above: simulated with an irregular upload rhythm, the 15-minute mean
 swings about twice as much within an hour as the 30-minute mean, the 60-minute
 mean about half as much. 15 minutes is a sensible lower end for a bathroom.
+A real bathroom confirmed it: with 10 instead of 15 minutes the averaged value
+reached its shower peak about 4 minutes earlier, but the swing in quiet night
+hours grew by about a third and the mean began to wander slowly with no real
+change in the room.
 The add-on log shows the windows in force right after the units are found, e.g.
 `Averaging per unit: Gäste Bad 15 min, Schlafzimmer Eltern 60 min; all others
 30 min.` The minutes are a plain number (decimal point, e.g. `7.5`; a trailing
@@ -266,6 +271,30 @@ The add-on log shows the windows in force right after the units are found, e.g.
 is named in the log and ignored. For a unit whose name contains a comma or
 semicolon, use its serial number. Names are read at start-up: after renaming a
 unit in the app, restart the add-on.
+
+**A hysteresis per unit.** On the unit's coarse raster (steps of 2–3 points) a
+short window can sit on one phase of the drifting sampling for a while: in quiet
+hours the mean then wanders by one to two points although nothing changes in
+the room. Since 1.4.38, `humidity_avg_hysteresis_devices` gives single units a
+hysteresis on *Humidity (averaged)*: the shown value only moves once the mean
+has left it by at least that many percentage points, for example
+
+```yaml
+humidity_avg_hysteresis_devices: "A1B2C3D4E5F6=1"
+```
+
+A shower (tens of points) passes at once; the slow wander below the hysteresis
+is not shown. The price: the shown value can sit up to the hysteresis away from
+the true mean, and slow real changes arrive in steps. 1 is a good start, 1.5 if
+steps still show at night. Entries and name matching work exactly as for
+`average_window_devices`; 0–10 points, plain number with a decimal point
+(`1.5`), a trailing `%` is fine; 0 or not listed = no hysteresis. Only
+*Humidity (averaged)* is affected - the raw values, *Temperature (averaged)* and
+the averaging itself stay as they are; after *unknown* the first mean is shown
+as it is. A median over the window instead of the mean was looked at and not
+taken: on the coarse raster it flips by a full step whenever one phase fills
+about half the window. The log shows the setting once the units are found, e.g.
+`Humidity (averaged) hysteresis per unit: Gäste Bad 1 %; all others none.`
 
 Held-back readings (see above) do not count. After a restart the averaged sensors
 show *unknown* until about two minutes of readings are in (with a long poll

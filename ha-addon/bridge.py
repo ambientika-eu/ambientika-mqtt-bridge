@@ -171,6 +171,21 @@ AVERAGE_MIN_POLLS = 20
 AVERAGE_DEVICE_WINDOW_MIN = (1.0, 240.0)   # minutes, as the add-on option average_window_min
 AVERAGE_MAX_GAP_POLLS = 2
 AVERAGE_MIN_COVER_S = 120.0
+# Hysteresis of the averaged humidity for single units
+# (humidity_avg_hysteresis_devices, "name=percent", see BridgeConfig). The unit
+# reports humidity in coarse steps (about 2.5-3 points) and the cloud hands out
+# about one reading per reversal, so with a short window a single phase of the
+# slowly drifting sampling can fill the whole window: in quiet hours the mean
+# then wanders by one to two points with no real change in the room (customer
+# measurement, guest bathroom, 10-min window). With a hysteresis of H points the
+# published humidity_avg only moves once the mean has left the last published
+# value by at least H; a shower (tens of points) passes at once, the slow wander
+# below H is not shown. Price: the shown value may sit up to H off the true mean,
+# and slow real changes arrive in steps of at least H. A median instead of the
+# mean was simulated and rejected: on the coarse raster it flips by a full step
+# whenever one phase holds about half the window. Only humidity_avg; raw values,
+# temperature_avg and the averaging itself are unchanged. Range below; 0 = off.
+HUMIDITY_AVG_HYSTERESIS_RANGE = (0.0, 10.0)   # percentage points
 # A status identical to the previous poll's is the same cached packet - unless it
 # has been the same for longer than this: a unit standing still reports the same
 # values for real, and such a reading must still count (e.g. to confirm a held-
@@ -560,6 +575,50 @@ def _name_key(value) -> str:
     return " ".join(text.split()).casefold()
 
 
+def _parse_unit_values(raw_value, bounds, suffixes, what, unit):
+    """Parse a per-unit option of "name=value" entries (average_window_devices,
+    humidity_avg_hysteresis_devices). See BridgeConfig.average_window_entries for
+    the syntax. `bounds` (lo, hi) clamps the value, `suffixes` may follow the
+    number (compared case-insensitively, longest first), `what` names the value
+    in the log ("minutes"), `unit` is printed after a value (" min").
+
+    Returns (entries, problems): entries as (key, label, value) in the order
+    given, problems as plain-words log texts."""
+    entries, problems = [], []
+    lo, hi = bounds
+    raw = str(raw_value or "")
+    for ch in (";", "\r", "\n"):
+        raw = raw.replace(ch, ",")
+    for part in (p.strip() for p in raw.split(",")):
+        if not part:
+            continue
+        sep = "=" if "=" in part else (":" if ":" in part else "")
+        name, _, num = part.rpartition(sep) if sep else ("", "", "")
+        name = name.strip()
+        if not name:
+            problems.append("%r is not of the form name=%s - ignored" % (part, what))
+            continue
+        num = num.strip()
+        for suffix in sorted(suffixes, key=len, reverse=True):
+            if num.lower().endswith(suffix):
+                num = num[:-len(suffix)].strip()
+                break
+        try:
+            value = float(num)
+        except ValueError:
+            value = float("nan")
+        if value != value or value in (float("inf"), float("-inf")):
+            problems.append("%r: %r is not a number of %s - ignored" % (name, num.strip(), what))
+            continue
+        if not lo <= value <= hi:
+            clamped = min(hi, max(lo, value))
+            problems.append("%r: %g%s is outside %g-%g - using %g"
+                            % (name, value, unit, lo, hi, clamped))
+            value = clamped
+        entries.append((_name_key(name), name, value))
+    return entries, problems
+
+
 
 
 def _slave_soft_reset_enabled() -> bool:
@@ -605,6 +664,10 @@ class BridgeConfig:
         # Empty = every unit uses AVERAGE_WINDOW_MIN. Example:
         # "Gäste-Bad=15, Schlafzimmer Eltern=60".
         self.average_window_devices = ""
+        # Hysteresis of Humidity (averaged) for single units, in percentage
+        # points: "name=percent" entries as above. Empty (default) = none - every
+        # unit publishes the mean as it is. Example: "Gäste-Bad=1".
+        self.humidity_avg_hysteresis_devices = ""
 
         # --- NeuraCell-X radon protection ---
         self.neuracell_enabled = True
@@ -730,37 +793,16 @@ class BridgeConfig:
         number with a decimal point, optionally followed by "min"; outside
         AVERAGE_DEVICE_WINDOW_MIN they are clamped; anything else is ignored.
         """
-        entries, problems = [], []
-        lo, hi = AVERAGE_DEVICE_WINDOW_MIN
-        raw = str(self.average_window_devices or "")
-        for ch in (";", "\r", "\n"):
-            raw = raw.replace(ch, ",")
-        for part in (p.strip() for p in raw.split(",")):
-            if not part:
-                continue
-            sep = "=" if "=" in part else (":" if ":" in part else "")
-            name, _, num = part.rpartition(sep) if sep else ("", "", "")
-            name = name.strip()
-            if not name:
-                problems.append("%r is not of the form name=minutes - ignored" % part)
-                continue
-            num = num.strip()
-            if num.lower().endswith("min"):
-                num = num[:-3].strip()
-            try:
-                minutes = float(num)
-            except ValueError:
-                minutes = float("nan")
-            if minutes != minutes or minutes in (float("inf"), float("-inf")):
-                problems.append("%r: %r is not a number of minutes - ignored" % (name, num.strip()))
-                continue
-            if not lo <= minutes <= hi:
-                clamped = min(hi, max(lo, minutes))
-                problems.append("%r: %g min is outside %g-%g - using %g"
-                                % (name, minutes, lo, hi, clamped))
-                minutes = clamped
-            entries.append((_name_key(name), name, minutes))
-        return entries, problems
+        return _parse_unit_values(self.average_window_devices, AVERAGE_DEVICE_WINDOW_MIN,
+                                  ("min",), "minutes", " min")
+
+    def humidity_avg_hysteresis_entries(self):
+        """Parse humidity_avg_hysteresis_devices like average_window_entries:
+        (entries, problems), entries as (key, label, percentage points). A value
+        is a plain number with a decimal point, optionally followed by "%",
+        "%rH" or "%rF"; outside HUMIDITY_AVG_HYSTERESIS_RANGE it is clamped."""
+        return _parse_unit_values(self.humidity_avg_hysteresis_devices, HUMIDITY_AVG_HYSTERESIS_RANGE,
+                                  ("% rh", "% rf", "%rh", "%rf", "%"), "percent", " %")
 
     @property
     def dewpoint_device_block_mode_set(self) -> set:
@@ -890,6 +932,7 @@ class BridgeConfig:
             ("dewpoint_controller_topic", ("DEWPOINT_CONTROLLER_TOPIC",)),
             ("dewpoint_controller_key", ("DEWPOINT_CONTROLLER_KEY",)),
             ("average_window_devices", ("AVERAGE_WINDOW_DEVICES",)),
+            ("humidity_avg_hysteresis_devices", ("HUMIDITY_AVG_HYSTERESIS_DEVICES",)),
         ):
             v = _env(*names)
             if v:
@@ -995,6 +1038,8 @@ class BridgeConfig:
         cfg.log_level = br.get("log_level", cfg.log_level)
         awd = br.get("average_window_devices")
         cfg.average_window_devices = "" if awd is None else str(awd)
+        hyd = br.get("humidity_avg_hysteresis_devices")
+        cfg.humidity_avg_hysteresis_devices = "" if hyd is None else str(hyd)
 
         extras = {}
         extras.update(raw.get("neuracell", {}) or {})
@@ -1027,6 +1072,8 @@ class BridgeConfig:
         cfg.log_level = raw.get("log_level", cfg.log_level)
         awd = raw.get("average_window_devices")
         cfg.average_window_devices = "" if awd is None else str(awd)
+        hyd = raw.get("humidity_avg_hysteresis_devices")
+        cfg.humidity_avg_hysteresis_devices = "" if hyd is None else str(hyd)
         cfg._apply_extras(raw.get)
         cfg.apply_env_overrides()
         return cfg
@@ -2590,6 +2637,12 @@ class AmbientikaBridge:
         # serial -> own averaging window in seconds, for the units listed in
         # cfg.average_window_devices (see _resolve_average_windows).
         self._avg_window: dict = {}
+        # serial -> hysteresis of humidity_avg in percentage points, for the units
+        # listed in cfg.humidity_avg_hysteresis_devices (see
+        # _resolve_humidity_hysteresis), and serial -> last published humidity_avg
+        # of such a unit (see _hold_humidity_avg).
+        self._hum_hyst: dict = {}
+        self._hum_avg_held: dict = {}
 
     # ----- values shown for a unit -----
     def _shown_mode(self, serial: str, device, own):
@@ -2726,6 +2779,34 @@ class AmbientikaBridge:
         AVERAGE_MIN_POLLS poll intervals either way."""
         return max(self._avg_window.get(serial, AVERAGE_WINDOW_S), AVERAGE_MIN_POLLS * interval)
 
+    def _match_unit_entries(self, option: str, entries, unit: str) -> dict:
+        """Map parsed per-unit entries (key, label, value) onto the discovered
+        units, by serial number first, else by name (see _name_key; two units
+        with the same name both match). Returns serial -> value. An entry that
+        matches no unit is named in the log with the list of units; a unit listed
+        twice with different values gets the later one, with a warning."""
+        by_serial = {_name_key(s): s for s in self.devices}
+        by_name: dict = {}
+        for s, d in self.devices.items():
+            by_name.setdefault(_name_key(getattr(d, "name", "")), []).append(s)
+        result: dict = {}
+        set_by: dict = {}
+        for key, label, value in entries:
+            targets = [by_serial[key]] if key in by_serial else by_name.get(key, [])
+            if not targets:
+                log.warning("%s: no unit named %r - entry ignored. "
+                            "Units: %s.", option, label, ", ".join(
+                                sorted("%s (%s)" % (getattr(d, "name", "?"), s)
+                                       for s, d in self.devices.items())) or "(none)")
+                continue
+            for s in targets:
+                if s in set_by and result[s] != value:
+                    log.warning("%s: %s is listed more than once (%r, %r) "
+                                "- using %g%s.", option, s, set_by[s], label, value, unit)
+                result[s] = value
+                set_by[s] = label
+        return result
+
     def _resolve_average_windows(self) -> None:
         """Map cfg.average_window_devices onto the discovered units (by serial
         number or name, see _name_key) and log the result once.
@@ -2744,25 +2825,8 @@ class AmbientikaBridge:
             interval = max(1.0, float(self.cfg.poll_interval))
         except (TypeError, ValueError):
             interval = 30.0
-        by_serial = {_name_key(s): s for s in self.devices}
-        by_name: dict = {}
-        for s, d in self.devices.items():
-            by_name.setdefault(_name_key(getattr(d, "name", "")), []).append(s)
-        set_by: dict = {}
-        for key, label, minutes in entries:
-            targets = [by_serial[key]] if key in by_serial else by_name.get(key, [])
-            if not targets:
-                log.warning("average_window_devices: no unit named %r - entry ignored. "
-                            "Units: %s.", label, ", ".join(
-                                sorted("%s (%s)" % (getattr(d, "name", "?"), s)
-                                       for s, d in self.devices.items())) or "(none)")
-                continue
-            for s in targets:
-                if s in set_by and self._avg_window[s] != minutes * 60.0:
-                    log.warning("average_window_devices: %s is listed more than once (%r, %r) "
-                                "- using %g min.", s, set_by[s], label, minutes)
-                self._avg_window[s] = minutes * 60.0
-                set_by[s] = label
+        self._avg_window = {s: minutes * 60.0 for s, minutes in
+                            self._match_unit_entries("average_window_devices", entries, " min").items()}
         shown = []
         for s in sorted(self._avg_window, key=lambda x: str(getattr(self.devices[x], "name", x))):
             own = self._avg_window[s]
@@ -2775,6 +2839,46 @@ class AmbientikaBridge:
         log.info("Averaging per unit: %s%s.", ", ".join(shown),
                  ("; all others %g min" % (max(AVERAGE_WINDOW_S, AVERAGE_MIN_POLLS * interval) / 60.0))
                  if rest > 0 else "")
+
+    def _resolve_humidity_hysteresis(self) -> None:
+        """Map cfg.humidity_avg_hysteresis_devices onto the discovered units like
+        _resolve_average_windows and log the result once. A held value of a unit
+        whose hysteresis changed or ended is dropped, so the next mean is shown
+        as it is."""
+        old = self._hum_hyst
+        self._hum_hyst = {}
+        entries, problems = self.cfg.humidity_avg_hysteresis_entries()
+        for p in problems:
+            log.warning("humidity_avg_hysteresis_devices: %s.", p)
+        if entries:
+            self._hum_hyst = self._match_unit_entries("humidity_avg_hysteresis_devices", entries, " %")
+        for s in list(self._hum_avg_held):
+            if self._hum_hyst.get(s) != old.get(s):
+                del self._hum_avg_held[s]
+        if not self._hum_hyst:          # empty, or nothing matched - the warnings say why
+            return
+        shown = ["%s %g %%%s" % (getattr(self.devices[s], "name", s), h, "" if h > 0 else " (off)")
+                 for s, h in sorted(self._hum_hyst.items(),
+                                    key=lambda x: str(getattr(self.devices[x[0]], "name", x[0])))]
+        rest = len(self.devices) - len(self._hum_hyst)
+        log.info("Humidity (averaged) hysteresis per unit: %s%s.", ", ".join(shown),
+                 "; all others none" if rest > 0 else "")
+
+    def _hold_humidity_avg(self, serial: str, value):
+        """Apply the hysteresis of humidity_avg_hysteresis_devices to one unit's
+        averaged humidity (see HUMIDITY_AVG_HYSTERESIS_RANGE): the last published
+        value stays until the mean differs from it by at least the hysteresis.
+        Unknown (None) is passed on at once and clears the held value, so the
+        first mean afterwards is shown as it is. Units without a hysteresis (or
+        with 0) get the mean unchanged."""
+        h = self._hum_hyst.get(serial)
+        if not h or h <= 0:
+            return value
+        held = self._hum_avg_held.get(serial)
+        if value is None or held is None or abs(value - held) >= h - 1e-9:
+            self._hum_avg_held[serial] = value
+            return value
+        return held
 
     def _average(self, serial: str, key: str, value, now: Optional[float] = None):
         """Record a reading and return the time-weighted mean (see AVERAGE_WINDOW_S).
@@ -2846,6 +2950,7 @@ class AmbientikaBridge:
             self._last_status[serial] = (dict(s), now_m)
         temp, temp_avg = self._measured(serial, "temperature", s["temperature"], fresh)
         hum, hum_avg = self._measured(serial, "humidity", s["humidity"], fresh)
+        hum_avg = self._hold_humidity_avg(serial, hum_avg)
         return {
             "operating_mode": shown.name,
             "operating_mode_raw": own.name,
@@ -4285,6 +4390,13 @@ class AmbientikaBridge:
             self._avg_window = {}
             log.error("average_window_devices could not be applied (%r) - every unit "
                       "uses the global window.", e)
+        try:
+            self._resolve_humidity_hysteresis()
+        except Exception as e:      # an option typo must never stop the bridge
+            self._hum_hyst = {}
+            self._hum_avg_held = {}
+            log.error("humidity_avg_hysteresis_devices could not be applied (%r) - no unit "
+                      "uses a hysteresis.", e)
 
     def _publish_discovery(self) -> None:
         if not self.cfg.enable_discovery or self.client is None:

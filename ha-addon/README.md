@@ -42,6 +42,7 @@ After installation, configure the add-on via the **Configuration** tab:
 | `command_coalesce_ms` | `800` | Commands for the same unit within this window are applied in one call (`0` = immediately) |
 | `average_window_min` | `30` | Window of the averaged sensors *Humidity (averaged)* and *Temperature (averaged)*, in minutes (1–240; at least twenty poll intervals; details in DOCS.md) |
 | `average_window_devices` | *(empty)* | Own window for single units: `unit=minutes` entries, comma-separated, by serial number or by the unit's name as in the app (1–240 minutes), e.g. `A1B2C3D4E5F6=15, Schlafzimmer Eltern=60`. The serial number is the safe way (it is in the add-on log and in the app); a name must match the app's spelling - upper/lower case does not matter, and a hyphen, underscore or space count as the same separator; anything else does matter. Units not listed use `average_window_min` (details in DOCS.md) |
+| `humidity_avg_hysteresis_devices` | *(empty)* | Hysteresis of *Humidity (averaged)* for single units, in percentage points: `unit=points` entries like `average_window_devices` (0–10), e.g. `A1B2C3D4E5F6=1`. The shown value only moves once the mean has left it by at least that much - calmer at night with a short window, a shower passes at once. Units not listed: none (details in DOCS.md) |
 | `slave_filter_soft_reset` | `false` | Maintenance acknowledgement for Slave filter counters |
 | `filter_ack_ttl_days` | `90` | How long an acknowledgement stays valid |
 
