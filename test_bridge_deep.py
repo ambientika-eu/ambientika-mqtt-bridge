@@ -1783,6 +1783,51 @@ async def test_controller_direct():
     check("tpsd: nur Sensoren zurueck -> verbunden und Sperre wieder aktiv",
           state(b).get("dewpoint_controller_connected") is True and office._status["operating_mode"] == OM.Off)
 
+    # F2) Nach Neustart / Reconnect nur das gespeicherte "online" (Broker war weg,
+    #     kein Last Will): nach dewpoint_controller_timeout ohne Nachricht getrennt.
+    b, office, smart, mq = mkbridge()
+    check("tpsd-ns: Standard 30 min", b.cfg.dewpoint_controller_timeout == 30)
+    await mq(AV, "online", retain=True)
+    await b.neuracell.check_dewpoint_link()
+    check("tpsd-ns: gespeichertes online -> unbekannt", b.neuracell.dewpoint_controller_connected() is None)
+    b.neuracell._tps_watch_start = _t.monotonic() - 29 * 60
+    await b.neuracell.check_dewpoint_link()
+    check("tpsd-ns: 29 min -> noch unbekannt", b.neuracell.dewpoint_controller_connected() is None)
+    b.neuracell._tps_watch_start = _t.monotonic() - 31 * 60
+    await b.neuracell.check_dewpoint_link()
+    check("tpsd-ns: 31 min ohne Nachricht -> getrennt", state(b).get("dewpoint_controller_connected") is False)
+    await mq(SE, '{"indoor": {"temp": 20}}')
+    check("tpsd-ns: Sensoren live -> verbunden", state(b).get("dewpoint_controller_connected") is True)
+    b.neuracell._tps_watch_start = _t.monotonic() - 60 * 60
+    await b.neuracell.check_dewpoint_link()
+    check("tpsd-ns: nach live Nachricht gilt wieder der Last Will", state(b).get("dewpoint_controller_connected") is True)
+    # Reconnect: wieder nur gespeichertes online -> Zeitgrenze ab dem Reconnect
+    b.neuracell.on_broker_connected()
+    await mq(AV, "online", retain=True)
+    b.neuracell._tps_watch_start = _t.monotonic() - 31 * 60
+    await b.neuracell.check_dewpoint_link()
+    check("tpsd-ns: nach Reconnect ohne Nachricht -> getrennt", state(b).get("dewpoint_controller_connected") is False)
+    # 0 = aus: bleibt unbekannt wie bisher
+    b, office, smart, mq = mkbridge(dewpoint_controller_timeout=0)
+    await mq(AV, "online", retain=True)
+    b.neuracell._tps_watch_start = _t.monotonic() - 120 * 60
+    await b.neuracell.check_dewpoint_link()
+    check("tpsd-ns: 0 = aus -> bleibt unbekannt", b.neuracell.dewpoint_controller_connected() is None)
+    # Fremde Steuerung ueber dewpoint_availability_topic: keine neue Zeitgrenze
+    b, office, smart, mq = mkbridge(dewpoint_availability_topic="tps/avail")
+    await mq("tps/avail", "online", retain=True)
+    b.neuracell._tps_watch_start = _t.monotonic() - 120 * 60
+    await b.neuracell.check_dewpoint_link()
+    check("tpsd-ns: fremde Steuerung -> unveraendert unbekannt", b.neuracell.dewpoint_controller_connected() is None)
+    # Config / Umgebungsvariable
+    c4 = bridge.BridgeConfig()
+    c4._apply_extras({"dewpoint_controller_timeout": 45}.get)
+    os.environ["DEWPOINT_CONTROLLER_TIMEOUT"] = "15"
+    c5 = bridge.BridgeConfig.from_env()
+    del os.environ["DEWPOINT_CONTROLLER_TIMEOUT"]
+    check("tpsd-ns: Option und Umgebungsvariable", c4.dewpoint_controller_timeout == 45
+          and c5.dewpoint_controller_timeout == 15)
+
     # G) generischer Sperr-Topic funktioniert weiter, beide Wege greifen ineinander
     b, office, smart, mq = mkbridge()
     await mq("ambientika/dewpoint/block", "ON")
@@ -3922,9 +3967,109 @@ async def test_neuracell_timed_expulsion():
             pass
 
 
+async def test_neuracell_slave_no_repeat():
+    """Gekoppelter Slave unter Schutz (Praxisfall Keller rechts, Nov. 2026).
+
+    Ein Slave behaelt sein eigenes Modusfeld (die Cloud nimmt den Befehl an,
+    das Feld bleibt z. B. auf Smart). Die Bridge darf ihm den Schutzzustand
+    nicht bei jedem Abruf erneut schicken - einmal pro Wechsel genuegt.
+    """
+    class SlaveDevice(FakeDevice):
+        async def change_mode(self, mode):
+            self.mode_calls.append(mode)      # angenommen, eigenes Feld bleibt
+            return Success(None)
+
+    def setup():
+        cfg = bridge.BridgeConfig()
+        cfg.radon_threshold = 100
+        cfg.radon_hysteresis = 10
+        cfg.dewpoint_block_devices = "OFF1,OFF2"
+        b = bridge.AmbientikaBridge(cfg)
+        b.client = FakeClient()
+        b.loop = asyncio.get_running_loop()
+        m = FakeDevice("OFF1", "Keller links", 1, mkstatus(op=OM.Smart))
+        m.role = "Master"
+        s = SlaveDevice("OFF2", "Keller rechts", 1, mkstatus(op=OM.Smart))
+        s.role = "SlaveOppositeMaster"
+        e = FakeDevice("SM1", "Eltern", 3, mkstatus(op=OM.ManualHeatRecovery, fan=FS.Low))
+        e.role = "Master"
+        b.devices = {d.serial_number: d for d in (m, s, e)}
+        return b, b.neuracell, m, s, e
+
+    b, nc, m, s, e = setup()
+    await nc.on_dewpoint_block("ON")
+    check("slave: Sperre -> Master aus", m._status["operating_mode"] == OM.Off)
+    check("slave: Sperre -> Slave einmal geschaltet", len(s.mode_calls) == 1, s.mode_calls)
+    for _ in range(5):
+        await nc.enforce()
+    check("slave: weitere Abrufe schicken dem Slave nichts mehr", len(s.mode_calls) == 1, s.mode_calls)
+    check("slave: Master wird auch nicht wiederholt", len(m.mode_calls) == 1, m.mode_calls)
+    # Der Master wird in der App verstellt -> die Bridge setzt ihn wie bisher wieder aus.
+    m._status["operating_mode"] = OM.Smart
+    await nc.enforce()
+    check("slave: verstellter Master wird wieder gesperrt",
+          m._status["operating_mode"] == OM.Off and len(m.mode_calls) == 2, m.mode_calls)
+    check("slave: Neustart-Pruefung haelt Slave fuer geschuetzt",
+          nc._still_protected("OFF2", dict(s._status), s))
+    await nc.on_dewpoint_block("OFF")
+    check("slave: Freigabe -> Slave einmal auf seine Baseline",
+          len(s.mode_calls) == 2 and s.mode_calls[-1]["operating_mode"] == OM.Smart, s.mode_calls)
+    check("slave: keine Baseline offen", not nc._saved_modes, nc._saved_modes)
+
+    # Radon: Wechsel Sperre -> Radon schickt dem Slave den neuen Zustand (einmal).
+    b, nc, m, s, e = setup()
+    await nc.on_dewpoint_block("ON")
+    await nc.on_radon_value("150")
+    RP = bridge.RADON_PROTECTION_MODE
+    check("slave: Radon -> Slave bekommt Zuluft",
+          s.mode_calls and s.mode_calls[-1]["operating_mode"] == RP, s.mode_calls)
+    n = len(s.mode_calls)
+    for _ in range(4):
+        await nc.enforce()
+    check("slave: Radon aktiv -> keine Wiederholung", len(s.mode_calls) == n, s.mode_calls)
+    await nc.on_radon_value("50")
+    check("slave: Radon weg, Sperre aktiv -> Slave wieder aus",
+          s.mode_calls[-1]["operating_mode"] == OM.Off, s.mode_calls)
+
+def test_cloud_error_log():
+    """Verbindungsabbrueche zur Cloud: eine Zeile statt Traceback (Praxisfall Nov. 2026)."""
+    import logging as _lg
+    import aiohttp as _ah
+
+    class Cap(_lg.Handler):
+        def __init__(self):
+            super().__init__()
+            self.recs = []
+
+        def emit(self, r):
+            self.recs.append(r)
+    h = Cap()
+    bridge.log.addHandler(h)
+    try:
+        bridge._log_cloud_exception("Error polling", "SER1", _ah.ConnectionTimeoutError(
+            "Connection timeout to host https://app.ambientika.eu:4521/device/device-status"))
+        bridge._log_cloud_exception("Error polling", "SER1", asyncio.TimeoutError())
+        try:
+            raise KeyError("Night")
+        except KeyError as e:
+            bridge._log_cloud_exception("Error polling", "SER1", e)
+    finally:
+        bridge.log.removeHandler(h)
+    net = h.recs[:2]
+    check("cloudlog: Timeout -> eine Warnung ohne Traceback",
+          all(r.levelno == _lg.WARNING and not r.exc_info for r in net), [(r.levelname, r.exc_info) for r in net])
+    check("cloudlog: Text nennt Geraet und Wiederholung",
+          "SER1" in net[0].getMessage() and "next poll" in net[0].getMessage(), net[0].getMessage())
+    check("cloudlog: anderer Fehler -> weiter mit Traceback",
+          h.recs[2].levelno == _lg.ERROR and h.recs[2].exc_info, h.recs[2].levelname)
+    check("cloudlog: Erkennung", bridge._is_network_error(_ah.ClientConnectorError.__new__(_ah.ClientConnectorError))
+          and not bridge._is_network_error(ValueError("x")))
+
+
 async def _async_suite():
     await test_neuracell()
     await test_neuracell_scoped()
+    await test_neuracell_slave_no_repeat()
     await test_neuracell_robust()
     await test_neuracell_timed_expulsion()
     await test_radon_meter()
@@ -3953,6 +4098,7 @@ async def _async_suite():
 
 def main():
     FAILS.clear()
+    test_cloud_error_log()
     test_discovery()
     test_dewpoint()
     test_config()

@@ -60,7 +60,9 @@ sensors *Radon Meter Connected* and *Dew Point Controller Connected* show whethe
 the two devices are still talking to the broker: their Last Will counts at once,
 a radon meter silent for longer than `radon_meter_timeout` (30 min) counts as
 disconnected as well, also after an add-on restart (the meters seen so far are
-remembered on the broker). A third-party dew-point controller needs
+remembered on the broker). The Ambientika Taupunktsteuerung counts as
+disconnected if it sends nothing within `dewpoint_controller_timeout` (30 min)
+after an add-on restart or a broker reconnect. A third-party dew-point controller needs
 `dewpoint_availability_topic` or `dewpoint_signal_timeout` for that (with
 `dewpoint_source: device` it follows the cloud reads instead). How the two
 protections work together (radon first, exact restore of every unit's mode) is
@@ -102,6 +104,7 @@ protection always has priority.
 | `dewpoint_block_key` | *(empty)* | JSON key of the block flag when `dewpoint_block_topic` carries a JSON object |
 | `dewpoint_availability_topic` | *(empty)* | `signal`: availability topic with Last Will of a third-party controller (`online`/`offline`, `true`/`false` or JSON with `state`). The Ambientika controller needs none |
 | `dewpoint_signal_timeout` | `0` | `signal`: minutes without any message from the controller before it counts as disconnected (0 = off). For controllers without Last Will; not applied while a Last Will reports online |
+| `dewpoint_controller_timeout` | `30` | Ambientika Taupunktsteuerung after an add-on restart or a broker reconnect: minutes without any message before it counts as disconnected (0 = off). Covers a controller that went away while the broker was down, when no Last Will comes |
 | `dewpoint_lost_action` | `keep` | While the controller counts as disconnected: `keep` the last block state, `release` ventilation, or `block` the units. Radon keeps priority either way |
 | `dewpoint_indoor_temp_topic` | `ambientika/dewpoint/indoor_temp` | `computed`: indoor temperature in °C |
 | `dewpoint_indoor_humidity_topic` | `ambientika/dewpoint/indoor_humidity` | `computed`: indoor relative humidity in % |

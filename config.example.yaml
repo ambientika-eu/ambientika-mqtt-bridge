@@ -91,6 +91,7 @@ dewpoint:
   # The HA sensor "Dew Point Controller Connected" shows the result.
   dewpoint_availability_topic: ""   # its availability topic with Last Will (online/offline); "" = off (not needed for the Ambientika Taupunktsteuerung, see below)
   dewpoint_signal_timeout: 0        # minutes without any TPS message -> disconnected; 0 = off (only without Last Will; pauses while the bridge is off the broker)
+  dewpoint_controller_timeout: 30   # Ambientika TPS after a restart/reconnect: minutes without a message -> disconnected; 0 = off
   dewpoint_lost_action: "keep"      # when disconnected: "keep" | "release" (ventilate) | "block" (units off)
   # Ambientika Taupunktsteuerung (MQTT firmware) read directly: dew-point/<id>/state
   # carries {"ventilating": true|false, "reason": ...} - ventilating false = block.

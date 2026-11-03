@@ -69,6 +69,27 @@ except ImportError as exc:
 
 log = logging.getLogger("ambientika_bridge")
 
+
+def _is_network_error(exc: BaseException) -> bool:
+    """A connection problem to the Ambientika cloud (timeout, refused, reset).
+
+    Such errors happen when the internet connection or the server is briefly
+    unreachable; the bridge retries on the next poll. They are logged as one
+    line instead of a full traceback.
+    """
+    return isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError,
+                            TimeoutError, ConnectionError))
+
+
+def _log_cloud_exception(what: str, serial: str, exc: BaseException) -> None:
+    """Log an exception from a cloud call: one line for a connection problem,
+    the full traceback for anything else."""
+    if _is_network_error(exc):
+        log.warning("%s for %s: no connection to the Ambientika cloud (%s: %s) - "
+                    "retrying on the next poll.", what, serial, type(exc).__name__, exc)
+    else:
+        log.exception("%s for %s: %s", what, serial, exc)
+
 # Version shown in the startup banner. Read from the environment so this file
 # stays byte-identical across all copies/repos (single source of truth); each
 # Home Assistant add-on injects its own config.yaml version via BRIDGE_VERSION
@@ -738,6 +759,12 @@ class BridgeConfig:
         #   (ventilate) or "block" (units off). Radon keeps priority either way.
         self.dewpoint_availability_topic = ""
         self.dewpoint_signal_timeout = 0
+        # - dewpoint_controller_timeout: the Ambientika Taupunktsteuerung after a
+        #   bridge restart or broker reconnect. Its "online" from the broker's
+        #   store says nothing about now, and if the broker itself restarted its
+        #   Last Will never comes. Without any live message for this many minutes
+        #   it counts as disconnected. 0 = off.
+        self.dewpoint_controller_timeout = 30
         self.dewpoint_lost_action = "keep"
         # Native topics of the Ambientika Taupunktsteuerung (MQTT firmware):
         # dew-point/<id>/state carries {"ventilating": true|false, "reason": ..}
@@ -879,6 +906,11 @@ class BridgeConfig:
                                                           self.dewpoint_signal_timeout)))
         except (TypeError, ValueError):
             pass
+        try:
+            self.dewpoint_controller_timeout = max(0, int(get("dewpoint_controller_timeout",
+                                                              self.dewpoint_controller_timeout)))
+        except (TypeError, ValueError):
+            pass
         self.dewpoint_lost_action = str(get("dewpoint_lost_action", self.dewpoint_lost_action)
                                         or self.dewpoint_lost_action).strip().lower()
         dct = get("dewpoint_controller_topic", self.dewpoint_controller_topic)
@@ -949,6 +981,12 @@ class BridgeConfig:
         if dst:
             try:
                 self.dewpoint_signal_timeout = max(0, int(dst))
+            except ValueError:
+                pass
+        dct_env = _env("DEWPOINT_CONTROLLER_TIMEOUT")
+        if dct_env:
+            try:
+                self.dewpoint_controller_timeout = max(0, int(dct_env))
             except ValueError:
                 pass
         rmt = _env("RADON_METER_TIMEOUT")
@@ -1545,6 +1583,7 @@ class NeuraCellXController:
         self._tps_watch_start = time.monotonic()
         self._tps_last_block: Optional[bool] = None  # last block decision, also while offline
         self._tps_native_seen: Optional[float] = None  # last live message on the controller's own topics
+        self._tps_stored_online = False  # only a stored "online" since the last (re)connect
         self.dewpoint_block = False
         self.last_radon: Optional[float] = None
 
@@ -1943,6 +1982,15 @@ class NeuraCellXController:
             # its keepalive, so a known "online" is current; the time limit only
             # covers controllers without a Last Will.
             return True
+        if (self._tps_stored_online and self._tps_native_seen is None
+                and cfg.dewpoint_controller_timeout > 0):
+            # Known only from the broker's store after a restart / reconnect: a
+            # controller that went away while the broker was down has no Last
+            # Will coming, so it gets the time limit of the radon meter.
+            if not self.bridge.mqtt_connected():
+                return self._tps_connected_reported
+            if time.monotonic() - self._tps_watch_start > cfg.dewpoint_controller_timeout * 60:
+                return False
         if cfg.dewpoint_signal_timeout > 0:
             if not self.bridge.mqtt_connected():
                 # The bridge itself is cut off from the broker: nothing can arrive,
@@ -2003,7 +2051,8 @@ class NeuraCellXController:
     def _tps_seen(self) -> None:
         self._tps_last_seen = time.monotonic()
 
-    async def on_dewpoint_availability(self, raw: str, retained: bool = False) -> None:
+    async def on_dewpoint_availability(self, raw: str, retained: bool = False,
+                                       native: bool = False) -> None:
         """Availability of the Taupunktsteuerung (its Last Will topic).
 
         `retained` = delivered from the broker's store on subscribe. A stored
@@ -2033,11 +2082,16 @@ class NeuraCellXController:
                 log.info("NeuraCell-X: Taupunktsteuerung reported online by the broker's store after "
                          "the reconnect - waiting for a message.")
             self._tps_avail = None
+            # Time limit after a restart only for the Ambientika controller
+            # (its sensor messages count as sign of life); a third-party one
+            # may only send on change.
+            self._tps_stored_online = native
             await self.check_dewpoint_link()
             self.bridge.publish_neuracell_state()
             return
         was_connected = self._tps_connected_reported
         self._tps_avail = avail
+        self._tps_stored_online = False
         self._tps_seen()
         await self.check_dewpoint_link()
         await self._tps_back(was_connected)
@@ -2060,6 +2114,11 @@ class NeuraCellXController:
         self._tps_connected_reported = now
         if now is False:
             action = self.cfg.dewpoint_lost_action
+            if (self._tps_stored_online and self._tps_native_seen is None
+                    and self._tps_avail is None):
+                log.warning("NeuraCell-X: Taupunktsteuerung sent nothing for %d min after the "
+                            "restart / reconnect - counted as disconnected.",
+                            self.cfg.dewpoint_controller_timeout)
             log.warning("NeuraCell-X: Taupunktsteuerung disconnected - dew-point block %s.",
                         {"release": "released (dewpoint_lost_action=release)",
                          "block": "set ON (dewpoint_lost_action=block)"}.get(
@@ -2101,6 +2160,7 @@ class NeuraCellXController:
         the controller publishes there, so it is alive - whatever its Last Will
         said before (e.g. a stale "offline" when its "online" was missed)."""
         self._tps_native_seen = time.monotonic()
+        self._tps_stored_online = False
         if self._tps_avail is False:
             # Its stale "offline" no longer counts; "online" only when it says
             # so itself (a configured time limit stays in force meanwhile).
@@ -2257,9 +2317,13 @@ class NeuraCellXController:
                  "to (%s) as its baseline, not TimedExpulsion.", serial, last.name)
         return last
 
-    def _still_protected(self, serial: str, status: dict) -> bool:
+    def _still_protected(self, serial: str, status: dict, device: Any = None) -> bool:
         """Is the unit still in the protection state we put it in (restart check)?"""
         applied = self._applied.get(serial)
+        if applied is not None and device is not None and self._is_coupled_slave(device):
+            # A coupled Slave's own mode field does not follow the command (its
+            # Master decides), so it cannot show a change made meanwhile.
+            return True
         if applied is not None:
             return (status["operating_mode"] == applied[0]
                     and (applied[0] != RADON_PROTECTION_MODE or status["fan_speed"] == applied[1]))
@@ -2285,7 +2349,7 @@ class NeuraCellXController:
             status = await self.bridge.read_status(device)
             if status is None:
                 return False
-            if not self._still_protected(serial, status):
+            if not self._still_protected(serial, status, device):
                 log.info("NeuraCell-X: %s was changed while the bridge was down; "
                          "dropping its saved baseline.", serial)
                 self._saved_modes.pop(serial, None)
@@ -2362,6 +2426,13 @@ class NeuraCellXController:
             base.update(self._pending_manual.pop(serial, {}))
             self._saved_modes[serial] = base
         mode, fan, hum = desired
+        if (not force and self._applied.get(serial) == (mode, fan)
+                and self._is_coupled_slave(device)):
+            # A coupled Slave runs with its zone Master and keeps reporting its
+            # own mode field, which a command does not change. It has received
+            # the protection state once; sending it again on every poll would
+            # only repeat the command (and the unit's confirmation beep).
+            return
         if (force or status["operating_mode"] != mode
                 or status["fan_speed"] != fan
                 or status["humidity_level"] != hum):
@@ -2369,6 +2440,13 @@ class NeuraCellXController:
                 self._applied[serial] = (mode, fan)
         else:
             self._applied[serial] = (mode, fan)
+
+    def _is_coupled_slave(self, device: Any) -> bool:
+        """True for a unit that currently runs as a Slave with a zone Master."""
+        try:
+            return self.bridge._zone_master(device) is not None
+        except Exception:
+            return False
 
     async def reconcile(self, force: bool = False) -> None:
         """Bring every device in line with the current protection state.
@@ -3696,7 +3774,7 @@ class AmbientikaBridge:
         try:
             res = await device.status()
         except Exception as e:
-            log.exception("status() raised for %s: %s", device.serial_number, e)
+            _log_cloud_exception("status() raised", device.serial_number, e)
             return None
         if isinstance(res, Failure):
             log.warning("status() failed for %s: %s", device.serial_number, res)
@@ -3738,7 +3816,7 @@ class AmbientikaBridge:
         try:
             res = await device.change_mode(mode)
         except Exception as e:
-            log.exception("change_mode raised for %s: %s", device.serial_number, e)
+            _log_cloud_exception("change_mode raised", device.serial_number, e)
             return False
         if isinstance(res, Failure):
             log.error("change_mode failed for %s: %s", device.serial_number, res)
@@ -3932,7 +4010,7 @@ class AmbientikaBridge:
                         cav = _availability_filter(ct)
                         if cav and _topic_match(cav, topic):
                             self._dispatch(self.neuracell.on_dewpoint_availability(
-                                payload, retained=retained)); return
+                                payload, retained=retained, native=True)); return
                         if _topic_match(ct, topic):
                             self._dispatch(self.neuracell.on_dewpoint_controller_state(
                                 payload, retained=retained)); return
@@ -4229,7 +4307,7 @@ class AmbientikaBridge:
         try:
             res = await device.change_mode(mode)
         except Exception as e:
-            log.exception("change_mode raised for %s: %s", serial, e)
+            _log_cloud_exception("change_mode raised", serial, e)
             return
         if isinstance(res, Failure):
             log.error("change_mode failed for %s: %s", serial, res)
@@ -4457,7 +4535,7 @@ class AmbientikaBridge:
                     # An exception here used to publish nothing at all, so the
                     # entity silently kept its last retained values and looked
                     # live in the dashboard. Count it like any other failed poll.
-                    log.exception("Error polling %s: %s", serial, e)
+                    _log_cloud_exception("Error polling", serial, e)
                     self._note_poll_failure(serial, "exception during poll")
 
             # Token hygiene: re-auth on an explicit 401/403, if a whole cycle of
@@ -4577,6 +4655,8 @@ class AmbientikaBridge:
                              _availability_filter(self.cfg.dewpoint_controller_topic) or "-")
                     if _availability_filter(self.cfg.dewpoint_controller_topic):
                         watch.append("availability %s" % _availability_filter(self.cfg.dewpoint_controller_topic))
+                    if self.cfg.dewpoint_controller_timeout > 0:
+                        watch.append("%d min after a restart/reconnect" % self.cfg.dewpoint_controller_timeout)
                 if self.cfg.dewpoint_availability_topic:
                     watch.append("availability %s" % self.cfg.dewpoint_availability_topic)
                 if self.cfg.dewpoint_signal_timeout > 0:
