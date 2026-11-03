@@ -503,11 +503,111 @@ async def scenario_radon_during_fallback():
     return sim
 
 
+def nils_house():
+    """5 SMART in einer Zone wie beim Kunden (Nov. 2026): Flur Master, vier
+    SlaveEqualMaster. Alle Smart."""
+    units = [
+        Unit("E05A1B9C0DAC", "Flur", 0, "Master", OM.Smart),
+        Unit("E05A1B9BAF0C", "Wohnzimmer", 0, "SlaveEqualMaster", OM.Smart),
+        Unit("CCDBA789F890", "Kinderzimmer", 0, "SlaveEqualMaster", OM.Smart),
+        Unit("E05A1B9C1111", "Schlafzimmer", 0, "SlaveEqualMaster", OM.Smart),
+        Unit("E05A1B9C2222", "Gaeste Bad", 0, "SlaveEqualMaster", OM.Smart),
+    ]
+    return {u.serial_number: u for u in units}
+
+
+WOZI, FLUR = "E05A1B9BAF0C", "E05A1B9C0DAC"
+
+
+async def scenario_unit_unplugged():
+    """Kundenprotokoll 31.10./01.11. (Bridge 1.4.41): das Wohnzimmer wird zum
+    Streichen 9 h vom Strom genommen - die Cloud antwortet 1063 Abrufe lang
+    404 "Status packet not found". Diagnose: Letztes Statuspaket bleibt stehen,
+    Fehlabrufe zaehlen, Ausfall von/bis im Attribut; Topologie einmal im Log;
+    nichts davon kostet einen Abruf der anderen vier."""
+    print("\n[E] Einheit 9 h stromlos (1063 Abrufe 404) -> Diagnose, Topologie, Rueckkehr")
+    units = nils_house()
+    sim = Sim(units, "E", neuracell_enabled=False, dewpoint_enabled=False)
+    for sn in units:
+        sim.b._device_house[sn] = 1
+
+    async def no_reauth(reason):          # 9 h Simulation: kein echter Token-Refresh gegen die Cloud
+        return True
+    sim.b._reauth = no_reauth
+    t_start = {}
+
+    def unplug(s):
+        t_start["wall"] = bridge.time.time()
+        s.units[WOZI].offline_polls = 1063
+    sim.mark(10, unplug)                      # ab Minute 10 ohne Strom
+
+    def diag(serial):
+        msgs = [json.loads(p) for t, p in sim.b.client.pub if t == bridge.diag_topic("ambientika", serial)]
+        return msgs[-1] if msgs else {}
+
+    def during(s):
+        d = diag(WOZI)
+        check("E: waehrend des Ausfalls - Zaehler laufen, Ausfall offen, letztes Paket steht (~Minute 10)",
+              d.get("poll_failures_consecutive", 0) >= 100 and d["last_outage_end"] is None
+              and d["last_outage_polls"] == d["poll_failures_consecutive"]
+              and d["last_status"] is not None and d["last_status"] <= bridge._iso_utc(t_start["wall"] + 1), d)
+        av = [p for t, p in s.b.client.pub if t == "ambientika/%s/availability" % WOZI]
+        check("E: Wohnzimmer nach 3 Fehlabrufen offline, Flur online", av and av[-1] == "offline"
+              and [p for t, p in s.b.client.pub if t == "ambientika/%s/availability" % FLUR][-1] == "online")
+        df = diag(FLUR)
+        check("E: Flur ohne Fehlabrufe, letztes Paket aktuell",
+              df["poll_failures_total"] == 0 and df["last_status"] >= bridge._iso_utc(t_start["wall"] + 50 * 60), df)
+    sim.mark(70, during)
+
+    def after(s):
+        d = diag(WOZI)
+        check("E: nach der Rueckkehr - 1063 Fehlabrufe, Ausfall geschlossen, consecutive 0",
+              d["poll_failures_total"] == 1063 and d["poll_failures_consecutive"] == 0
+              and d["last_outage_polls"] == 1063 and d["last_outage_end"] is not None
+              and d["last_outage_start"] is not None and d["last_status"] >= d["last_outage_end"], d)
+        start, end = d["last_outage_start"], d["last_outage_end"]
+        from datetime import datetime as _dt
+        dur_min = (_dt.fromisoformat(end) - _dt.fromisoformat(start)).total_seconds() / 60.0
+        check("E: Ausfalldauer ~ 1063 Abrufe a 30 s = 531.5 min (von/bis im Attribut)",
+              530.0 <= dur_min <= 533.0, dur_min)
+        check("E: Log - 'answering again after 1063 failed poll(s) since <Beginn>'",
+              s.has_log("INFO", "Device %s is answering again after 1063 failed poll(s) since %s" % (WOZI, start)), [m for t, lv, m in s.log if "answering" in m])
+        warn = [m for t, lv, m in s.log if lv == "WARNING"]
+        detail = [m for m in warn if m.startswith("status() failed for %s" % WOZI)]
+        hourly = [m for m in detail if "failed polls in a row since" in m]
+        check("E: Warnungen - 3x Detail bis zur Schwelle, 1x offline, dann stuendliche Zusammenfassung (9), sonst nichts",
+              len(detail) - len(hourly) == 3 and hourly and 8 <= len(hourly) <= 10
+              and warn.count("Poll failed 3 times in a row for %s (status() failed) - marking offline." % WOZI) == 1
+              and len(warn) == len(detail) + 1, (len(warn), len(detail), len(hourly), warn[:6]))
+        check("E: Zusammenfassung nennt Zaehler und Beginn",
+              hourly and "in a row since %s" % start in hourly[-1] and "Failed Polls sensor" in hourly[-1], hourly[-1:])
+        check("E: keine 1063 Einzelwarnungen mehr", len(warn) < 20, len(warn))
+        av = [p for t, p in s.b.client.pub if t == "ambientika/%s/availability" % WOZI]
+        check("E: Wohnzimmer wieder online", av[-1] == "online")
+        topo = [m for t, lv, m in s.log if m.startswith("Zone topology")]
+        check("E: Topologie genau einmal, eine Zone: Flur Master + vier Slaves, keine 'changed'-Zeile",
+              len(topo) == 1 and topo[0].startswith("Zone topology - zone 0: Master Flur (E05A1B9C0DAC); Slaves: ")
+              and topo[0].count("SlaveEqualMaster") == 4 and "changed" not in topo[0], topo)
+        ri = [json.loads(p) for t, p in s.b.client.pub if t == bridge.reset_info_topic("ambientika", WOZI)]
+        check("E: reset_info Wohnzimmer einmal: Slave, Master Flur, Zaehler bleibt",
+              len(ri) == 1 and ri[0]["device_role"] == "SlaveEqualMaster" and ri[0]["zone_master"] == "Flur (E05A1B9C0DAC)"
+              and ri[0]["cloud_reset_clears_counter"] is False, ri)
+        n_states = {sn: sum(1 for t, p in s.b.client.pub if t == "ambientika/%s/state" % sn) for sn in s.units}
+        check("E: die anderen vier haben jeden Abruf einen Zustand bekommen (>= 1080), Wohnzimmer ~1063 weniger",
+              all(n_states[sn] >= 1080 for sn in s.units if sn != WOZI)
+              and n_states[FLUR] - n_states[WOZI] in range(1060, 1067), n_states)
+    sim.mark(10 + 532 + 5, after)
+    await sim.run(10 + 532 + 8)
+    check("E: keine Fehler/Tracebacks", not any(lv == "ERROR" for _t, lv, _m in sim.log))
+    return sim
+
+
 async def main_async():
     await scenario_cellar_outage()
     await scenario_restart_during_fallback()
     await scenario_broker_restart_no_block()
     await scenario_radon_during_fallback()
+    await scenario_unit_unplugged()
 
 
 def main():

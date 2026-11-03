@@ -47,7 +47,10 @@ Then save and start the add-on. Your units appear under
 | `command_coalesce_ms` | `800` | Commands for the same unit within this window are applied in one call. `0` applies every command immediately |
 | `average_window_min` | `30` | Window of the averaged sensors *Humidity (averaged)* and *Temperature (averaged)*, in minutes (1–240; at least twenty poll intervals), see below |
 | `average_window_devices` | *(empty)* | Own window for single units: `unit=minutes` entries, comma-separated, by serial number or by the unit's name as in the app (1–240 minutes), e.g. `A1B2C3D4E5F6=15, Schlafzimmer Eltern=60`. The serial number is the safe way (it is in the add-on log and in the app); a name must match the app's spelling - upper/lower case does not matter, and a hyphen, underscore or space count as the same separator; anything else does matter. Units not listed use `average_window_min`, see below |
-| `humidity_avg_hysteresis_devices` | *(empty)* | Hysteresis of *Humidity (averaged)* for single units, in percentage points: `unit=points` entries like `average_window_devices` (0–10), e.g. `A1B2C3D4E5F6=1`. The shown value only moves once the mean has left it by at least that much - calmer at night with a short window, a shower passes at once. Units not listed: none, see below |
+| `humidity_avg_hysteresis` | `0` | Hysteresis of *Humidity (averaged)* for every unit, in percentage points (0–10; `0` = none). The shown value only moves once the mean has left it by at least that much - calmer at night with a short window, a shower passes at once, see below |
+| `humidity_avg_hysteresis_devices` | *(empty)* | The same for single units, overriding the global value for them: `unit=points` entries like `average_window_devices` (0–10), e.g. `A1B2C3D4E5F6=1`; `=0` switches it off for that unit |
+| `temperature_avg_hysteresis` | `0` | Hysteresis of *Temperature (averaged)* for every unit, in °C (0–5; `0` = none) |
+| `temperature_avg_hysteresis_devices` | *(empty)* | The same for single units, overriding the global value: `unit=degrees` entries (0–5), e.g. `A1B2C3D4E5F6=0.3` |
 | `slave_filter_soft_reset` | `false` | Maintenance acknowledgement for Slave units, see below |
 | `filter_ack_ttl_days` | `90` | How long such an acknowledgement stays valid (1–3650) |
 
@@ -138,10 +141,24 @@ status, and there is nothing to press at the unit either (the unit's own filter
 alarm is active on Masters only). The bridge says so in plain words instead of
 promising a change that will not come.
 
-The only way to clear a Slave's own counter is a reset while the unit is a
-Master: set it up in the app as a standalone unit for the moment, reset the
-filter, then couple it as a Slave again. For everyday use the acknowledgement
-below is the simpler way.
+A Slave's own counter clears with a **factory reset of the unit**: reset it at
+the unit (see its manual), set it up again in the app and assign it to its zone
+again - the counter reads `Good` afterwards (customer measurement, Nov 2026).
+The earlier detour - set it up as a standalone unit for the moment, reset the
+filter, couple it again - is only the fallback should the raw value still read
+`Bad`. The cloud keeps no queue: a reset sent before the factory reset is not
+delivered afterwards, the factory reset itself does it. For everyday use the
+acknowledgement below is the simpler way.
+
+So that the reset button does not promise what it cannot do, the button and the
+*Filter Reset Status* sensor carry attributes (since 1.4.41, topic
+`ambientika/<serial>/reset_info`): `device_role`, `zone_master`,
+`cloud_reset_clears_counter` (`false` for a coupled Slave), a `note` in plain
+words saying what a press does on this unit, and `last_reset_started`,
+`last_reset_result`, `last_reset_result_at` for the last reset pressed. They
+follow the roles the units report, so they are right again after a factory reset
+or re-coupling in the app. Open the button's or the sensor's attributes in Home
+Assistant to read them.
 
 Switch on `slave_filter_soft_reset` to record such a maintenance yourself. The
 serviced unit then reads green, while the unchanged device value stays visible:
@@ -282,29 +299,36 @@ is named in the log and ignored. For a unit whose name contains a comma or
 semicolon, use its serial number. Names are read at start-up: after renaming a
 unit in the app, restart the add-on.
 
-**A hysteresis per unit.** On the unit's coarse raster (steps of 2–3 points) a
-short window can sit on one phase of the drifting sampling for a while: in quiet
-hours the mean then wanders by one to two points although nothing changes in
-the room. Since 1.4.38, `humidity_avg_hysteresis_devices` gives single units a
-hysteresis on *Humidity (averaged)*: the shown value only moves once the mean
-has left it by at least that many percentage points, for example
+**A hysteresis.** On the unit's coarse raster (humidity in steps of 2–3 points,
+temperature in whole degrees) a short window can sit on one phase of the drifting
+sampling for a while: in quiet hours the mean then wanders by one to two points -
+a few tenths of a degree - although nothing changes in the room. Since 1.4.38
+*Humidity (averaged)* can get a hysteresis, since 1.4.41 *Temperature (averaged)*
+too, each for every unit at once or per unit: the shown value only moves once
+the mean has left it by at least that much, for example
 
 ```yaml
-humidity_avg_hysteresis_devices: "A1B2C3D4E5F6=1"
+humidity_avg_hysteresis: 1                            # every unit, percentage points
+humidity_avg_hysteresis_devices: "A1B2C3D4E5F6=1.5"   # this unit 1.5 instead
+temperature_avg_hysteresis: 0.3                       # every unit, °C
+temperature_avg_hysteresis_devices: "Schlafzimmer=0"  # this unit none
 ```
 
 A shower (tens of points) passes at once; the slow wander below the hysteresis
 is not shown. The price: the shown value can sit up to the hysteresis away from
-the true mean, and slow real changes arrive in steps. 1 is a good start, 1.5 if
-steps still show at night. Entries and name matching work exactly as for
-`average_window_devices`; 0–10 points, plain number with a decimal point
-(`1.5`), a trailing `%` is fine; 0 or not listed = no hysteresis. Only
-*Humidity (averaged)* is affected - the raw values, *Temperature (averaged)* and
-the averaging itself stay as they are; after *unknown* the first mean is shown
-as it is. A median over the window instead of the mean was looked at and not
-taken: on the coarse raster it flips by a full step whenever one phase fills
-about half the window. The log shows the setting once the units are found, e.g.
-`Humidity (averaged) hysteresis per unit: Gäste Bad 1 %; all others none.`
+the true mean, and slow real changes arrive in steps. For the humidity 1 is a
+good start, 1.5 if steps still show at night; for the temperature 0.3. The
+per-unit entries and their name matching work exactly as for
+`average_window_devices`; a per-unit entry overrides the global value for that
+unit, `=0` switches it off there. 0–10 points or 0–5 °C, plain number with a
+decimal point (`1.5`), a trailing `%` or `°C` is fine; a value outside the range
+is clamped with a note in the log, an unreadable one counts as 0. The raw values
+and the averaging itself stay as they are; after *unknown* the first mean is
+shown as it is. A median over the window instead of the mean was looked at and
+not taken: on the coarse raster it flips by a full step whenever one phase fills
+about half the window. The log shows the settings once the units are found, e.g.
+`Humidity (averaged) hysteresis per unit: Gäste Bad 1.5 %; all others 1 %.` and
+`Temperature (averaged) hysteresis: 0.3 °C for every unit.`
 
 Held-back readings (see above) do not count. After a restart the averaged sensors
 show *unknown* until about two minutes of readings are in (with a long poll
@@ -340,6 +364,39 @@ You can also send everything at once to `ambientika/<serial>/set`:
 ```json
 {"operating_mode": "MasterSlaveFlow", "fan_speed": "High"}
 ```
+
+## When a unit stops reporting
+
+Every unit has two diagnostic sensors (since 1.4.41) that stay readable while
+the unit itself is *unavailable* - they are bound to the add-on's availability,
+not the unit's:
+
+- **Last Status Packet**: when the cloud last handed out a status packet of this
+  unit. A unit without power or WLAN stops here, and Home Assistant shows "since
+  3 hours". It is *unknown* until the first successful read after a start. The
+  cloud serves a unit's last packet for a few minutes after the unit has gone
+  quiet, so the time lags a real outage by about that much. It changes with every
+  read (one recorder entry per poll interval) - exclude it from the recorder if
+  the size of the database matters.
+- **Failed Polls**: how many reads of this unit have failed since the add-on
+  started, as a counter with history. Its attributes name the current run
+  (`consecutive_failures`), the last failure with the cloud's answer, and the most
+  recent outage: `last_outage_start`, `last_outage_end` (empty while it is still
+  running) and `last_outage_polls`. A unit that was without power for nine hours
+  shows one block of about 1080 reads there; a cloud that hiccups now and then
+  shows single reads.
+
+The log says the same: the first failed reads up to
+`availability_failure_threshold` in full, then once an hour a summary with the
+count (`... 1063 failed polls in a row since ...`), and when the unit is back
+`Device ... is answering again after 1063 failed poll(s) since ...`.
+
+After the first read of all units the log also lists the zone topology - one
+line per zone with the Master and its Slaves and their roles (`Zone topology -
+zone 0: Master Flur (...); Slaves: Wohnzimmer (...) SlaveEqualMaster, ...`) - and
+again whenever it changes, e.g. after a factory reset or re-coupling in the app
+(`Zone topology changed - ...`). That is the picture to compare with before and
+after touching a zone in the app.
 
 ## When something does not work
 

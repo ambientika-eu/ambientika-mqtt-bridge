@@ -42,7 +42,10 @@ After installation, configure the add-on via the **Configuration** tab:
 | `command_coalesce_ms` | `800` | Commands for the same unit within this window are applied in one call (`0` = immediately) |
 | `average_window_min` | `30` | Window of the averaged sensors *Humidity (averaged)* and *Temperature (averaged)*, in minutes (1–240; at least twenty poll intervals; details in DOCS.md) |
 | `average_window_devices` | *(empty)* | Own window for single units: `unit=minutes` entries, comma-separated, by serial number or by the unit's name as in the app (1–240 minutes), e.g. `A1B2C3D4E5F6=15, Schlafzimmer Eltern=60`. The serial number is the safe way (it is in the add-on log and in the app); a name must match the app's spelling - upper/lower case does not matter, and a hyphen, underscore or space count as the same separator; anything else does matter. Units not listed use `average_window_min` (details in DOCS.md) |
-| `humidity_avg_hysteresis_devices` | *(empty)* | Hysteresis of *Humidity (averaged)* for single units, in percentage points: `unit=points` entries like `average_window_devices` (0–10), e.g. `A1B2C3D4E5F6=1`. The shown value only moves once the mean has left it by at least that much - calmer at night with a short window, a shower passes at once. Units not listed: none (details in DOCS.md) |
+| `humidity_avg_hysteresis` | `0` | Hysteresis of *Humidity (averaged)* for every unit, in percentage points (0–10; `0` = none). The shown value only moves once the mean has left it by at least that much - calmer at night with a short window, a shower passes at once (details in DOCS.md) |
+| `humidity_avg_hysteresis_devices` | *(empty)* | The same for single units, overriding the global value: `unit=points` entries like `average_window_devices` (0–10), e.g. `A1B2C3D4E5F6=1`; `=0` switches it off for that unit |
+| `temperature_avg_hysteresis` | `0` | Hysteresis of *Temperature (averaged)* for every unit, in °C (0–5; `0` = none) |
+| `temperature_avg_hysteresis_devices` | *(empty)* | The same for single units, overriding the global value: `unit=degrees` entries (0–5), e.g. `A1B2C3D4E5F6=0.3` |
 | `slave_filter_soft_reset` | `false` | Maintenance acknowledgement for Slave filter counters |
 | `filter_ack_ttl_days` | `90` | How long an acknowledgement stays valid |
 
@@ -148,9 +151,14 @@ a unit in `Smart` / `Auto` is running right now), *Zone*. The text values except
 
 **Binary sensors** - *Humidity Alarm*, *Night Alarm*.
 
-**Diagnostic** - *Filter Reset Status* (disabled by default: `idle`, `running`,
-`confirmed`, `acknowledged`, `unconfirmed`) and, with `slave_filter_soft_reset`
-on, *Filter Acknowledged Since* and *Filter Acknowledgement Valid Until*.
+**Diagnostic** - *Last Status Packet* (when the cloud last handed out a status
+packet of this unit) and *Failed Polls* (failed reads since the add-on started,
+with the most recent outage in its attributes) - both stay readable while the
+unit itself is unavailable, see DOCS.md -, *Filter Reset Status* (disabled by
+default: `idle`, `running`, `confirmed`, `acknowledged`, `unconfirmed`; its
+attributes, like the reset button's, say what a reset does on this unit) and,
+with `slave_filter_soft_reset` on, *Filter Acknowledged Since* and *Filter
+Acknowledgement Valid Until*.
 
 **NeuraCell-X** (one extra device) - *Radon Protection Active*, *Radon Level*,
 *Radon Meter Connected*, *Dew Point Controller Connected*, *Ventilation Blocked

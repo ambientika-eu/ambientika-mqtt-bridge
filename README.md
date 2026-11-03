@@ -154,6 +154,8 @@ See [`iobroker-adapter/README.md`](iobroker-adapter/README.md)
 | `ambientika/<serial>/state` | Bridge → Broker | Full device state (JSON, retained) |
 | `ambientika/<serial>/availability` | Bridge → Broker | `online` / `offline` |
 | `ambientika/<serial>/reset_state` | Bridge → Broker | Filter reset: `idle` / `running` / `confirmed` / `acknowledged` / `unconfirmed` |
+| `ambientika/<serial>/reset_info` | Bridge → Broker | What a filter reset does on this unit (JSON, retained): role, zone Master, whether the cloud reset clears *its* counter, the last reset and its result - attributes of the reset button and of *Filter Reset Status* (see *Filter reset on Master/Slave groups*) |
+| `ambientika/<serial>/diagnostics` | Bridge → Broker | Poll diagnostics (JSON, retained, after every poll): time of the last status packet, failed polls (total, in a row, last one, the most recent outage) - see *Poll diagnostics* |
 | `ambientika/<serial>/set/<attribute>` | Broker → Bridge | Set **one** attribute, plain value |
 | `ambientika/<serial>/set` | Broker → Bridge | Set **several** attributes at once (JSON object) |
 | `ambientika/bridge/availability` | Bridge → Broker | The bridge itself: `online` / `offline` |
@@ -277,7 +279,10 @@ environment variable overrides the same setting from `config.yaml`.
 | `COMMAND_COALESCE_MS` | — | `800` | Commands for the same device within this window are applied in one call (`0` = off) |
 | `AVERAGE_WINDOW_MIN` | — | `30` | Window of `humidity_avg` / `temperature_avg` in minutes, 1-1440 (add-on option `average_window_min`: 1-240; at least twenty poll intervals either way) |
 | `AVERAGE_WINDOW_DEVICES` | `bridge.average_window_devices` | *(empty)* | Own window for single units: `unit=minutes` entries, comma-separated, by serial number or unit name as in the app, 1-240 (e.g. `A1B2C3D4E5F6=15, Schlafzimmer Eltern=60`). The serial number is the safe way; in a name, upper/lower case does not matter and a hyphen, underscore or space count as the same separator (see *Averaged humidity and temperature*) |
-| `HUMIDITY_AVG_HYSTERESIS_DEVICES` | `bridge.humidity_avg_hysteresis_devices` | *(empty)* | Hysteresis of `humidity_avg` for single units in percentage points, `unit=points` entries as above, 0-10 (e.g. `A1B2C3D4E5F6=1`); the published value only moves once the mean has left it by at least that much (see *Averaged humidity and temperature*) |
+| `HUMIDITY_AVG_HYSTERESIS` | `bridge.humidity_avg_hysteresis` | `0` | Hysteresis of `humidity_avg` for every unit, in percentage points, 0-10 (`0` = none); the published value only moves once the mean has left it by at least that much (see *Averaged humidity and temperature*) |
+| `HUMIDITY_AVG_HYSTERESIS_DEVICES` | `bridge.humidity_avg_hysteresis_devices` | *(empty)* | Hysteresis of `humidity_avg` for single units, overriding the global value: `unit=points` entries as above, 0-10 (e.g. `A1B2C3D4E5F6=1`; `=0` switches it off for that unit) |
+| `TEMPERATURE_AVG_HYSTERESIS` | `bridge.temperature_avg_hysteresis` | `0` | Hysteresis of `temperature_avg` for every unit, in °C, 0-5 (`0` = none) |
+| `TEMPERATURE_AVG_HYSTERESIS_DEVICES` | `bridge.temperature_avg_hysteresis_devices` | *(empty)* | Hysteresis of `temperature_avg` for single units, overriding the global value: `unit=degrees` entries, 0-5 (e.g. `A1B2C3D4E5F6=0.3`) |
 | `SLAVE_FILTER_SOFT_RESET` | — | `0` | Record a bridge-side "serviced" acknowledgement when a Slave's filter counter cannot be cleared remotely (see below) |
 | `FILTER_ACK_TTL_DAYS` | — | `90` | How long such an acknowledgement stays valid |
 | `FILTER_ACK_PATH` | — | `/data/filter_ack.json` | Where the acknowledgements are stored (needs a persistent volume) |
@@ -389,10 +394,21 @@ filter alarm is active on Masters only). The bridge sends the documented
 device status and reports what actually happened - for a Slave it says plainly
 that its counter stays, instead of promising a change on a later poll.
 
-The only way to clear a Slave's own counter is a reset while the unit is a Master:
-set it up in the app as a standalone unit for the moment, reset the filter, then
-couple it as a Slave again. For everyday use the maintenance acknowledgement below
-is the simpler way.
+A Slave's own counter clears with a **factory reset of the unit**: reset it at the
+unit (see its manual), set it up again in the app and assign it to its zone again -
+the counter reads `Good` afterwards (customer measurement, Nov 2026; the earlier
+detour of resetting the filter while the unit stands alone is only the fallback
+should the raw value still read `Bad`). The cloud keeps no queue, so a reset sent
+before the factory reset is not delivered afterwards - the factory reset itself
+does it. For everyday use the maintenance acknowledgement below is the simpler way.
+
+So that the reset button does not promise what it cannot do, since 1.4.41 the
+button and the *Filter Reset Status* sensor carry attributes from
+`ambientika/<serial>/reset_info` (retained, follows the roles): `device_role`,
+`zone_master`, `cloud_reset_clears_counter` (`false` for a coupled Slave), a `note`
+in plain words saying what a press does on this unit, and `last_reset_started`,
+`last_reset_result`, `last_reset_result_at` for the last reset pressed. The log says
+the same when a Slave's reset ends `unconfirmed`.
 
 A counter is only skipped when it is positively `Good`. `Medium` (yellow) is a
 real reset case, since filters are usually cleaned before the alarm turns red.
@@ -552,22 +568,34 @@ A real bathroom confirmed the trade-off: with 10 instead of 15 minutes the mean
 reached its shower peak about 4 minutes earlier, but the swing in quiet night hours
 grew by about a third and the mean began to wander slowly with no real change.
 
-Since 1.4.38 single units can also get a hysteresis on `humidity_avg`:
-`HUMIDITY_AVG_HYSTERESIS_DEVICES` (add-on option and `config.yaml` key
-`humidity_avg_hysteresis_devices`) takes `unit=points` entries with the same syntax
-and name matching as `AVERAGE_WINDOW_DEVICES`, 0-10 percentage points (decimal
-point; a trailing `%`, `%rH` or `%rF` is fine). The published `humidity_avg` of such
-a unit only moves once the mean has left it by at least that many points, e.g.
-`A1B2C3D4E5F6=1`. On the unit's coarse raster a short window can sit on one phase of
-the drifting sampling for a while, so in quiet hours the mean wanders by one to two
-points with nothing changing in the room; the hysteresis hides that, while a shower
-(tens of points) passes at once. The price: the value can sit up to the hysteresis
-away from the true mean, and slow real changes arrive in steps. `null` (unknown)
-passes at once and the first mean afterwards is published as it is. Raw values,
-`temperature_avg` and the averaging itself are unchanged; 0 or not listed = none.
-A median instead of the mean was simulated and not taken: on the coarse raster it
-flips by a full step whenever one phase fills about half the window. The log shows
-the setting once the units are found (`Humidity (averaged) hysteresis per unit: ...`).
+Since 1.4.38 `humidity_avg` can get a hysteresis, since 1.4.41 `temperature_avg` as
+well, each for every unit at once or per unit:
+
+| Setting | Scope | Range |
+|---|---|---|
+| `HUMIDITY_AVG_HYSTERESIS` (`humidity_avg_hysteresis`) | every unit | 0-10 percentage points, `0` = none |
+| `HUMIDITY_AVG_HYSTERESIS_DEVICES` (`humidity_avg_hysteresis_devices`) | single units, `unit=points` entries; overrides the global value for that unit (`=0` = none there) | 0-10 |
+| `TEMPERATURE_AVG_HYSTERESIS` (`temperature_avg_hysteresis`) | every unit | 0-5 °C, `0` = none |
+| `TEMPERATURE_AVG_HYSTERESIS_DEVICES` (`temperature_avg_hysteresis_devices`) | single units, `unit=degrees` entries; overrides the global value | 0-5 |
+
+The per-unit lists take the same syntax and name matching as `AVERAGE_WINDOW_DEVICES`
+(decimal point; a trailing `%`, `%rH` or `%rF` after a humidity value and `°C`, `°`
+or `K` after a temperature value are fine). The published mean of a unit with a
+hysteresis only moves once the mean has left it by at least that much, e.g.
+`A1B2C3D4E5F6=1` for one percentage point or `0.3` °C for the temperature. On the
+unit's coarse raster (humidity in steps of 2-3 points, temperature in whole degrees)
+a short window can sit on one phase of the drifting sampling for a while, so in
+quiet hours the mean wanders by one to two points - a few tenths of a degree - with
+nothing changing in the room; the hysteresis hides that, while a shower (tens of
+points) passes at once. The price: the value can sit up to the hysteresis away from
+the true mean, and slow real changes arrive in steps. `null` (unknown) passes at
+once and the first mean afterwards is published as it is. Raw values and the
+averaging itself are unchanged. A median instead of the mean was simulated and
+not taken: on the coarse raster it flips by a full step whenever one phase fills
+about half the window. The log shows the settings once the units are found
+(`Humidity (averaged) hysteresis per unit: ...; all others 1 %`, `Temperature
+(averaged) hysteresis: 0.3 °C for every unit.`); a value outside its range is
+clamped with a note, an unreadable one counts as 0.
 
 ### Availability debounce
 
@@ -577,6 +605,49 @@ reachable. The bridge therefore only publishes `offline` after
 `AVAILABILITY_FAILURE_THRESHOLD` consecutive failures (default `3`), which stops
 entities from flickering to *unavailable* and back for one poll interval. Set it
 to `1` for the previous immediate-offline behaviour.
+
+The log shows the first failures up to that threshold in full (`status() failed
+for ...`, `Poll 1/3 failed ...`, `... marking offline`). Once a unit is offline,
+the detail of its further failed polls is written once an hour as a summary with
+the count (`... - 1063 failed polls in a row since ...`), and the first successful
+poll says how long it was (`Device ... is answering again after 1063 failed
+poll(s) since ...`). Before 1.4.41 every failed poll wrote its own warning - a
+unit without power for nine hours wrote 1063 identical lines.
+
+### Poll diagnostics
+
+Since 1.4.41 every unit publishes `ambientika/<serial>/diagnostics` (JSON,
+retained) after every poll, success or failure, and Home Assistant discovers two
+diagnostic sensors from it. Both are bound to the **bridge's** availability, not
+the unit's, so they stay readable while the unit itself is offline - which is when
+they matter:
+
+| Entity | Content |
+|---|---|
+| **Last Status Packet** (`last_status`, timestamp) | when the cloud last handed out a status packet of this unit. A unit without power stops here; Home Assistant shows "3 hours ago". Unknown until the first successful poll after a start |
+| **Failed Polls** (`poll_failures_total`, `total_increasing`) | failed polls since the bridge started; attributes: `consecutive_failures`, `last_failure`, `last_failure_reason`, `last_outage_start`, `last_outage_end`, `last_outage_polls` (the most recent run of failed polls - its first and last poll, or `null` for the end while it is still running), `counting_since` |
+
+The cloud serves a unit's last packet for a few minutes after the unit has gone
+quiet, so the timestamp lags a real outage by about that much. The timestamp
+changes with every poll, i.e. one recorder row per poll interval; exclude
+`sensor.*_last_status_packet` from the recorder if the database size matters.
+A restart of the bridge starts the counter at 0 again (`total_increasing`: the
+long-term statistics read that as a meter reset and keep the sum).
+
+### Zone topology in the log
+
+After the first poll cycle the log lists the coupling as the units report it -
+one line per zone with the Master and its Slaves and their roles:
+
+```
+Zone topology - zone 0: Master Flur (E05A1B9C0DAC); Slaves: Gäste Bad (…) SlaveEqualMaster, Kinderzimmer (…) SlaveEqualMaster, …
+Zone topology - zone 1: Master Küche (…); no Slaves (standalone)
+```
+
+and again whenever it changes (`Zone topology changed - …`), e.g. after a factory
+reset or re-coupling in the app; a unit that reports no role appears as `not
+coupled`, a zone whose Master is missing as `no Master found`. With several
+houses in one account the house is named too.
 
 ### `ambientika_py` dependency
 

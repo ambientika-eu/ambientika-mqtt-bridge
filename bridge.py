@@ -192,21 +192,31 @@ AVERAGE_MIN_POLLS = 20
 AVERAGE_DEVICE_WINDOW_MIN = (1.0, 240.0)   # minutes, as the add-on option average_window_min
 AVERAGE_MAX_GAP_POLLS = 2
 AVERAGE_MIN_COVER_S = 120.0
-# Hysteresis of the averaged humidity for single units
-# (humidity_avg_hysteresis_devices, "name=percent", see BridgeConfig). The unit
-# reports humidity in coarse steps (about 2.5-3 points) and the cloud hands out
-# about one reading per reversal, so with a short window a single phase of the
-# slowly drifting sampling can fill the whole window: in quiet hours the mean
-# then wanders by one to two points with no real change in the room (customer
-# measurement, guest bathroom, 10-min window). With a hysteresis of H points the
-# published humidity_avg only moves once the mean has left the last published
-# value by at least H; a shower (tens of points) passes at once, the slow wander
-# below H is not shown. Price: the shown value may sit up to H off the true mean,
-# and slow real changes arrive in steps of at least H. A median instead of the
-# mean was simulated and rejected: on the coarse raster it flips by a full step
-# whenever one phase holds about half the window. Only humidity_avg; raw values,
-# temperature_avg and the averaging itself are unchanged. Range below; 0 = off.
-HUMIDITY_AVG_HYSTERESIS_RANGE = (0.0, 10.0)   # percentage points
+# Hysteresis of the averaged values (humidity_avg_hysteresis /
+# humidity_avg_hysteresis_devices, "name=percent", and since 1.4.41 likewise
+# temperature_avg_hysteresis / temperature_avg_hysteresis_devices, "name=degrees",
+# see BridgeConfig). The unit reports humidity in coarse steps (about 2.5-3
+# points) and temperature in whole degrees, and the cloud hands out about one
+# reading per reversal, so with a short window a single phase of the slowly
+# drifting sampling can fill the whole window: in quiet hours the mean then
+# wanders by one to two points (a few tenths of a degree) with no real change in
+# the room (customer measurement, guest bathroom, 10-min window). With a
+# hysteresis of H the published mean only moves once it has left the last
+# published value by at least H; a shower (tens of points) passes at once, the
+# slow wander below H is not shown. Price: the shown value may sit up to H off
+# the true mean, and slow real changes arrive in steps of at least H. A median
+# instead of the mean was simulated and rejected: on the coarse raster it flips
+# by a full step whenever one phase holds about half the window. Only the
+# averaged values; raw values and the averaging itself are unchanged. The global
+# value applies to every unit, an entry in the per-unit list overrides it for
+# that unit (0 there switches it off for that unit). Ranges below; 0 = off.
+HUMIDITY_AVG_HYSTERESIS_RANGE = (0.0, 10.0)      # percentage points
+TEMPERATURE_AVG_HYSTERESIS_RANGE = (0.0, 5.0)    # °C
+# A unit marked offline (availability_failure_threshold failed polls in a row)
+# writes the detail of its further failed polls to the log only this often, as a
+# summary with the count (1063 identical warnings for a nine-hour power cut
+# before 1.4.41). The first failures up to the threshold are logged as before.
+POLL_FAILURE_NOTE_S = 3600.0
 # A status identical to the previous poll's is the same cached packet - unless it
 # has been the same for longer than this: a unit standing still reports the same
 # values for real, and such a reading must still count (e.g. to confirm a held-
@@ -646,6 +656,35 @@ def _parse_unit_values(raw_value, bounds, suffixes, what, unit):
     return entries, problems
 
 
+def _parse_bounded_float(raw_value, bounds, suffixes, what, unit, default=0.0):
+    """Parse a single global numeric option (humidity_avg_hysteresis,
+    temperature_avg_hysteresis): a plain number with a decimal point, optionally
+    followed by one of `suffixes`; outside `bounds` it is clamped. Empty, None,
+    "null" (bashio) or unreadable -> `default`.
+
+    Returns (value, problem): problem is a plain-words log text or None."""
+    lo, hi = bounds
+    if raw_value is None or isinstance(raw_value, bool):
+        return default, None
+    num = str(raw_value).strip()
+    if not num or num.lower() in ("null", "none"):
+        return default, None
+    for suffix in sorted(suffixes, key=len, reverse=True):
+        if num.lower().endswith(suffix):
+            num = num[:-len(suffix)].strip()
+            break
+    try:
+        value = float(num)
+    except ValueError:
+        value = float("nan")
+    if value != value or value in (float("inf"), float("-inf")):
+        return default, "%r is not a number of %s - using %g" % (str(raw_value).strip(), what, default)
+    if not lo <= value <= hi:
+        clamped = min(hi, max(lo, value))
+        return clamped, "%g%s is outside %g-%g - using %g" % (value, unit, lo, hi, clamped)
+    return value, None
+
+
 
 
 def _slave_soft_reset_enabled() -> bool:
@@ -691,10 +730,16 @@ class BridgeConfig:
         # Empty = every unit uses AVERAGE_WINDOW_MIN. Example:
         # "Gäste-Bad=15, Schlafzimmer Eltern=60".
         self.average_window_devices = ""
-        # Hysteresis of Humidity (averaged) for single units, in percentage
-        # points: "name=percent" entries as above. Empty (default) = none - every
-        # unit publishes the mean as it is. Example: "Gäste-Bad=1".
+        # Hysteresis of Humidity (averaged) for every unit, in percentage points
+        # (0 = none, the default), and for single units: "name=percent" entries
+        # as above, overriding the global value for that unit (0 = none there).
+        # Example: humidity_avg_hysteresis 1, devices "Schlafzimmer=0".
+        self.humidity_avg_hysteresis = 0.0
         self.humidity_avg_hysteresis_devices = ""
+        # The same for Temperature (averaged), in °C: the unit reports whole
+        # degrees, so a short window wanders by a few tenths in quiet hours.
+        self.temperature_avg_hysteresis = 0.0
+        self.temperature_avg_hysteresis_devices = ""
 
         # --- NeuraCell-X radon protection ---
         self.neuracell_enabled = True
@@ -856,13 +901,38 @@ class BridgeConfig:
         return _parse_unit_values(self.average_window_devices, AVERAGE_DEVICE_WINDOW_MIN,
                                   ("min",), "minutes", " min")
 
+    _HUMIDITY_HYST_SUFFIXES = ("% rh", "% rf", "%rh", "%rf", "%")
+    _TEMPERATURE_HYST_SUFFIXES = ("°c", "° c", "°", "c", "k", "grad", "deg")
+
     def humidity_avg_hysteresis_entries(self):
         """Parse humidity_avg_hysteresis_devices like average_window_entries:
         (entries, problems), entries as (key, label, percentage points). A value
         is a plain number with a decimal point, optionally followed by "%",
         "%rH" or "%rF"; outside HUMIDITY_AVG_HYSTERESIS_RANGE it is clamped."""
         return _parse_unit_values(self.humidity_avg_hysteresis_devices, HUMIDITY_AVG_HYSTERESIS_RANGE,
-                                  ("% rh", "% rf", "%rh", "%rf", "%"), "percent", " %")
+                                  self._HUMIDITY_HYST_SUFFIXES, "percent", " %")
+
+    def temperature_avg_hysteresis_entries(self):
+        """Parse temperature_avg_hysteresis_devices the same way: entries as
+        (key, label, °C). A value is a plain number with a decimal point,
+        optionally followed by "°C", "°" or "K"; outside
+        TEMPERATURE_AVG_HYSTERESIS_RANGE it is clamped."""
+        return _parse_unit_values(self.temperature_avg_hysteresis_devices,
+                                  TEMPERATURE_AVG_HYSTERESIS_RANGE,
+                                  self._TEMPERATURE_HYST_SUFFIXES, "degrees", " °C")
+
+    def humidity_avg_hysteresis_value(self):
+        """The global hysteresis of Humidity (averaged) as (points, problem):
+        humidity_avg_hysteresis parsed and clamped to HUMIDITY_AVG_HYSTERESIS_RANGE,
+        0 when empty or unreadable (problem then names why)."""
+        return _parse_bounded_float(self.humidity_avg_hysteresis, HUMIDITY_AVG_HYSTERESIS_RANGE,
+                                    self._HUMIDITY_HYST_SUFFIXES, "percent", " %")
+
+    def temperature_avg_hysteresis_value(self):
+        """The global hysteresis of Temperature (averaged) as (°C, problem), see
+        humidity_avg_hysteresis_value."""
+        return _parse_bounded_float(self.temperature_avg_hysteresis, TEMPERATURE_AVG_HYSTERESIS_RANGE,
+                                    self._TEMPERATURE_HYST_SUFFIXES, "degrees", " °C")
 
     @property
     def dewpoint_device_block_mode_set(self) -> set:
@@ -1006,6 +1076,11 @@ class BridgeConfig:
             ("dewpoint_controller_key", ("DEWPOINT_CONTROLLER_KEY",)),
             ("average_window_devices", ("AVERAGE_WINDOW_DEVICES",)),
             ("humidity_avg_hysteresis_devices", ("HUMIDITY_AVG_HYSTERESIS_DEVICES",)),
+            ("temperature_avg_hysteresis_devices", ("TEMPERATURE_AVG_HYSTERESIS_DEVICES",)),
+            # Kept as typed here; humidity_avg_hysteresis_value() /
+            # temperature_avg_hysteresis_value() parse and clamp them.
+            ("humidity_avg_hysteresis", ("HUMIDITY_AVG_HYSTERESIS",)),
+            ("temperature_avg_hysteresis", ("TEMPERATURE_AVG_HYSTERESIS",)),
         ):
             v = _env(*names)
             if v:
@@ -1123,8 +1198,7 @@ class BridgeConfig:
         cfg.log_level = br.get("log_level", cfg.log_level)
         awd = br.get("average_window_devices")
         cfg.average_window_devices = "" if awd is None else str(awd)
-        hyd = br.get("humidity_avg_hysteresis_devices")
-        cfg.humidity_avg_hysteresis_devices = "" if hyd is None else str(hyd)
+        cfg._read_hysteresis_options(br.get)
 
         extras = {}
         extras.update(raw.get("neuracell", {}) or {})
@@ -1157,11 +1231,24 @@ class BridgeConfig:
         cfg.log_level = raw.get("log_level", cfg.log_level)
         awd = raw.get("average_window_devices")
         cfg.average_window_devices = "" if awd is None else str(awd)
-        hyd = raw.get("humidity_avg_hysteresis_devices")
-        cfg.humidity_avg_hysteresis_devices = "" if hyd is None else str(hyd)
+        cfg._read_hysteresis_options(raw.get)
         cfg._apply_extras(raw.get)
         cfg.apply_env_overrides()
         return cfg
+
+    def _read_hysteresis_options(self, get) -> None:
+        """Take the four hysteresis options from a getter get(key) (options.json
+        or the bridge: section of config.yaml): the per-unit lists as text (null
+        -> empty), the global values as given (parsed and clamped later by
+        humidity_avg_hysteresis_value() / temperature_avg_hysteresis_value(), so
+        a bad value is reported in the log instead of stopping the start)."""
+        for attr in ("humidity_avg_hysteresis_devices", "temperature_avg_hysteresis_devices"):
+            v = get(attr)
+            setattr(self, attr, "" if v is None else str(v))
+        for attr in ("humidity_avg_hysteresis", "temperature_avg_hysteresis"):
+            v = get(attr)
+            if v is not None:
+                setattr(self, attr, v)
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":
@@ -1224,6 +1311,18 @@ def _log_handler_error(fut) -> None:
 
 def reset_state_topic(prefix: str, serial: str) -> str:
     return f"{prefix}/{serial}/reset_state"
+
+def reset_info_topic(prefix: str, serial: str) -> str:
+    """Retained JSON next to reset_state: what a filter reset does on this unit
+    (role, whether the cloud reset clears its counter, the last reset sent and
+    its result) - attributes of the reset button and of Filter Reset Status."""
+    return f"{prefix}/{serial}/reset_info"
+
+def diag_topic(prefix: str, serial: str) -> str:
+    """Retained JSON with the unit's poll diagnostics (last status packet,
+    failed polls) - published after every poll, success or failure, and bound
+    to the bridge's availability, not the unit's."""
+    return f"{prefix}/{serial}/diagnostics"
 
 def bridge_avail_topic(prefix: str) -> str:
     return f"{prefix}/bridge/availability"
@@ -1431,7 +1530,12 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
 
     # Button: Filter-Reset. Setzt den Filteralarm/-zaehler ueber den
     # Cloud-Endpunkt zurueck - auch schon bei "gelb" (verschmutzt), also bevor
-    # der App-eigene Reset-Button (erst bei "rot") erscheint.
+    # der App-eigene Reset-Button (erst bei "rot") erscheint. Seine Attribute
+    # (reset_info, seit 1.4.41) sagen, was der Druck auf DIESEM Geraet bewirkt:
+    # bei einem gekoppelten Slave bleibt der eigene Zaehler stehen (nur ein
+    # Werksreset loescht ihn), damit der Knopf nichts verspricht, was er nicht
+    # halten kann.
+    reset_info = reset_info_topic(prefix, serial)
     entities.append((
         f"{base}/button/{serial}_reset_filter/config",
         {
@@ -1439,6 +1543,7 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
             "unique_id": f"ambientika_{serial}_reset_filter",
             "command_topic": cmd_topic(prefix, serial, "reset_filter"),
             "payload_press": "PRESS",
+            "json_attributes_topic": reset_info,
             "availability_topic": avail,
             "device": device_info,
             "icon": "mdi:air-filter",
@@ -1448,17 +1553,69 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
     # Filter-reset status sensor: honest running/confirmed/unconfirmed indicator.
     # Disabled by default and marked diagnostic, so it stays invisible to normal
     # users (a cloud reset is fire-and-forget, like the app) while power users can
-    # switch it on to see whether a reset actually took.
+    # switch it on to see whether a reset actually took. Same attributes as the
+    # button (role, what the reset does here, the last reset and its result).
     entities.append((
         f"{base}/sensor/{serial}_reset_state/config",
         {
             "name": "Filter Reset Status",
             "unique_id": f"ambientika_{serial}_reset_state",
             "state_topic": reset_state_topic(prefix, serial),
+            "json_attributes_topic": reset_info,
             "availability_topic": avail,
             "device": device_info,
             "icon": "mdi:air-filter",
             "enabled_by_default": False,
+            "entity_category": "diagnostic",
+        },
+    ))
+
+    # Poll diagnostics (1.4.41, customer suggestion): when the cloud last handed
+    # out a status packet of this unit, and how many polls failed. Both are bound
+    # to the BRIDGE's availability, not the unit's: a unit that has gone silent
+    # is exactly when they are needed, and its own entities are unavailable then.
+    # The timestamp moves with every successful poll (one recorder row per poll;
+    # exclude it from the recorder if the database size matters). The counter
+    # counts since the bridge started (total_increasing: a restart reads as a
+    # meter reset, the statistics keep the sum); its attributes carry the current
+    # run of failures and the most recent outage (first and last failed poll).
+    diag = diag_topic(prefix, serial)
+    bridge_avail = bridge_avail_topic(prefix)
+    entities.append((
+        f"{base}/sensor/{serial}_last_status/config",
+        {
+            "name": "Last Status Packet",
+            "unique_id": f"ambientika_{serial}_last_status",
+            "state_topic": diag,
+            # "None" (no packet since the bridge started) is "unknown" in HA.
+            "value_template": "{{ value_json.last_status | default('None', true) }}",
+            "availability_topic": bridge_avail,
+            "device": device_info,
+            "device_class": "timestamp",
+            "icon": "mdi:clock-check-outline",
+            "entity_category": "diagnostic",
+        },
+    ))
+    entities.append((
+        f"{base}/sensor/{serial}_poll_failures/config",
+        {
+            "name": "Failed Polls",
+            "unique_id": f"ambientika_{serial}_poll_failures",
+            "state_topic": diag,
+            "value_template": "{{ value_json.poll_failures_total }}",
+            "json_attributes_topic": diag,
+            "json_attributes_template": (
+                "{{ {'consecutive_failures': value_json.poll_failures_consecutive,"
+                " 'last_failure': value_json.last_failure,"
+                " 'last_failure_reason': value_json.last_failure_reason,"
+                " 'last_outage_start': value_json.last_outage_start,"
+                " 'last_outage_end': value_json.last_outage_end,"
+                " 'last_outage_polls': value_json.last_outage_polls,"
+                " 'counting_since': value_json.bridge_started} | tojson }}"),
+            "availability_topic": bridge_avail,
+            "device": device_info,
+            "state_class": "total_increasing",
+            "icon": "mdi:cloud-alert-outline",
             "entity_category": "diagnostic",
         },
     ))
@@ -2861,8 +3018,11 @@ class AmbientikaBridge:
         self._cmd_timers: dict = {}
         self._stop_event: Optional[asyncio.Event] = None
         self.neuracell = NeuraCellXController(self, cfg)
-        # serial -> number of consecutive failed polls (availability debounce)
+        # serial -> number of consecutive failed polls (availability debounce),
+        # and serial -> monotonic time of the last hourly summary of an offline
+        # unit's failed polls (see _note_poll_failure).
         self._poll_failures: dict = {}
+        self._poll_fail_noted: dict = {}
         # serial -> last light_sensor_level seen while the unit was running (or
         # last set by the user). A powered-off unit reports a default level, so
         # we keep this to avoid overwriting the user's dusk-sensor choice on an
@@ -2901,12 +3061,41 @@ class AmbientikaBridge:
         # serial -> own averaging window in seconds, for the units listed in
         # cfg.average_window_devices (see _resolve_average_windows).
         self._avg_window: dict = {}
-        # serial -> hysteresis of humidity_avg in percentage points, for the units
-        # listed in cfg.humidity_avg_hysteresis_devices (see
-        # _resolve_humidity_hysteresis), and serial -> last published humidity_avg
-        # of such a unit (see _hold_humidity_avg).
-        self._hum_hyst: dict = {}
-        self._hum_avg_held: dict = {}
+        # Hysteresis of the averaged values (see _resolve_hysteresis): per key
+        # ("humidity" in percentage points, "temperature" in °C) the global value
+        # from humidity_avg_hysteresis / temperature_avg_hysteresis, the units
+        # listed in the *_devices option with their own value (serial -> value;
+        # overrides the global one), and serial -> last published mean of a unit
+        # with a hysteresis (see _hold_avg).
+        self._hyst_global: dict = {"humidity": 0.0, "temperature": 0.0}
+        self._hyst: dict = {"humidity": {}, "temperature": {}}
+        self._avg_held: dict = {"humidity": {}, "temperature": {}}
+        # Diagnostics per unit (see _publish_diag): time of the last status packet
+        # read from the cloud, failed polls (total since start, consecutive, last
+        # one with reason) and the most recent run of consecutive failed polls -
+        # published on their own topic bound to the bridge's availability, so
+        # they stay readable while the unit itself is offline.
+        self._diag: dict = {}
+        self._started_wall: float = time.time()
+        # Zone topology (Master and Slaves per zone) as last logged, so a change
+        # is logged once (see _log_topology).
+        self._topology_logged: Optional[tuple] = None
+        # serial -> last published reset_info payload (see _publish_reset_info),
+        # and serial -> {"started", "result", "result_at"} of the last filter
+        # reset pressed (unix times), shown in that payload.
+        self._reset_info_shown: dict = {}
+        self._reset_log: dict = {}
+
+    # ----- hysteresis of the averaged values -----
+    @property
+    def _hum_hyst(self) -> dict:
+        """serial -> own hysteresis of Humidity (averaged) (per-unit list only)."""
+        return self._hyst["humidity"]
+
+    @property
+    def _hum_avg_held(self) -> dict:
+        """serial -> last published Humidity (averaged) of a unit with a hysteresis."""
+        return self._avg_held["humidity"]
 
     # ----- values shown for a unit -----
     def _shown_mode(self, serial: str, device, own):
@@ -3104,45 +3293,86 @@ class AmbientikaBridge:
                  ("; all others %g min" % (max(AVERAGE_WINDOW_S, AVERAGE_MIN_POLLS * interval) / 60.0))
                  if rest > 0 else "")
 
-    def _resolve_humidity_hysteresis(self) -> None:
-        """Map cfg.humidity_avg_hysteresis_devices onto the discovered units like
-        _resolve_average_windows and log the result once. A held value of a unit
-        whose hysteresis changed or ended is dropped, so the next mean is shown
-        as it is."""
-        old = self._hum_hyst
-        self._hum_hyst = {}
-        entries, problems = self.cfg.humidity_avg_hysteresis_entries()
-        for p in problems:
-            log.warning("humidity_avg_hysteresis_devices: %s.", p)
-        if entries:
-            self._hum_hyst = self._match_unit_entries("humidity_avg_hysteresis_devices", entries, " %")
-        for s in list(self._hum_avg_held):
-            if self._hum_hyst.get(s) != old.get(s):
-                del self._hum_avg_held[s]
-        if not self._hum_hyst:          # empty, or nothing matched - the warnings say why
-            return
-        shown = ["%s %g %%%s" % (getattr(self.devices[s], "name", s), h, "" if h > 0 else " (off)")
-                 for s, h in sorted(self._hum_hyst.items(),
-                                    key=lambda x: str(getattr(self.devices[x[0]], "name", x[0])))]
-        rest = len(self.devices) - len(self._hum_hyst)
-        log.info("Humidity (averaged) hysteresis per unit: %s%s.", ", ".join(shown),
-                 "; all others none" if rest > 0 else "")
+    # key -> (sensor name, option name of the global value, unit for the log)
+    _HYST_LABEL = {"humidity": ("Humidity (averaged)", "humidity_avg_hysteresis", " %"),
+                   "temperature": ("Temperature (averaged)", "temperature_avg_hysteresis", " °C")}
 
-    def _hold_humidity_avg(self, serial: str, value):
-        """Apply the hysteresis of humidity_avg_hysteresis_devices to one unit's
-        averaged humidity (see HUMIDITY_AVG_HYSTERESIS_RANGE): the last published
-        value stays until the mean differs from it by at least the hysteresis.
-        Unknown (None) is passed on at once and clears the held value, so the
-        first mean afterwards is shown as it is. Units without a hysteresis (or
-        with 0) get the mean unchanged."""
-        h = self._hum_hyst.get(serial)
+    def _hysteresis_of(self, key: str, serial: str) -> float:
+        """Effective hysteresis of one unit's averaged value: its own entry from
+        the *_devices list, else the global value (0 = none)."""
+        try:
+            return float(self._hyst[key].get(serial, self._hyst_global.get(key, 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _resolve_hysteresis(self, key: str) -> None:
+        """Take the global hysteresis of one averaged value (humidity_avg_hysteresis /
+        temperature_avg_hysteresis) and map the per-unit list (*_devices) onto the
+        discovered units like _resolve_average_windows; log the result once. A
+        held value of a unit whose effective hysteresis changed or ended is
+        dropped, so the next mean is shown as it is."""
+        label, option, unit = self._HYST_LABEL[key]
+        old_per, old_glob = dict(self._hyst[key]), self._hyst_global.get(key, 0.0)
+        if key == "humidity":
+            glob, problem = self.cfg.humidity_avg_hysteresis_value()
+            entries, problems = self.cfg.humidity_avg_hysteresis_entries()
+        else:
+            glob, problem = self.cfg.temperature_avg_hysteresis_value()
+            entries, problems = self.cfg.temperature_avg_hysteresis_entries()
+        if problem:
+            log.warning("%s: %s.", option, problem)
+        for p in problems:
+            log.warning("%s_devices: %s.", option, p)
+        per = self._match_unit_entries(option + "_devices", entries, unit) if entries else {}
+        self._hyst[key] = per
+        self._hyst_global[key] = glob
+        held = self._avg_held[key]
+        for s in list(held):
+            if per.get(s, glob) != old_per.get(s, old_glob):
+                del held[s]
+        if not per:                     # empty, or nothing matched - the warnings say why
+            if glob > 0:
+                log.info("%s hysteresis: %g%s for every unit.", label, glob, unit)
+            return
+        shown = ["%s %g%s%s" % (getattr(self.devices[s], "name", s), h, unit, "" if h > 0 else " (off)")
+                 for s, h in sorted(per.items(),
+                                    key=lambda x: str(getattr(self.devices[x[0]], "name", x[0])))]
+        rest = len(self.devices) - len(per)
+        others = ("; all others %g%s" % (glob, unit)) if glob > 0 else "; all others none"
+        log.info("%s hysteresis per unit: %s%s.", label, ", ".join(shown), others if rest > 0 else "")
+
+    def _resolve_humidity_hysteresis(self) -> None:
+        """Humidity (averaged): see _resolve_hysteresis."""
+        self._resolve_hysteresis("humidity")
+
+    def _resolve_temperature_hysteresis(self) -> None:
+        """Temperature (averaged): see _resolve_hysteresis."""
+        self._resolve_hysteresis("temperature")
+
+    def _hold_avg(self, key: str, serial: str, value):
+        """Apply the hysteresis (see HUMIDITY_AVG_HYSTERESIS_RANGE and
+        TEMPERATURE_AVG_HYSTERESIS_RANGE) to one unit's averaged value: the last
+        published value stays until the mean differs from it by at least the
+        hysteresis. Unknown (None) is passed on at once and clears the held value,
+        so the first mean afterwards is shown as it is. Units without a hysteresis
+        (or with 0) get the mean unchanged."""
+        h = self._hysteresis_of(key, serial)
         if not h or h <= 0:
             return value
-        held = self._hum_avg_held.get(serial)
+        held_map = self._avg_held[key]
+        held = held_map.get(serial)
         if value is None or held is None or abs(value - held) >= h - 1e-9:
-            self._hum_avg_held[serial] = value
+            held_map[serial] = value
             return value
         return held
+
+    def _hold_humidity_avg(self, serial: str, value):
+        """Humidity (averaged): see _hold_avg."""
+        return self._hold_avg("humidity", serial, value)
+
+    def _hold_temperature_avg(self, serial: str, value):
+        """Temperature (averaged): see _hold_avg."""
+        return self._hold_avg("temperature", serial, value)
 
     def _average(self, serial: str, key: str, value, now: Optional[float] = None):
         """Record a reading and return the time-weighted mean (see AVERAGE_WINDOW_S).
@@ -3214,7 +3444,8 @@ class AmbientikaBridge:
             self._last_status[serial] = (dict(s), now_m)
         temp, temp_avg = self._measured(serial, "temperature", s["temperature"], fresh)
         hum, hum_avg = self._measured(serial, "humidity", s["humidity"], fresh)
-        hum_avg = self._hold_humidity_avg(serial, hum_avg)
+        hum_avg = self._hold_avg("humidity", serial, hum_avg)
+        temp_avg = self._hold_avg("temperature", serial, temp_avg)
         return {
             "operating_mode": shown.name,
             "operating_mode_raw": own.name,
@@ -3373,17 +3604,30 @@ class AmbientikaBridge:
         return repl
 
     # ----- availability debounce -----
-    def _note_poll_failure(self, serial: str, reason: str) -> None:
+    def _poll_failure_quiet(self, serial: str) -> bool:
+        """True once a unit has failed at least availability_failure_threshold polls
+        in a row: it is marked offline, and the detail of every further failed poll
+        goes to the log only as a summary once an hour (see _note_poll_failure) -
+        a unit without power for nine hours wrote 1063 identical warnings before
+        1.4.41; the count and the times are in its Failed Polls sensor now."""
+        return self._poll_failures.get(serial, 0) >= max(1, self.cfg.availability_failure_threshold)
+
+    def _note_poll_failure(self, serial: str, reason: str, detail: Optional[str] = None) -> None:
         """Count a failed poll and flag the device offline only after N in a row.
 
         A single missed cycle is normally a transient cloud hiccup - the API
         sporadically answers HTTP 404 "Status packet not found!" for a device
         that is perfectly reachable. Publishing "offline" on the first miss
         makes the entity flicker to unavailable and back for one poll interval.
+        `detail` (the cloud's answer) is logged as a warning for each of the
+        first N failures and then once an hour as a summary, with the count.
         """
         n = self._poll_failures.get(serial, 0) + 1
         self._poll_failures[serial] = n
+        d = self._diag_failure(serial, n, reason)
         threshold = max(1, self.cfg.availability_failure_threshold)
+        if n <= threshold and detail:
+            log.warning("%s for %s: %s", reason, serial, detail)
         if n < threshold:
             log.info("Poll %d/%d failed for %s (%s) - keeping it available.",
                      n, threshold, serial, reason)
@@ -3391,13 +3635,99 @@ class AmbientikaBridge:
         if n == threshold:
             log.warning("Poll failed %d times in a row for %s (%s) - marking offline.",
                         n, serial, reason)
+        elif detail:
+            now = time.monotonic()
+            last = self._poll_fail_noted.get(serial)
+            if last is None or now - last >= POLL_FAILURE_NOTE_S:
+                self._poll_fail_noted[serial] = now
+                log.warning("%s for %s: %s - %d failed polls in a row since %s; the unit stays "
+                            "offline. Next note in %d min, the count is in its Failed Polls "
+                            "sensor.", reason, serial, detail, n, _iso_utc(d.get("outage_start")),
+                            int(POLL_FAILURE_NOTE_S // 60))
+            else:
+                log.debug("%s for %s: %s (%d in a row)", reason, serial, detail, n)
         if self.client is not None:
             self.client.publish(avail_topic(self.cfg.topic_prefix, serial),
                                 "offline", qos=0, retain=True)
 
     def _note_poll_success(self, serial: str) -> None:
-        if self._poll_failures.pop(serial, 0):
-            log.info("Device %s is answering again.", serial)
+        n = self._poll_failures.pop(serial, 0)
+        self._poll_fail_noted.pop(serial, None)
+        d = self._diag_success(serial, n)
+        if n:
+            start = d.get("outage_start")
+            log.info("Device %s is answering again after %d failed poll(s)%s.", serial, n,
+                     (" since %s" % _iso_utc(start)) if start else "")
+
+    # ----- per-unit diagnostics: last status packet, failed polls -----
+    @staticmethod
+    def _wall_time() -> float:
+        """Wall-clock time of the diagnostics (unix time; replaceable in tests)."""
+        return time.time()
+
+    def _diag_of(self, serial: str) -> dict:
+        return self._diag.setdefault(serial, {
+            "last_status": None,            # unix time of the last status packet read
+            "total": 0,                     # failed polls since the bridge started
+            "consecutive": 0,               # failed polls in a row right now
+            "last_failure": None,           # unix time and reason of the last failed poll
+            "last_failure_reason": None,
+            "outage_start": None,           # the most recent run of failed polls:
+            "outage_end": None,             # first failure, first success after it
+            "outage_polls": None,           # (None while it is still running), count
+        })
+
+    def _diag_failure(self, serial: str, n: int, reason: str) -> dict:
+        """Count a failed poll (n = failures in a row) and publish the diagnostics."""
+        d = self._diag_of(serial)
+        now = self._wall_time()
+        d["total"] += 1
+        d["consecutive"] = n
+        d["last_failure"] = now
+        d["last_failure_reason"] = str(reason)
+        if n == 1 or d["outage_start"] is None or d["outage_end"] is not None:
+            d["outage_start"] = now
+            d["outage_end"] = None
+        d["outage_polls"] = n
+        self._publish_diag(serial)
+        return d
+
+    def _diag_success(self, serial: str, failed_before: int) -> dict:
+        """Note a status packet read now; close a run of failed polls, if any."""
+        d = self._diag_of(serial)
+        now = self._wall_time()
+        d["last_status"] = now
+        if failed_before or d["consecutive"]:
+            d["outage_end"] = now
+            d["outage_polls"] = max(int(failed_before or 0), int(d["consecutive"] or 0))
+        d["consecutive"] = 0
+        self._publish_diag(serial)
+        return d
+
+    def _diag_payload(self, serial: str) -> dict:
+        d = self._diag_of(serial)
+        return {
+            "last_status": _iso_utc(d["last_status"]) if d["last_status"] else None,
+            "poll_failures_total": int(d["total"]),
+            "poll_failures_consecutive": int(d["consecutive"]),
+            "last_failure": _iso_utc(d["last_failure"]) if d["last_failure"] else None,
+            "last_failure_reason": d["last_failure_reason"],
+            "last_outage_start": _iso_utc(d["outage_start"]) if d["outage_start"] else None,
+            "last_outage_end": _iso_utc(d["outage_end"]) if d["outage_end"] else None,
+            "last_outage_polls": d["outage_polls"],
+            "bridge_started": _iso_utc(self._started_wall),
+        }
+
+    def _publish_diag(self, serial: str) -> None:
+        """Publish the unit's diagnostics (retained) - never lets an error through,
+        a diagnostic must not cost a poll."""
+        if self.client is None:
+            return
+        try:
+            self.client.publish(diag_topic(self.cfg.topic_prefix, serial),
+                                json.dumps(self._diag_payload(serial)), qos=0, retain=True)
+        except Exception as e:
+            log.debug("diagnostics for %s not published: %s", serial, e)
 
     # ----- device helpers -----
     async def _reset_request(self, device, method, path, body):
@@ -3495,6 +3825,154 @@ class AmbientikaBridge:
         if master is not None:
             cands.append((master.serial_number, "zone master %s" % master.serial_number))
         return cands
+
+    # ----- zone topology (Master and Slaves per zone) in the log -----
+    @staticmethod
+    def _unit_label(device) -> str:
+        """'Name (serial)' of a unit for the log."""
+        return "%s (%s)" % (getattr(device, "name", None) or "?", getattr(device, "serial_number", "?"))
+
+    def _topology(self) -> list:
+        """The coupling as the units report it: one entry per zone, as
+        (house, zone, [Masters], [(Slave, role)], [others (role)]), sorted; plus
+        one entry with zone None for units without a zone index. Roles are the
+        live ones from the last status (see _role_of), so the picture follows
+        re-coupling in the app without a restart."""
+        groups: dict = {}
+        for serial, dev in self.devices.items():
+            house = self._device_house.get(serial)
+            zone = getattr(dev, "zone_index", None)
+            g = groups.setdefault((house, zone), ([], [], []))
+            role = self._role_of(dev)
+            shown_role = self._live_role.get(serial) or getattr(dev, "role", None) or "no role"
+            if role == "master":
+                g[0].append(dev)
+            elif role.startswith("slave"):
+                g[1].append((dev, str(shown_role)))
+            else:
+                g[2].append((dev, str(shown_role)))
+        out = []
+        for (house, zone), (masters, slaves, others) in groups.items():
+            key = lambda d: (str(getattr(d, "name", "")), str(getattr(d, "serial_number", "")))  # noqa: E731
+            out.append((house, zone, sorted(masters, key=key),
+                        sorted(slaves, key=lambda x: key(x[0])),
+                        sorted(others, key=lambda x: key(x[0]))))
+        def zone_order(e):
+            house, zone = e[0], e[1]
+            try:
+                z = (0, int(zone)) if zone is not None else (1, 0)
+            except (TypeError, ValueError):
+                z = (2, 0)
+            return (str(house), z, str(zone))
+        out.sort(key=zone_order)
+        return out
+
+    def _topology_signature(self, topo) -> tuple:
+        return tuple(
+            (str(house), zone,
+             tuple(getattr(d, "serial_number", "?") for d in masters),
+             tuple((getattr(d, "serial_number", "?"), r.lower()) for d, r in slaves),
+             tuple((getattr(d, "serial_number", "?"), r.lower()) for d, r in others))
+            for house, zone, masters, slaves, others in topo)
+
+    def _log_topology(self) -> None:
+        """Log the zone topology once after the first poll cycle and again whenever
+        it changes (a unit re-coupled, reset or re-added in the app): one line per
+        zone naming the Master and its Slaves with their roles - the picture one
+        otherwise notes down by hand before touching a zone in the app."""
+        if not self.devices:
+            return
+        topo = self._topology()
+        sig = self._topology_signature(topo)
+        if sig == self._topology_logged:
+            return
+        first = self._topology_logged is None
+        self._topology_logged = sig
+        houses = {h for h, *_ in topo}
+        many_houses = len(houses) > 1
+        head = "Zone topology" if first else "Zone topology changed"
+        for house, zone, masters, slaves, others in topo:
+            where = ("zone %s" % zone) if zone is not None else "no zone"
+            if many_houses:
+                where += " (house %s)" % house
+            parts = []
+            if masters:
+                parts.append("Master " + (", ".join(self._unit_label(d) for d in masters)
+                                          if len(masters) == 1 else
+                                          "(%d!) %s" % (len(masters), ", ".join(self._unit_label(d) for d in masters))))
+            elif slaves:
+                parts.append("no Master found")
+            if slaves:
+                parts.append("Slaves: " + ", ".join("%s %s" % (self._unit_label(d), r) for d, r in slaves))
+            elif masters and not others:
+                parts.append("no Slaves (standalone)")
+            if others:
+                parts.append("not coupled: " + ", ".join("%s %s" % (self._unit_label(d), r) for d, r in others))
+            log.info("%s - %s: %s", head, where, "; ".join(parts))
+
+    # ----- what a filter reset does on this unit (attributes of the button) -----
+    def _reset_info_payload(self, serial: str, device) -> dict:
+        """Attributes of the reset button and of Filter Reset Status: the unit's
+        role, whether the cloud reset clears ITS counter, and what the button does
+        here - so a button on a coupled Slave does not promise what it cannot do
+        (the Slave keeps its own counter; only a factory reset clears it)."""
+        master = self._zone_master(device)
+        role = self._live_role.get(serial) or getattr(device, "role", None) or "unknown"
+        ack = self._reset_log.get(serial, {})
+        if master is not None:
+            note = ("Coupled Slave: the cloud filter reset is accepted but not carried out by this "
+                    "unit, so its own filter counter stays. It clears with a factory reset of the unit "
+                    "(then set the unit up again in the app and assign it to its zone again). The "
+                    "button still sends the reset to this unit and to its zone Master %s, which "
+                    "clears the Master's counter%s." % (
+                        self._unit_label(master),
+                        ", and records the maintenance acknowledgement (slave_filter_soft_reset)"
+                        if self._soft_reset_enabled() else
+                        "; switch on slave_filter_soft_reset to record the maintenance as an "
+                        "acknowledgement instead"))
+            clears = False
+        elif str(role).lower() == "master":
+            note = ("Master: the cloud filter reset clears this unit's counter. Filter Reset Status "
+                    "confirms it against the real device status after the reset.")
+            clears = True
+        else:
+            note = ("Standalone or not coupled: the cloud filter reset is sent to this unit and "
+                    "confirmed against its real status.")
+            clears = True
+        return {
+            "device_role": str(role),
+            "zone_master": self._unit_label(master) if master is not None else None,
+            "cloud_reset_clears_counter": clears,
+            "note": note,
+            "last_reset_started": _iso_utc(ack["started"]) if ack.get("started") else None,
+            "last_reset_result": ack.get("result"),
+            "last_reset_result_at": _iso_utc(ack["result_at"]) if ack.get("result_at") else None,
+        }
+
+    def _publish_reset_info(self, serial: str, force: bool = False) -> None:
+        """Publish reset_info (retained) when it changed - or always with force
+        (reconnect). Never lets an error through."""
+        if self.client is None:
+            return
+        device = self.devices.get(serial)
+        if device is None:
+            return
+        try:
+            payload = self._reset_info_payload(serial, device)
+            if not force and self._reset_info_shown.get(serial) == payload:
+                return
+            info = self.client.publish(reset_info_topic(self.cfg.topic_prefix, serial),
+                                       json.dumps(payload), qos=0, retain=True)
+            if getattr(info, "rc", mqtt.MQTT_ERR_SUCCESS) == mqtt.MQTT_ERR_SUCCESS:
+                self._reset_info_shown[serial] = payload
+        except Exception as e:
+            log.debug("reset_info for %s not published: %s", serial, e)
+
+    def _refresh_reset_info(self) -> None:
+        """After a poll cycle: bring the reset info of every unit up to date (roles
+        may have changed)."""
+        for serial in list(self.devices):
+            self._publish_reset_info(serial)
 
     # ----- filter reset orchestration: dedupe, status sensor, persistence -----
     def _publish_reset_state(self, serial: str, state: str) -> None:
@@ -3603,6 +4081,8 @@ class AmbientikaBridge:
         self._pending_resets.add(serial)
         self._save_pending()
         self._publish_reset_state(serial, "running")
+        self._reset_log[serial] = {"started": self._wall_time(), "result": None, "result_at": None}
+        self._publish_reset_info(serial)
 
         task = asyncio.create_task(self._reset_filter(device))
         self._reset_tasks.add(task)
@@ -3621,6 +4101,9 @@ class AmbientikaBridge:
             self._publish_reset_state(serial, state)
             self._pending_resets.discard(serial)
             self._save_pending()
+            rec = self._reset_log.setdefault(serial, {})
+            rec["result"], rec["result_at"] = state, self._wall_time()
+            self._publish_reset_info(serial)
 
         task.add_done_callback(_done)
 
@@ -3675,9 +4158,10 @@ class AmbientikaBridge:
             reset clears the Master's own counter, a Slave keeps its own, and
             there is nothing to press at the unit either. So we do NOT claim the
             status "will follow on the next poll"; we say plainly that the counter
-            stays (the only way to clear it is a reset while the unit is a Master:
-            set it up as a standalone unit in the app for the moment, reset,
-            couple it back), and (if SLAVE_FILTER_SOFT_RESET is on) record a
+            stays (it clears with a factory reset of the unit, then set up again in
+            the app and assigned to its zone again - customer measurement Nov 2026;
+            a reset while the unit stands alone is the fallback), and (if
+            SLAVE_FILTER_SOFT_RESET is on) record a
             bridge-side "serviced" acknowledgement so dashboards can go green
             without faking the raw value.
         """
@@ -3744,8 +4228,10 @@ class AmbientikaBridge:
                 "cleared remotely. The manufacturer resets filters per zone through the "
                 "Master only: the reset clears the Master's counter, a Slave keeps its "
                 "own, and there is nothing to press at the unit either. To clear this "
-                "unit's own counter, set it up in the app as a standalone unit for the "
-                "moment, reset the filter, then couple it as a Slave again - or record "
+                "unit's own counter, factory-reset the unit (see its manual), then set it "
+                "up again in the app and assign it to its zone again - the factory reset "
+                "clears the counter; should the raw value still read Bad afterwards, reset "
+                "the filter while the unit stands alone, then couple it again. Or record "
                 "the maintenance acknowledgement (SLAVE_FILTER_SOFT_RESET=1). This is "
                 "how the units work, not a transient delay.", serial)
         else:
@@ -4126,6 +4612,11 @@ class AmbientikaBridge:
             # while the broker was away was never stored.
             for serial, state in list(self._reset_shown.items()):
                 self._publish_reset_state(serial, state)
+            # And for the reset info and the poll diagnostics (both retained).
+            for serial in list(self._reset_info_shown):
+                self._publish_reset_info(serial, force=True)
+            for serial in list(self._diag):
+                self._publish_diag(serial)
         except Exception as e:
             # Runs in paho's network thread: an exception here would end that thread.
             log.exception("Error after connecting to the MQTT broker: %s", e)
@@ -4657,13 +5148,16 @@ class AmbientikaBridge:
             self._avg_window = {}
             log.error("average_window_devices could not be applied (%r) - every unit "
                       "uses the global window.", e)
-        try:
-            self._resolve_humidity_hysteresis()
-        except Exception as e:      # an option typo must never stop the bridge
-            self._hum_hyst = {}
-            self._hum_avg_held = {}
-            log.error("humidity_avg_hysteresis_devices could not be applied (%r) - no unit "
-                      "uses a hysteresis.", e)
+        for key in ("humidity", "temperature"):
+            try:
+                self._resolve_hysteresis(key)
+            except Exception as e:      # an option typo must never stop the bridge
+                self._hyst[key] = {}
+                self._hyst_global[key] = 0.0
+                self._avg_held[key] = {}
+                label, option, _unit = self._HYST_LABEL[key]
+                log.error("%s / %s_devices could not be applied (%r) - no unit uses a "
+                          "hysteresis of %s.", option, option, e, label)
 
     def _publish_discovery(self) -> None:
         if not self.cfg.enable_discovery or self.client is None:
@@ -4699,8 +5193,7 @@ class AmbientikaBridge:
                             code = None
                         if code in (401, 403):
                             saw_auth_error = True
-                        log.warning("status() failed for %s: %s", serial, res)
-                        self._note_poll_failure(serial, "status() failed")
+                        self._note_poll_failure(serial, "status() failed", detail=str(res))
                         continue
                     s = res.unwrap()
                     # Remember the user's light-sensor level while the unit runs;
@@ -4724,8 +5217,24 @@ class AmbientikaBridge:
                     # An exception here used to publish nothing at all, so the
                     # entity silently kept its last retained values and looked
                     # live in the dashboard. Count it like any other failed poll.
-                    _log_cloud_exception("Error polling %s" % serial, e)
-                    self._note_poll_failure(serial, "exception during poll")
+                    # A connection problem of a unit already offline is logged
+                    # as the hourly summary; anything else as before.
+                    if _is_network_error(e) and self._poll_failure_quiet(serial):
+                        self._note_poll_failure(serial, "exception during poll",
+                                                detail="no connection to the Ambientika cloud (%s: %s)"
+                                                % (type(e).__name__, e))
+                    else:
+                        _log_cloud_exception("Error polling %s" % serial, e)
+                        self._note_poll_failure(serial, "exception during poll")
+
+            # Diagnostics after the cycle: the zone topology (once, and on every
+            # change) and what the filter reset does on each unit (follows the
+            # roles). Neither may ever cost a poll.
+            try:
+                self._log_topology()
+                self._refresh_reset_info()
+            except Exception as e:
+                log.debug("topology/reset info skipped: %s", e)
 
             # Token hygiene: re-auth on an explicit 401/403, if a whole cycle of
             # >=2 devices produced no success (an expired token looks like this), or
@@ -4909,6 +5418,11 @@ def main() -> None:
     log.info("Poll interval : %ss", cfg.poll_interval)
     log.info("Averaging     : %.0f min (humidity_avg, temperature_avg)",
              max(AVERAGE_WINDOW_S, AVERAGE_MIN_POLLS * max(1, cfg.poll_interval)) / 60.0)
+    _hh, _ = cfg.humidity_avg_hysteresis_value()
+    _th, _ = cfg.temperature_avg_hysteresis_value()
+    if _hh > 0 or _th > 0:
+        log.info("Hysteresis    : humidity_avg %g %%, temperature_avg %g °C (per-unit entries "
+                 "follow once the units are found)", _hh, _th)
 
     if not cfg.username or not cfg.password:
         log.error("Ambientika username/password missing. Set 'ambientika_username' and "

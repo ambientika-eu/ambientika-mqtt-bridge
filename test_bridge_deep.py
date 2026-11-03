@@ -4359,6 +4359,551 @@ async def test_dewpoint_fallback():
           and "dewpoint_fallback" in ent[0]["value_template"], ent)
 
 
+# --------------------------------------------------------------------------- 1.4.41
+class _Wall:
+    """Ersetzt die Wanduhr der Diagnose (AmbientikaBridge._wall_time) durch eine
+    verschiebbare Zeit, damit Zeitstempel im Test deterministisch sind."""
+
+    def __init__(self, t=1_762_200_000.0):          # 2025-11-03 ~ 20:40 UTC (irgendein fester Punkt)
+        self.t = t
+        self._orig = None
+
+    def __enter__(self):
+        self._orig = bridge.AmbientikaBridge._wall_time
+        bridge.AmbientikaBridge._wall_time = staticmethod(lambda: self.t)
+        return self
+
+    def __exit__(self, *a):
+        bridge.AmbientikaBridge._wall_time = self._orig
+
+
+def _diag_msgs(b, serial):
+    return [json.loads(pl) for tp, pl in b.client.pub if tp == bridge.diag_topic("ambientika", serial)]
+
+
+def _reset_info_msgs(b, serial):
+    return [json.loads(pl) for tp, pl in b.client.pub if tp == bridge.reset_info_topic("ambientika", serial)]
+
+
+def test_hysteresis_global_and_temperature():
+    """Hysterese fuer Temperature (averaged) und globale Vorgabewerte fuer beide
+    gemittelten Werte (Kundenvorschlag Nov. 2026, Bridge 1.4.41): die Option gab es
+    nur fuer die Feuchte und nur je Geraet."""
+    C = bridge.BridgeConfig
+
+    # A) Parsen des globalen Werts (Zahl aus options.json, Text, Suffix, null, Grenzen)
+    def glob(v, key="humidity"):
+        c = C()
+        setattr(c, key + "_avg_hysteresis", v)
+        return (c.humidity_avg_hysteresis_value() if key == "humidity"
+                else c.temperature_avg_hysteresis_value())
+    check("hyst-glob: Standard 0", glob(0.0) == (0.0, None) and C().humidity_avg_hysteresis == 0.0
+          and C().temperature_avg_hysteresis == 0.0)
+    check("hyst-glob: Zahl 1 (options.json)", glob(1) == (1.0, None))
+    check("hyst-glob: Text '1.5 %' (Umgebungsvariable)", glob("1.5 %") == (1.5, None))
+    check("hyst-glob: Temperatur '0.3 °C'", glob("0.3 °C", "temperature") == (0.3, None))
+    check("hyst-glob: Temperatur 0.5 Zahl", glob(0.5, "temperature") == (0.5, None))
+    for v in (None, "", "  ", "null", "None", False):
+        check("hyst-glob: leer %r -> 0 ohne Meldung" % (v,), glob(v) == (0.0, None), glob(v))
+    v, p = glob(20)
+    check("hyst-glob: 20 -> auf 10 begrenzt mit Meldung", v == 10.0 and p and "outside 0-10" in p and "using 10" in p, (v, p))
+    v, p = glob(-1, "temperature")
+    check("hyst-glob: -1 °C -> 0 mit Meldung", v == 0.0 and p and "outside 0-5" in p, (v, p))
+    v, p = glob("abc")
+    check("hyst-glob: unlesbar -> 0 mit Meldung", v == 0.0 and p and "not a number" in p, (v, p))
+    v, p = glob("1,5")
+    check("hyst-glob: Dezimalkomma -> unlesbar, 0 mit Meldung", v == 0.0 and p is not None, (v, p))
+    v, p = glob(float("nan"))
+    check("hyst-glob: NaN -> 0 mit Meldung", v == 0.0 and p is not None, (v, p))
+
+    # B) Parsen der Temperatur-Liste je Geraet
+    c = C()
+    c.temperature_avg_hysteresis_devices = "Gäste-Bad=0.3, SN-2=0.5 °C; Flur:1°\nWC=0.2K\r\nKeller=7"
+    e, p = c.temperature_avg_hysteresis_entries()
+    check("hyst-temp: Eintraege mit Einheiten, 7 auf 5 begrenzt",
+          [(lbl, v) for _, lbl, v in e] == [("Gäste-Bad", 0.3), ("SN-2", 0.5), ("Flur", 1.0), ("WC", 0.2),
+                                            ("Keller", 5.0)] and len(p) == 1 and "outside 0-5" in p[0], (e, p))
+
+    # C) Konfiguration: options.json (Zahl), YAML (bridge:), Umgebungsvariable, null
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    keys = ("HUMIDITY_AVG_HYSTERESIS", "TEMPERATURE_AVG_HYSTERESIS", "TEMPERATURE_AVG_HYSTERESIS_DEVICES",
+            "HUMIDITY_AVG_HYSTERESIS_DEVICES")
+    old_env = {k: os.environ.pop(k, None) for k in keys}
+    try:
+        pj = os.path.join(tmp, "options.json")
+        with open(pj, "w") as f:
+            json.dump({"ambientika_username": "u", "humidity_avg_hysteresis": 1.0,
+                       "temperature_avg_hysteresis": 0.3, "temperature_avg_hysteresis_devices": "Bad=0.5",
+                       "humidity_avg_hysteresis_devices": "Bad=2"}, f)
+        c = C.from_ha_options(pj)
+        check("hyst-cfg: options.json alle vier",
+              c.humidity_avg_hysteresis_value() == (1.0, None) and c.temperature_avg_hysteresis_value() == (0.3, None)
+              and c.temperature_avg_hysteresis_devices == "Bad=0.5" and c.humidity_avg_hysteresis_devices == "Bad=2",
+              vars(c))
+        with open(pj, "w") as f:
+            json.dump({"ambientika_username": "u", "humidity_avg_hysteresis": None,
+                       "temperature_avg_hysteresis_devices": None}, f)
+        c = C.from_ha_options(pj)
+        check("hyst-cfg: options.json null -> Standard",
+              c.humidity_avg_hysteresis_value() == (0.0, None) and c.temperature_avg_hysteresis_devices == "")
+        with open(pj, "w") as f:
+            json.dump({"ambientika_username": "u"}, f)
+        c = C.from_ha_options(pj)
+        check("hyst-cfg: options.json ohne Schluessel -> Standard (alte Installation)",
+              c.humidity_avg_hysteresis_value() == (0.0, None) and c.temperature_avg_hysteresis_value() == (0.0, None)
+              and c.temperature_avg_hysteresis_devices == "" and c.humidity_avg_hysteresis_devices == "")
+        yp = os.path.join(tmp, "config.yaml")
+        with open(yp, "w") as f:
+            f.write("bridge:\n  poll_interval: 30\n  humidity_avg_hysteresis: 1\n"
+                    "  temperature_avg_hysteresis: 0.4\n  temperature_avg_hysteresis_devices: \"Bad=0.2\"\n")
+        c = C.from_yaml(yp)
+        check("hyst-cfg: YAML bridge-Abschnitt",
+              c.humidity_avg_hysteresis_value() == (1.0, None) and c.temperature_avg_hysteresis_value() == (0.4, None)
+              and c.temperature_avg_hysteresis_devices == "Bad=0.2", vars(c))
+        os.environ["HUMIDITY_AVG_HYSTERESIS"] = "2"
+        os.environ["TEMPERATURE_AVG_HYSTERESIS"] = "0.5"
+        os.environ["TEMPERATURE_AVG_HYSTERESIS_DEVICES"] = "WC=1"
+        c = C.from_env()
+        check("hyst-cfg: Umgebungsvariablen",
+              c.humidity_avg_hysteresis_value() == (2.0, None) and c.temperature_avg_hysteresis_value() == (0.5, None)
+              and c.temperature_avg_hysteresis_devices == "WC=1")
+        os.environ["HUMIDITY_AVG_HYSTERESIS"] = "null"
+        os.environ["TEMPERATURE_AVG_HYSTERESIS"] = "null"
+        os.environ["TEMPERATURE_AVG_HYSTERESIS_DEVICES"] = "null"
+        c = C.from_env()
+        check("hyst-cfg: 'null' (bashio) -> Standard",
+              c.humidity_avg_hysteresis_value() == (0.0, None) and c.temperature_avg_hysteresis_value() == (0.0, None)
+              and c.temperature_avg_hysteresis_devices == "")
+    finally:
+        for k, v in old_env.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+    # D) Aufloesen: global + je Geraet, 0 je Geraet schaltet aus, Log
+    b, devs = _house_bridge(["Flur", "Gäste Bad", "Kinderzimmer"], hyd="Kinderzimmer=0, Gäste-Bad=1.5")
+    b.cfg.humidity_avg_hysteresis = 1
+    b.cfg.temperature_avg_hysteresis = "0.3"
+    b.cfg.temperature_avg_hysteresis_devices = "Flur=0"
+    with _LogCapture() as lc:
+        b._resolve_humidity_hysteresis()
+        b._resolve_temperature_hysteresis()
+    check("hyst-res: Feuchte - Flur global 1, Bad 1.5, Kinderzimmer 0",
+          [b._hysteresis_of("humidity", s) for s in ("SN-0", "SN-1", "SN-2")] == [1.0, 1.5, 0.0]
+          and b._hum_hyst == {"SN-1": 1.5, "SN-2": 0.0})
+    check("hyst-res: Temperatur - Flur 0 (eigener Eintrag), andere global 0.3",
+          [b._hysteresis_of("temperature", s) for s in ("SN-0", "SN-1", "SN-2")] == [0.0, 0.3, 0.3])
+    check("hyst-res: Startlog Feuchte mit 'all others 1 %'",
+          lc.has("INFO", "Humidity (averaged) hysteresis per unit: Gäste Bad 1.5 %, Kinderzimmer 0 % (off); all others 1 %."),
+          lc.lines)
+    check("hyst-res: Startlog Temperatur",
+          lc.has("INFO", "Temperature (averaged) hysteresis per unit: Flur 0 °C (off); all others 0.3 °C."), lc.lines)
+    b2, _ = _house_bridge(["Bad", "WC"])
+    b2.cfg.temperature_avg_hysteresis = 0.5
+    with _LogCapture() as lc:
+        b2._resolve_humidity_hysteresis()
+        b2._resolve_temperature_hysteresis()
+    check("hyst-res: nur global -> eine Zeile 'for every unit', Feuchte ohne Zeile",
+          lc.has("INFO", "Temperature (averaged) hysteresis: 0.5 °C for every unit.")
+          and not lc.has("INFO", "Humidity (averaged) hysteresis"), lc.lines)
+    b3, _ = _house_bridge(["Bad"])
+    b3.cfg.humidity_avg_hysteresis = "zwanzig"
+    b3.cfg.temperature_avg_hysteresis = 9
+    with _LogCapture() as lc:
+        b3._resolve_humidity_hysteresis()
+        b3._resolve_temperature_hysteresis()
+    check("hyst-res: unlesbar -> Warnung und 0; 9 °C -> Warnung und 5",
+          lc.has("WARNING", "humidity_avg_hysteresis: 'zwanzig' is not a number") and b3._hysteresis_of("humidity", "SN-0") == 0.0
+          and lc.has("WARNING", "temperature_avg_hysteresis: 9 °C is outside 0-5 - using 5")
+          and b3._hysteresis_of("temperature", "SN-0") == 5.0, lc.lines)
+
+    # E) Halten der Temperatur ueber den echten Payload-Pfad; Feuchte global
+    b, devs = _house_bridge(["Bad", "Flur"], awd="Bad=10")
+    b.cfg.temperature_avg_hysteresis = 0.3
+    b.cfg.humidity_avg_hysteresis = 1
+    b._resolve_average_windows()
+    b._resolve_humidity_hysteresis()
+    b._resolve_temperature_hysteresis()
+    seq_t = [21.0, 21.2, 20.9, 21.3, 21.4, 21.1, None, 21.2, 23.0, 22.9]
+    want_t = [21.0, 21.0, 21.0, 21.3, 21.3, 21.3, None, 21.2, 23.0, 23.0]
+    got_t = [b._hold_temperature_avg("SN-0", v) for v in seq_t]
+    check("hyst-temp: Halten bei 0.3 °C, unbekannt sofort und setzt zurueck", got_t == want_t, got_t)
+    check("hyst-temp: Feuchte-Halten unabhaengig davon (global 1 %)",
+          [b._hold_humidity_avg("SN-1", v) for v in [50.0, 50.5, 50.9, 51.0]] == [50.0, 50.0, 50.0, 51.0])
+    # Payload-Pfad: Rohtemperatur wechselt 21/22 je Abruf, das Mittel wandert um Zehntel
+    dev = devs["SN-0"]
+    out = []
+    with _Clock() as c:
+        for i in range(60):
+            c.t += 30
+            dev._status["temperature"] = 21 if i % 3 else 22
+            dev._status["humidity"] = 55 if i % 2 else 58
+            pl = b._state_payload("SN-0", dev, dict(dev._status))
+            out.append((pl["temperature"], pl["temperature_avg"], pl["humidity_avg"]))
+    raws = [o[0] for o in out]
+    avgs = [o[1] for o in out if o[1] is not None]
+    check("hyst-temp: Rohwert unveraendert, Mittel veroeffentlicht und gehalten (Spruenge >= 0.3 oder 0)",
+          raws == [21 if i % 3 else 22 for i in range(60)] and len(avgs) > 40
+          and all(d == 0 or d >= 0.3 - 1e-9 for d in (abs(a - b_) for a, b_ in zip(avgs, avgs[1:]))),
+          avgs[:12])
+    # Aenderung der globalen Hysterese verwirft gehaltene Werte
+    b.cfg.temperature_avg_hysteresis = 0.5
+    b._resolve_temperature_hysteresis()
+    check("hyst-temp: global geaendert -> gehaltene Werte verworfen", b._avg_held["temperature"] == {},
+          b._avg_held["temperature"])
+    b.cfg.temperature_avg_hysteresis = 0
+    b._resolve_temperature_hysteresis()
+    check("hyst-temp: 0 = aus", [b._hold_temperature_avg("SN-0", v) for v in seq_t] == seq_t)
+
+
+def test_discovery_1_4_41():
+    """Neue Entitaeten 1.4.41: Last Status Packet, Failed Polls (an der Verfuegbarkeit
+    der Bridge), Attribute an Reset-Knopf und Filter Reset Status."""
+    cfg = bridge.BridgeConfig()
+    ents = dict(bridge.build_discovery_configs(cfg, "AMB-2", "Kitchen"))
+    ls = ents.get("homeassistant/sensor/AMB-2_last_status/config")
+    fp = ents.get("homeassistant/sensor/AMB-2_poll_failures/config")
+    btn = ents.get("homeassistant/button/AMB-2_reset_filter/config")
+    rs = ents.get("homeassistant/sensor/AMB-2_reset_state/config")
+    check("disc41: Last Status Packet - timestamp, diagnostic, Bridge-Verfuegbarkeit, diagnostics-Topic",
+          ls and ls["device_class"] == "timestamp" and ls["entity_category"] == "diagnostic"
+          and ls["availability_topic"] == "ambientika/bridge/availability"
+          and ls["state_topic"] == "ambientika/AMB-2/diagnostics" and "last_status" in ls["value_template"]
+          and "default('None', true)" in ls["value_template"] and "state_class" not in ls, ls)
+    check("disc41: Failed Polls - total_increasing, Attribute aus demselben Topic",
+          fp and fp["state_class"] == "total_increasing" and fp["entity_category"] == "diagnostic"
+          and fp["availability_topic"] == "ambientika/bridge/availability"
+          and fp["json_attributes_topic"] == "ambientika/AMB-2/diagnostics"
+          and "poll_failures_total" in fp["value_template"]
+          and all(k in fp["json_attributes_template"] for k in
+                  ("consecutive_failures", "last_outage_start", "last_outage_end", "last_outage_polls",
+                   "last_failure_reason", "counting_since")) and "unit_of_measurement" not in fp, fp)
+    check("disc41: Reset-Knopf und Filter Reset Status tragen reset_info als Attribute",
+          btn and rs and btn["json_attributes_topic"] == "ambientika/AMB-2/reset_info"
+          and rs["json_attributes_topic"] == "ambientika/AMB-2/reset_info"
+          and rs["enabled_by_default"] is False and btn["availability_topic"] == "ambientika/AMB-2/availability",
+          (btn, rs))
+    uids = [p["unique_id"] for p in ents.values()]
+    check("disc41: unique_ids weiterhin eindeutig, alles JSON", len(uids) == len(set(uids))
+          and all(json.dumps(p) for p in ents.values()))
+    cfg2 = bridge.BridgeConfig()
+    cfg2.topic_prefix = "haus"
+    cfg2.discovery_prefix = "ha"
+    ents2 = dict(bridge.build_discovery_configs(cfg2, "X1", "Bad"))
+    check("disc41: Praefixe durchgereicht",
+          ents2["ha/sensor/X1_last_status/config"]["availability_topic"] == "haus/bridge/availability"
+          and ents2["ha/sensor/X1_poll_failures/config"]["state_topic"] == "haus/X1/diagnostics"
+          and ents2["ha/button/X1_reset_filter/config"]["json_attributes_topic"] == "haus/X1/reset_info")
+
+
+async def test_poll_diagnostics():
+    """Letztes Statuspaket und fehlgeschlagene Abrufe je Geraet (Kundenvorschlag
+    Nov. 2026: 1063 Logzeilen von Hand gezaehlt, Geraet war 9 h stromlos)."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.enable_discovery = False
+    cfg.poll_interval = 30
+    b = bridge.AmbientikaBridge(cfg)
+    b.client = FakeClient()
+    T0 = 1_762_200_000.0
+    with _Wall(T0) as w:
+        b._started_wall = w.t
+        # 1) erster erfolgreicher Abruf
+        b._note_poll_success("E05")
+        d = _diag_msgs(b, "E05")
+        check("diag: erster Erfolg -> last_status gesetzt, Zaehler 0, kein Ausfall",
+              len(d) == 1 and d[0]["last_status"] == bridge._iso_utc(T0) and d[0]["poll_failures_total"] == 0
+              and d[0]["poll_failures_consecutive"] == 0 and d[0]["last_failure"] is None
+              and d[0]["last_outage_start"] is None and d[0]["last_outage_end"] is None
+              and d[0]["last_outage_polls"] is None and d[0]["bridge_started"] == bridge._iso_utc(T0), d)
+        # 2) ein einzelner Aussetzer (404), dann wieder gut
+        w.t += 30
+        with _LogCapture() as lc:
+            b._note_poll_failure("E05", "status() failed")
+        d = _diag_msgs(b, "E05")[-1]
+        check("diag: 1. Fehlabruf -> total 1, consecutive 1, Ausfall begonnen, offen",
+              d["poll_failures_total"] == 1 and d["poll_failures_consecutive"] == 1
+              and d["last_failure"] == bridge._iso_utc(T0 + 30) and d["last_failure_reason"] == "status() failed"
+              and d["last_outage_start"] == bridge._iso_utc(T0 + 30) and d["last_outage_end"] is None
+              and d["last_outage_polls"] == 1 and d["last_status"] == bridge._iso_utc(T0), d)
+        check("diag: Verfuegbarkeit nach 1 von 3 unveraendert",
+              lc.has("INFO", "Poll 1/3 failed for E05") and not any(
+                  tp == "ambientika/E05/availability" and pl == "offline" for tp, pl in b.client.pub))
+        w.t += 30
+        with _LogCapture() as lc:
+            b._note_poll_success("E05")
+        d = _diag_msgs(b, "E05")[-1]
+        check("diag: Erfolg -> Ausfall geschlossen (1 Abruf), consecutive 0, last_status neu",
+              d["poll_failures_total"] == 1 and d["poll_failures_consecutive"] == 0
+              and d["last_outage_start"] == bridge._iso_utc(T0 + 30) and d["last_outage_end"] == bridge._iso_utc(T0 + 60)
+              and d["last_outage_polls"] == 1 and d["last_status"] == bridge._iso_utc(T0 + 60), d)
+        check("diag: Log 'answering again after 1 failed poll(s) since ...'",
+              lc.has("INFO", "Device E05 is answering again after 1 failed poll(s) since %s" % bridge._iso_utc(T0 + 30)),
+              lc.lines)
+        # 3) der Kundenfall: 1063 Abrufe lang 404 (knapp 9 h), dann wieder da
+        start = w.t + 30
+        b.client = FakeClient()
+        with _LogCapture() as lc:
+            for i in range(1063):
+                w.t += 30
+                b._note_poll_failure("E05", "status() failed")
+        d = _diag_msgs(b, "E05")[-1]
+        check("diag: waehrend des Ausfalls - 1063 Abrufe, offen, last_status steht auf dem letzten Paket",
+              d["poll_failures_total"] == 1064 and d["poll_failures_consecutive"] == 1063
+              and d["last_outage_start"] == bridge._iso_utc(start) and d["last_outage_end"] is None
+              and d["last_outage_polls"] == 1063 and d["last_status"] == bridge._iso_utc(T0 + 60), d)
+        check("diag: je Fehlabruf eine Diagnose-Nachricht (retained)",
+              len(_diag_msgs(b, "E05")) == 1063 and all(r for tp, pl, r in b.client.pubr
+                                                        if tp == "ambientika/E05/diagnostics"))
+        check("diag: offline nach 3 gemeldet, danach keine weitere Warnung je Abruf",
+              lc.has("WARNING", "Poll failed 3 times in a row for E05")
+              and sum(1 for lv, m in lc.lines if lv == "WARNING") == 1, [m for lv, m in lc.lines if lv == "WARNING"])
+        w.t += 30
+        end = w.t
+        with _LogCapture() as lc:
+            b._note_poll_success("E05")
+        d = _diag_msgs(b, "E05")[-1]
+        check("diag: Rueckkehr - Ausfall 1063 Abrufe von/bis, total bleibt 1064",
+              d["poll_failures_total"] == 1064 and d["poll_failures_consecutive"] == 0
+              and d["last_outage_start"] == bridge._iso_utc(start) and d["last_outage_end"] == bridge._iso_utc(end)
+              and d["last_outage_polls"] == 1063 and d["last_status"] == bridge._iso_utc(end), d)
+        check("diag: Dauer des Ausfalls im Log nachlesbar (since ...)",
+              lc.has("INFO", "answering again after 1063 failed poll(s) since %s" % bridge._iso_utc(start)), lc.lines)
+        # 4) zweites Geraet unabhaengig; Reconnect sendet alle Diagnosen neu
+        b._note_poll_success("CCD")
+        d2 = _diag_msgs(b, "CCD")[-1]
+        check("diag: anderes Geraet eigene Zaehler", d2["poll_failures_total"] == 0 and d2["last_outage_start"] is None)
+        b.client = FakeClient()
+        b.cfg.enable_discovery = False
+        b._on_mqtt_connect(b.client, None, None, 0)
+        check("diag: nach Reconnect beide Diagnosen erneut veroeffentlicht",
+              len(_diag_msgs(b, "E05")) == 1 and len(_diag_msgs(b, "CCD")) == 1
+              and _diag_msgs(b, "E05")[0]["poll_failures_total"] == 1064, b.client.pub[:4])
+        # 5) ohne Verbindung kein Absturz, Zaehler laufen weiter
+        b.client = None
+        b._note_poll_failure("E05", "exception during poll")
+        b._note_poll_success("E05")
+        check("diag: ohne Client kein Fehler", b._diag["E05"]["total"] == 1065)
+        # 6) Payload-Format: ISO 8601 mit Offset
+        iso = bridge._iso_utc(T0)
+        check("diag: ISO 8601 mit Offset", iso.endswith("+00:00") and "T" in iso, iso)
+        # 7) Logdetail der Cloud-Antwort: 3x Warnung bis zur Schwelle, dann einmal je Stunde
+        b.client = FakeClient()
+        b._poll_failures.pop("E05", None)
+        b._poll_fail_noted.pop("E05", None)
+        with _Clock(50000.0) as c, _LogCapture() as lc:
+            for i in range(130):                  # 65 min lang 404
+                c.t += 30
+                w.t += 30
+                b._note_poll_failure("E05", "status() failed", detail="<Failure: 404 Status packet not found!>")
+        warn = [m for lv, m in lc.lines if lv == "WARNING"]
+        detail = [m for m in warn if m.startswith("status() failed for E05: <Failure: 404")]
+        hourly = [m for m in detail if "failed polls in a row since" in m]
+        check("diag-log: 3 Detailwarnungen, 1x offline, Zusammenfassung bei Abruf 4 und nach 60 min",
+              len(detail) == 5 and len(hourly) == 2 and len(warn) == 6
+              and "4 failed polls in a row" in hourly[0] and "124 failed polls in a row" in hourly[1]
+              and "Next note in 60 min" in hourly[0], (len(warn), hourly))
+        check("diag-log: INFO 'Poll 1/3', 'Poll 2/3' wie bisher",
+              lc.has("INFO", "Poll 1/3 failed for E05") and lc.has("INFO", "Poll 2/3 failed for E05"), lc.lines[:4])
+        with _LogCapture() as lc:
+            b._note_poll_success("E05")
+            c2 = None
+        check("diag-log: Rueckkehr setzt den Stundentakt zurueck", "E05" not in b._poll_fail_noted
+              and lc.has("INFO", "answering again after 130 failed poll(s)"), lc.lines)
+        with _Clock(60000.0) as c, _LogCapture() as lc:
+            for i in range(4):
+                c.t += 30
+                w.t += 30
+                b._note_poll_failure("E05", "status() failed", detail="<Failure: 404>")
+        check("diag-log: neuer Ausfall -> wieder 3 Details + offline + erste Zusammenfassung",
+              sum(1 for lv, m in lc.lines if lv == "WARNING") == 5, lc.lines)
+        b._note_poll_success("E05")
+
+
+async def test_zone_topology_log():
+    """Zonen-Topologie beim Start ins Log, je Zone eine Zeile; bei Aenderung erneut
+    (Kundenvorschlag Nov. 2026: Rollen vor dem Werksreset von Hand notiert)."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.enable_discovery = False
+    b = bridge.AmbientikaBridge(cfg)
+    b.client = FakeClient()
+    flur = FakeDevice(serial="E05A1B9C0DAC", name="Flur", zone=0, status=mkstatus(op=OM.Smart))
+    flur.role = "Master"
+    rooms = {}
+    for sn, name in (("E05A1B9BAF0C", "Wohnzimmer"), ("CCDBA789F890", "Kinderzimmer"),
+                     ("AAAA00000001", "Schlafzimmer"), ("AAAA00000002", "Gäste Bad")):
+        d = FakeDevice(serial=sn, name=name, zone=0, status=mkstatus(op=OM.Smart))
+        d.role = "SlaveEqualMaster"
+        rooms[sn] = d
+    kueche = FakeDevice(serial="BBBB00000001", name="Küche", zone=1, status=mkstatus(op=OM.Smart))
+    kueche.role = "Master"
+    b.devices = {"E05A1B9C0DAC": flur, **rooms, "BBBB00000001": kueche}
+    for sn, d in b.devices.items():
+        b._device_house[sn] = 7
+    # vor dem ersten Abruf: Rollen aus der Geraetesuche
+    with _LogCapture() as lc:
+        b._log_topology()
+    z0 = [m for lv, m in lc.lines if m.startswith("Zone topology - zone 0")]
+    z1 = [m for lv, m in lc.lines if m.startswith("Zone topology - zone 1")]
+    check("topo: eine Zeile je Zone", len(z0) == 1 and len(z1) == 1 and len(lc.lines) == 2, lc.lines)
+    check("topo: Zone 0 - Master Flur, vier Slaves mit Rolle, sortiert nach Name",
+          z0 and z0[0] == ("Zone topology - zone 0: Master Flur (E05A1B9C0DAC); Slaves: "
+                           "Gäste Bad (AAAA00000002) SlaveEqualMaster, Kinderzimmer (CCDBA789F890) SlaveEqualMaster, "
+                           "Schlafzimmer (AAAA00000001) SlaveEqualMaster, Wohnzimmer (E05A1B9BAF0C) SlaveEqualMaster"),
+          z0)
+    check("topo: Zone 1 - Master allein", z1 and z1[0] == "Zone topology - zone 1: Master Küche (BBBB00000001); no Slaves (standalone)", z1)
+    check("topo: ohne zweites Haus kein Hauszusatz", "house" not in z0[0])
+    with _LogCapture() as lc:
+        b._log_topology()
+        b._log_topology()
+    check("topo: unveraendert -> nichts mehr geloggt", not lc.lines, lc.lines)
+    # Werksreset des Wohnzimmers: das Geraet meldet NotConfigured
+    rooms["E05A1B9BAF0C"]._status["device_role"] = "NotConfigured"
+    b._note_live_role("E05A1B9BAF0C", rooms["E05A1B9BAF0C"]._status)
+    with _LogCapture() as lc:
+        b._log_topology()
+    ch = [m for lv, m in lc.lines if m.startswith("Zone topology changed - zone 0")]
+    check("topo: Aenderung -> 'changed', Wohnzimmer als 'not coupled' mit gemeldeter Rolle",
+          len(ch) == 1 and "Slaves: Gäste Bad (AAAA00000002) SlaveEqualMaster, Kinderzimmer" in ch[0]
+          and ch[0].endswith("; not coupled: Wohnzimmer (E05A1B9BAF0C) NotConfigured")
+          and "Wohnzimmer (E05A1B9BAF0C) SlaveEqualMaster" not in ch[0], lc.lines)
+    check("topo: nur die geaenderte Zeile? - nein, das Bild komplett (Zone 1 wieder dabei)",
+          any(m.startswith("Zone topology changed - zone 1") for lv, m in lc.lines), lc.lines)
+    # wieder gekoppelt -> wieder wie vorher, eine 'changed'-Meldung
+    rooms["E05A1B9BAF0C"]._status["device_role"] = "SlaveEqualMaster"
+    b._note_live_role("E05A1B9BAF0C", rooms["E05A1B9BAF0C"]._status)
+    with _LogCapture() as lc:
+        b._log_topology()
+    check("topo: zurueckgekoppelt -> changed, wieder vier Slaves",
+          any(m.startswith("Zone topology changed - zone 0") and m.count("SlaveEqualMaster") == 4 for lv, m in lc.lines),
+          lc.lines)
+    # Zone ohne Master, zwei Haeuser, Geraet ohne Zone
+    b2 = bridge.AmbientikaBridge(cfg)
+    s1 = FakeDevice(serial="S1", name="Bad", zone=2, status=mkstatus(op=OM.Smart)); s1.role = "SlaveOppositeMaster"
+    m2 = FakeDevice(serial="M2", name="Keller", zone=0, status=mkstatus(op=OM.Smart)); m2.role = "Master"
+    n3 = FakeDevice(serial="N3", name="Neu", zone=None, status=mkstatus(op=OM.Smart)); n3.role = ""
+    b2.devices = {"S1": s1, "M2": m2, "N3": n3}
+    b2._device_house = {"S1": 1, "M2": 2, "N3": 2}
+    with _LogCapture() as lc:
+        b2._log_topology()
+    msgs = [m for lv, m in lc.lines]
+    check("topo: Slave ohne Master -> 'no Master found'; Hausangabe bei zwei Haeusern",
+          any(m == "Zone topology - zone 2 (house 1): no Master found; Slaves: Bad (S1) SlaveOppositeMaster" for m in msgs), msgs)
+    check("topo: Geraet ohne Zone und ohne Rolle",
+          any(m == "Zone topology - no zone (house 2): not coupled: Neu (N3) no role" for m in msgs), msgs)
+    check("topo: Reihenfolge Haus, dann Zone", msgs[0].startswith("Zone topology - zone 2 (house 1)")
+          and msgs[1].startswith("Zone topology - zone 0 (house 2)") and msgs[2].startswith("Zone topology - no zone"), msgs)
+    b3 = bridge.AmbientikaBridge(cfg)
+    with _LogCapture() as lc:
+        b3._log_topology()
+    check("topo: ohne Geraete nichts", not lc.lines)
+
+
+async def test_reset_info():
+    """Was der Filter-Reset auf diesem Geraet bewirkt - Attribute an Knopf und Status
+    (Kundenvorschlag Nov. 2026: der Knopf auf einem Slave verspricht sonst etwas,
+    das er nicht halten kann)."""
+    old_env = {k: os.environ.get(k) for k in ("SLAVE_FILTER_SOFT_RESET", "FILTER_ACK_PATH")}
+    os.environ["SLAVE_FILTER_SOFT_RESET"] = "0"
+    alt = bridge.FILTER_RESET_VERIFY_DELAY
+    bridge.FILTER_RESET_VERIFY_DELAY = 0.01
+    try:
+        cfg = bridge.BridgeConfig()
+        cfg.neuracell_enabled = False
+        cfg.dewpoint_enabled = False
+        cfg.enable_discovery = False
+        b = bridge.AmbientikaBridge(cfg)
+        b.client = FakeClient()
+        b.loop = asyncio.get_running_loop()
+        flur = FakeDevice(serial="FLUR", name="Flur", zone=0, status=mkstatus(op=OM.Smart))
+        flur.role = "Master"
+        wozi = FakeDevice(serial="WOZI", name="Wohnzimmer", zone=0, status=mkstatus(op=OM.Smart))
+        wozi.role = "SlaveEqualMaster"
+        wozi._status["filters_status"] = "Bad"
+        solo = FakeDevice(serial="SOLO", name="Keller", zone=3, status=mkstatus(op=OM.Smart))
+        solo.role = "NotConfigured"
+        b.devices = {"FLUR": flur, "WOZI": wozi, "SOLO": solo}
+        for sn, d in b.devices.items():
+            b._note_live_role(sn, d._status)
+        b._refresh_reset_info()
+        pw = _reset_info_msgs(b, "WOZI")
+        pf = _reset_info_msgs(b, "FLUR")
+        ps = _reset_info_msgs(b, "SOLO")
+        check("rinfo: je Geraet eine Nachricht (retained)",
+              len(pw) == 1 and len(pf) == 1 and len(ps) == 1
+              and all(r for tp, pl, r in b.client.pubr if tp.endswith("/reset_info")), b.client.pub)
+        check("rinfo: Slave - Rolle, Master, Zaehler bleibt, Hinweis Werksreset + Quittung einschalten",
+              pw[0]["device_role"] == "SlaveEqualMaster" and pw[0]["zone_master"] == "Flur (FLUR)"
+              and pw[0]["cloud_reset_clears_counter"] is False
+              and "factory reset" in pw[0]["note"] and "zone Master Flur (FLUR)" in pw[0]["note"]
+              and "switch on slave_filter_soft_reset" in pw[0]["note"]
+              and pw[0]["last_reset_started"] is None and pw[0]["last_reset_result"] is None, pw)
+        check("rinfo: Master - Zaehler wird geloescht", pf[0]["device_role"] == "Master" and pf[0]["zone_master"] is None
+              and pf[0]["cloud_reset_clears_counter"] is True and pf[0]["note"].startswith("Master:"), pf)
+        check("rinfo: NotConfigured - Einzelgeraet", ps[0]["device_role"] == "NotConfigured"
+              and ps[0]["cloud_reset_clears_counter"] is True and ps[0]["note"].startswith("Standalone"), ps)
+        b._refresh_reset_info()
+        check("rinfo: unveraendert -> nichts erneut gesendet", len(_reset_info_msgs(b, "WOZI")) == 1)
+        # Reset am Slave druecken: started -> Ergebnis unconfirmed mit Zeiten
+        async def fake_req(device, method, path, body):
+            return (200, None, "")
+        b._reset_request = fake_req
+        with _Wall(1_762_200_000.0) as w:
+            with _LogCapture() as lc:
+                b._start_reset(wozi)          # Startzeit wird sofort festgehalten ...
+                w.t += 12                     # ... das Ergebnis kommt (hier) 12 s spaeter
+                await asyncio.sleep(0.3)
+        pw = _reset_info_msgs(b, "WOZI")
+        states = [pl for tp, pl in b.client.pub if tp == bridge.reset_state_topic("ambientika", "WOZI")]
+        check("rinfo: Status running -> unconfirmed", states == ["running", "unconfirmed"], states)
+        check("rinfo: Attribute - gestartet, Ergebnis unconfirmed mit Zeit",
+              len(pw) == 3 and pw[1]["last_reset_started"] == bridge._iso_utc(1_762_200_000.0)
+              and pw[1]["last_reset_result"] is None and pw[2]["last_reset_result"] == "unconfirmed"
+              and pw[2]["last_reset_result_at"] == bridge._iso_utc(1_762_200_012.0)
+              and pw[2]["last_reset_started"] == pw[1]["last_reset_started"], pw)
+        check("rinfo: Slave-Warnung nennt den Werksreset",
+              lc.has("WARNING", "this is a SLAVE", "factory-reset the unit"), lc.lines)
+        # Quittung eingeschaltet -> Hinweis nennt sie
+        os.environ["SLAVE_FILTER_SOFT_RESET"] = "1"
+        os.environ["FILTER_ACK_PATH"] = os.path.join(_tempfile.mkdtemp(), "filter_ack.json")
+        b._refresh_reset_info()
+        pw = _reset_info_msgs(b, "WOZI")
+        check("rinfo: mit Quittung -> 'records the maintenance acknowledgement'",
+              "records the maintenance acknowledgement" in pw[-1]["note"], pw[-1]["note"])
+        # Rollenwechsel (Werksreset) -> Attribute folgen
+        wozi._status["device_role"] = "NotConfigured"
+        b._note_live_role("WOZI", wozi._status)
+        b._refresh_reset_info()
+        pw = _reset_info_msgs(b, "WOZI")
+        check("rinfo: Rolle geaendert -> neu, Zaehler loeschbar, letzter Reset bleibt sichtbar",
+              pw[-1]["device_role"] == "NotConfigured" and pw[-1]["cloud_reset_clears_counter"] is True
+              and pw[-1]["last_reset_result"] == "unconfirmed", pw[-1])
+        # Reconnect sendet alle drei erneut, auch unveraendert
+        b.client = FakeClient()
+        b._on_mqtt_connect(b.client, None, None, 0)
+        check("rinfo: Reconnect -> alle erneut",
+              len(_reset_info_msgs(b, "WOZI")) == 1 and len(_reset_info_msgs(b, "FLUR")) == 1
+              and len(_reset_info_msgs(b, "SOLO")) == 1)
+        # unbekanntes Geraet / ohne Client: kein Fehler
+        b._publish_reset_info("GIBTSNICHT")
+        b.client = None
+        b._publish_reset_info("WOZI")
+        b._refresh_reset_info()
+    finally:
+        bridge.FILTER_RESET_VERIFY_DELAY = alt
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        bridge._FILTER_ACK_GOOD_STREAK.clear()
+        bridge._FILTER_ACK_ODD_RAW.clear()
+
+
 async def _async_suite():
     await test_neuracell()
     await test_neuracell_scoped()
@@ -4388,6 +4933,9 @@ async def _async_suite():
     await test_average()
     await test_average_per_device_discovery()
     await test_humidity_hysteresis_discovery()
+    await test_poll_diagnostics()
+    await test_zone_topology_log()
+    await test_reset_info()
 
 
 def main():
@@ -4402,6 +4950,8 @@ def main():
     test_average_discovery_and_env()
     test_average_per_device()
     test_humidity_hysteresis()
+    test_hysteresis_global_and_temperature()
+    test_discovery_1_4_41()
     asyncio.run(_async_suite())
     print("\nRESULT:", "ALL PASS" if not FAILS else f"{len(FAILS)} FAIL -> {FAILS}")
     return 1 if FAILS else 0

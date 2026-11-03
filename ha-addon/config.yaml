@@ -1,6 +1,6 @@
 name: "Ambientika MQTT Bridge"
 description: "MQTT bridge for Ambientika ventilation units. Connects the Ambientika Cloud API to your local MQTT broker with Home Assistant Auto-Discovery support. Includes NeuraCell-X radon protection + dew-point control (Taupunktsteuerung)."
-version: "1.4.40"
+version: "1.4.41"
 slug: "ambientika_mqtt_bridge"
 init: false
 arch:
@@ -68,8 +68,14 @@ options:
   average_window_min: 30
   # Eigenes Fenster je Geraet: "Seriennummer=Minuten" (sicher) oder "Name wie in der App=Minuten", z. B. "A1B2C3D4E5F6=15, Schlafzimmer=60" (leer = alle wie oben)
   average_window_devices: ""
-  # Hysterese fuer Humidity (averaged) je Geraet in %-Punkten (0-10): "Seriennummer=1" oder "Name wie in der App=1" (leer = keine)
+  # Hysterese fuer Humidity (averaged) in %-Punkten (0-10, 0 = keine): fuer alle Geraete ...
+  humidity_avg_hysteresis: 0.0
+  # ... und je Geraet (ueberschreibt den Wert oben): "Seriennummer=1" oder "Name wie in der App=1" (leer = alle wie oben, "=0" schaltet ab)
   humidity_avg_hysteresis_devices: ""
+  # Hysterese fuer Temperature (averaged) in °C (0-5, 0 = keine): fuer alle Geraete ...
+  temperature_avg_hysteresis: 0.0
+  # ... und je Geraet: "Seriennummer=0.3" oder "Name wie in der App=0.3"
+  temperature_avg_hysteresis_devices: ""
   # --- Filter-Wartungsquittung fuer Slave-Einheiten ---
   slave_filter_soft_reset: false
   filter_ack_ttl_days: 90
@@ -124,7 +130,10 @@ schema:
   command_coalesce_ms: int(0,10000)
   average_window_min: int(1,240)
   average_window_devices: str?
+  humidity_avg_hysteresis: float(0,10)?
   humidity_avg_hysteresis_devices: str?
+  temperature_avg_hysteresis: float(0,5)?
+  temperature_avg_hysteresis_devices: str?
   # --- Filter-Wartungsquittung ---
   slave_filter_soft_reset: bool
   filter_ack_ttl_days: int(1,3650)
