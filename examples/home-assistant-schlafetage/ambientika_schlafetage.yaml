@@ -688,6 +688,36 @@ automation:
             {%- else %} Bitte kurz vom Strom nehmen und wieder einstecken.
             {%- endif %}
 
+  # Hinweis aufs Handy, wenn die Notlueftung der Bridge anspringt bzw. endet
+  # (ab Bridge 1.4.40): Taupunktsperre aktiv, aber Taupunktsteuerung und
+  # Radon-Messgeraet beide nicht verbunden - nach dewpoint_fallback_timeout
+  # laufen die gesperrten Geraete mit Waermerueckgewinnung auf kleiner Stufe,
+  # bis sich eines der beiden Geraete wieder meldet.
+  - id: ambientika_notlueftung_hinweis
+    alias: "Ambientika NeuraCell-X – Notlüftung Hinweis"
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.neuracell_x_fallback_ventilation_active
+        from: "off"
+        to: "on"
+        id: "an"
+      - platform: state
+        entity_id: binary_sensor.neuracell_x_fallback_ventilation_active
+        from: "on"
+        to: "off"
+        id: "aus"
+    action:
+      - service: notify.notify
+        data:
+          title: "NeuraCell-X"
+          message: >
+            {% if trigger.id == 'an' %}
+            Notlüftung: Taupunktsteuerung und Radon-Messgerät sind beide nicht verbunden, die gesperrten Geräte laufen mit Wärmerückgewinnung auf kleiner Stufe. Bitte beide Geräte prüfen (kurz vom Strom nehmen).
+            {% else %}
+            Notlüftung beendet – Taupunktsteuerung oder Radon-Messgerät melden sich wieder, die Lüftung folgt wieder der Taupunktsteuerung.
+            {% endif %}
+
   # Selbstheilung: Radon-Messgeraet nach 10 Minuten ohne Verbindung ueber die
   # Steckdose neu starten, hoechstens einmal pro Stunde. Kommt es danach nicht
   # zurueck, wird alle 30 Minuten geprueft und nach Ablauf der Stunde erneut

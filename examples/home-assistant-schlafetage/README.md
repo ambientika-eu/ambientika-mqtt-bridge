@@ -8,7 +8,7 @@ Fertiges Paket für eine Etage mit mehreren Ambientika SMART/OFFICE über die Am
 - **Morgens:** zurück in den sensorgeführten SMART-Betrieb.
 - **Wochentage:** Montag bis Freitag und Samstag/Sonntag haben getrennte Uhrzeiten, alle vier sind im Dashboard einstellbar.
 - **Button „Schlafetage 20 min durchlüften“:** für jedes Familienmitglied. Danach läuft die Etage wieder wie vorher.
-- **Handy-Hinweis:** wenn der Radonschutz anspringt oder endet, und wenn Radon-Messgerät oder Taupunktsteuerung länger als 20 Minuten nicht verbunden sind.
+- **Handy-Hinweis:** wenn der Radonschutz anspringt oder endet, wenn Radon-Messgerät oder Taupunktsteuerung länger als 20 Minuten nicht verbunden sind, und wenn die Notlüftung der Bridge anspringt oder endet (ab Bridge 1.4.40: Taupunktsperre aktiv, aber beide Geräte nicht verbunden – die gesperrten Geräte laufen dann mit Wärmerückgewinnung auf kleiner Stufe, Sensor *Fallback Ventilation Active*).
 - **Selbstheilung (optional):** Radon-Messgerät und Taupunktsteuerung werden über eine schaltbare Steckdose automatisch neu gestartet, wenn sie 10 Minuten nicht verbunden sind – siehe unten.
 - **Radonvorrang:** Solange NeuraCell-X den Radonschutz aktiv hat, pausieren alle Automationen.
 

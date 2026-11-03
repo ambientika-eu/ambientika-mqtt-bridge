@@ -4027,9 +4027,19 @@ async def test_neuracell_slave_no_repeat():
     for _ in range(4):
         await nc.enforce()
     check("slave: Radon aktiv -> keine Wiederholung", len(s.mode_calls) == n, s.mode_calls)
+    # Sperre wechselt waehrend des Radonschutzes: alle bleiben in Zuluft, kein einziger neuer Befehl
+    calls = (len(m.mode_calls), len(s.mode_calls), len(e.mode_calls))
+    await nc.on_dewpoint_block("OFF")
+    await nc.on_dewpoint_block("ON")
+    check("slave: Sperre wechselt waehrend Radon -> keine Befehle",
+          (len(m.mode_calls), len(s.mode_calls), len(e.mode_calls)) == calls
+          and m._status["operating_mode"] == RP and e._status["operating_mode"] == RP,
+          (calls, len(m.mode_calls), len(s.mode_calls), len(e.mode_calls)))
     await nc.on_radon_value("50")
     check("slave: Radon weg, Sperre aktiv -> Slave wieder aus",
           s.mode_calls[-1]["operating_mode"] == OM.Off, s.mode_calls)
+    check("slave: Radon weg -> Eltern einmal zurueck, Master einmal aus",
+          e.mode_calls[-1]["operating_mode"] == OM.ManualHeatRecovery and m.mode_calls[-1]["operating_mode"] == OM.Off)
 
 def test_cloud_error_log():
     """Verbindungsabbrueche zur Cloud: eine Zeile statt Traceback (Praxisfall Nov. 2026)."""
@@ -4046,13 +4056,13 @@ def test_cloud_error_log():
     h = Cap()
     bridge.log.addHandler(h)
     try:
-        bridge._log_cloud_exception("Error polling", "SER1", _ah.ConnectionTimeoutError(
+        bridge._log_cloud_exception("Error polling SER1", _ah.ConnectionTimeoutError(
             "Connection timeout to host https://app.ambientika.eu:4521/device/device-status"))
-        bridge._log_cloud_exception("Error polling", "SER1", asyncio.TimeoutError())
+        bridge._log_cloud_exception("Error polling SER1", asyncio.TimeoutError())
         try:
             raise KeyError("Night")
         except KeyError as e:
-            bridge._log_cloud_exception("Error polling", "SER1", e)
+            bridge._log_cloud_exception("Error polling SER1", e)
     finally:
         bridge.log.removeHandler(h)
     net = h.recs[:2]
@@ -4066,10 +4076,294 @@ def test_cloud_error_log():
           and not bridge._is_network_error(ValueError("x")))
 
 
+async def test_dewpoint_fallback():
+    """1.4.40: Notluftung - Sperre aktiv, aber Taupunktsteuerung UND Radon-Messgeraet weg.
+
+    Praxisfall: Keller mit zwei OFFICE an TPS und Radon-Messgeraet. Faellt
+    das WLAN im Keller kurz aus, melden sich beide ab; die Sperre (Geraete aus)
+    bliebe mit dewpoint_lost_action=keep bestehen und niemand misst mehr Radon.
+    Nach dewpoint_fallback_timeout laufen die gesperrten Geraete mit
+    Waermerueckgewinnung (ManualHeatRecovery) auf dewpoint_fallback_fan, bis
+    sich eines der beiden Geraete wieder meldet.
+    """
+    import time as _t
+
+    class Msg:
+        def __init__(self, t, p, retain=False):
+            self.topic, self.payload, self.retain = t, p.encode(), retain
+
+    def mkbridge(**kw):
+        cfg = bridge.BridgeConfig()
+        cfg.dewpoint_block_devices = "OFF-1,OFF-2"
+        cfg.radon_threshold = 100
+        cfg.radon_hysteresis = 10
+        for k, v in kw.items():
+            setattr(cfg, k, v)
+        b = bridge.AmbientikaBridge(cfg)
+        b.client = FakeClient()
+        b.loop = asyncio.get_running_loop()
+        o1 = FakeDevice(serial="OFF-1", name="Keller links", zone=1, status=mkstatus(op=OM.Smart))
+        o1.role = "Master"
+        o2 = FakeDevice(serial="OFF-2", name="Keller rechts", zone=1, status=mkstatus(op=OM.Smart))
+        o2.role = "SlaveOppositeMaster"
+        sm = FakeDevice(serial="SM-1", name="Eltern", zone=3, status=mkstatus(op=OM.Night))
+        sm.role = "Master"
+        b.devices = {d.serial_number: d for d in (o1, o2, sm)}
+        pending = []
+        b._dispatch = lambda coro: pending.append(coro)
+
+        async def mq(t, p, retain=False):
+            b._on_mqtt_message(None, None, Msg(t, p, retain))
+            while pending:
+                await pending.pop(0)
+        return b, o1, o2, sm, mq
+
+    def state(b):
+        return [json.loads(p) for t, p in b.client.pub if t.endswith("neuracell/state")][-1]
+
+    def mode(d):
+        return d._status["operating_mode"], d._status["fan_speed"]
+
+    ST, AV = "dew-point/TP_1/state", "dew-point/TP_1/availability/state"
+    MS, MA = "radon/Radon_1/state", "radon/Radon_1/availability/state"
+    MHR, RP = bridge.DEWPOINT_FALLBACK_MODE, bridge.RADON_PROTECTION_MODE
+
+    async def blind_setup(**kw):
+        """Sperre aktiv, dann TPS und Messgeraet per Last Will weg."""
+        b, o1, o2, sm, mq = mkbridge(**kw)
+        nc = b.neuracell
+        await mq(MA, "online")
+        await mq(MS, '{"mittelwert": 40}')
+        await mq(AV, "online")
+        await mq(ST, '{"ventilating": false, "reason": "aussen zu feucht"}')
+        return b, nc, o1, o2, sm, mq
+
+    with _LogCapture() as lc:
+        b, nc, o1, o2, sm, mq = await blind_setup()
+        check("fallback: Standard 30 min / Low", b.cfg.dewpoint_fallback_timeout == 30
+              and b.cfg.dewpoint_fallback_fan_speed == FS.Low)
+        check("fallback: Sperre -> OFFICE aus, SMART unberuehrt",
+              mode(o1)[0] == OM.Off and len(o2.mode_calls) == 1 and mode(sm)[0] == OM.Night)
+        check("fallback: Sensor im Status, anfangs aus", state(b).get("dewpoint_fallback") is False)
+        await mq(AV, "offline")
+        check("fallback: nur TPS weg -> nicht scharf", nc._blind_since is None and not nc.dewpoint_fallback)
+        await mq(MA, "offline")
+        check("fallback: TPS und Messgeraet weg -> scharf, noch nichts geschaltet",
+              nc._blind_since is not None and not nc.dewpoint_fallback and mode(o1)[0] == OM.Off)
+        check("fallback: Ankuendigung im Log", lc.has("WARNING", "fallback ventilation", "in 30 min"))
+        # 29 min: noch nichts; Geraete bleiben aus, Slave bekommt nichts
+        nc._blind_since = _t.monotonic() - 29 * 60
+        n2 = len(o2.mode_calls)
+        for _ in range(3):
+            await nc.enforce()
+        check("fallback: vor Ablauf bleibt alles aus", mode(o1)[0] == OM.Off and not nc.dewpoint_fallback
+              and len(o2.mode_calls) == n2)
+        # 31 min: Notlueftung
+        nc._blind_since = _t.monotonic() - 31 * 60
+        await nc.enforce()
+        check("fallback: nach 30 min Waermerueckgewinnung Low am Master",
+              nc.dewpoint_fallback and mode(o1) == (MHR, FS.Low), mode(o1))
+        check("fallback: Slave bekommt den Zustand genau einmal",
+              len(o2.mode_calls) == n2 + 1 and o2.mode_calls[-1]["operating_mode"] == MHR
+              and o2.mode_calls[-1]["fan_speed"] == FS.Low, o2.mode_calls)
+        check("fallback: SMART weiter unberuehrt", mode(sm)[0] == OM.Night and not sm.mode_calls)
+        check("fallback: Status zeigt Notlueftung", state(b).get("dewpoint_fallback") is True
+              and state(b).get("dewpoint_block") is True)
+        check("fallback: Log nennt Start", lc.has("WARNING", "fallback ventilation - Taupunktsteuerung and radon meter"))
+        check("fallback: Baseline der OFFICE bleibt Smart",
+              nc._saved_modes["OFF-1"]["operating_mode"] == OM.Smart and nc._applied["OFF-1"] == (MHR, FS.Low))
+        for _ in range(4):
+            await nc.enforce()
+        check("fallback: keine Wiederholungen", len(o2.mode_calls) == n2 + 1 and len(o1.mode_calls) == 2, o1.mode_calls)
+        # Benutzer verstellt den Master waehrend der Notlueftung -> wie bei der Sperre zurueckgesetzt
+        o1._status["operating_mode"] = OM.Smart
+        await nc.enforce()
+        check("fallback: verstellter Master wird wieder gesetzt", mode(o1) == (MHR, FS.Low))
+        # Neustart-Pruefung: Slave gilt als geschuetzt, Master mit MHR ebenso
+        check("fallback: _still_protected", nc._still_protected("OFF-1", dict(o1._status), o1)
+              and nc._still_protected("OFF-2", dict(o2._status), o2))
+        # Messgeraet meldet sich: "online" allein reicht nicht (erster Wert ~10 min spaeter),
+        # erst ein aktueller Wert (niedrig) beendet die Notlueftung, Sperre gilt wieder
+        await mq(MA, "online")
+        check("fallback: Messgeraet nur online -> Notlueftung bleibt", nc.dewpoint_fallback and mode(o1)[0] == MHR)
+        await mq(MS, '{"mittelwert": 0}')
+        check("fallback: Startwert 0 -> Notlueftung bleibt", nc.dewpoint_fallback and mode(o1)[0] == MHR)
+        await mq(MS, '{"mittelwert": 40}')
+        check("fallback: Messgeraet zurueck -> Ende, OFFICE wieder aus",
+              not nc.dewpoint_fallback and mode(o1)[0] == OM.Off and o2.mode_calls[-1]["operating_mode"] == OM.Off)
+        check("fallback: Ende im Log", lc.has("WARNING", "fallback ventilation ended", "radon meter reporting again"))
+        check("fallback: Status wieder aus", state(b).get("dewpoint_fallback") is False)
+        # Messgeraet wieder weg -> neue Ankuendigung, neue Frist
+        await mq(MA, "offline")
+        check("fallback: erneut scharf", nc._blind_since is not None and not nc.dewpoint_fallback)
+        nc._blind_since = _t.monotonic() - 31 * 60
+        await nc.enforce()
+        check("fallback: zweite Notlueftung", nc.dewpoint_fallback and mode(o1) == (MHR, FS.Low))
+        # TPS meldet sich mit Freigabe -> Sperre weg, Baseline zurueck
+        await mq(AV, "online")
+        await mq(ST, '{"ventilating": true, "reason": "ok"}')
+        check("fallback: TPS gibt frei -> Smart zurueck, Notlueftung aus",
+              not nc.dewpoint_fallback and mode(o1)[0] == OM.Smart and not nc._saved_modes
+              and o2.mode_calls[-1]["operating_mode"] == OM.Smart, (mode(o1), nc._saved_modes))
+        check("fallback: Ende im Log, Grund TPS zurueck", lc.has("WARNING", "fallback ventilation ended", "Taupunktsteuerung connected again"))
+
+    # Radon waehrend der Notlueftung: Radon gewinnt, danach keine Notlueftung solange Radon aktiv
+    b, nc, o1, o2, sm, mq = await blind_setup()
+    await mq(AV, "offline")
+    await mq(MA, "offline")
+    nc._blind_since = _t.monotonic() - 31 * 60
+    await nc.enforce()
+    check("fallback/radon: Notlueftung aktiv", nc.dewpoint_fallback)
+    await mq(MA, "online")
+    await mq(MS, '{"mittelwert": 250}')
+    check("fallback/radon: Radon -> alle Zuluft, Notlueftung aus",
+          nc.radon_active and not nc.dewpoint_fallback and mode(o1)[0] == RP and mode(sm)[0] == RP)
+    await mq(MA, "offline")
+    for _ in range(3):
+        await nc.enforce()
+    check("fallback/radon: Messgeraet weg, Radonschutz bleibt -> keine Notlueftung",
+          nc.radon_active and nc._blind_since is None and mode(o1)[0] == RP)
+    await mq(MA, "online")
+    await mq(MS, '{"mittelwert": 50}')
+    check("fallback/radon: Radon vorbei -> OFFICE wieder aus (Sperre), SMART zurueck",
+          mode(o1)[0] == OM.Off and mode(sm)[0] == OM.Night)
+
+    # Option 0 = aus
+    b, nc, o1, o2, sm, mq = await blind_setup(dewpoint_fallback_timeout=0)
+    await mq(AV, "offline")
+    await mq(MA, "offline")
+    check("fallback/0: nicht scharf", nc._blind_since is None)
+    for _ in range(3):
+        await nc.enforce()
+    check("fallback/0: bleibt aus", not nc.dewpoint_fallback and mode(o1)[0] == OM.Off)
+
+    # Stufe konfigurierbar
+    b, nc, o1, o2, sm, mq = await blind_setup(dewpoint_fallback_fan="Medium", dewpoint_fallback_timeout=10)
+    await mq(AV, "offline")
+    await mq(MA, "offline")
+    nc._blind_since = _t.monotonic() - 11 * 60
+    await nc.enforce()
+    check("fallback/fan: Medium", nc.dewpoint_fallback and mode(o1) == (MHR, FS.Medium), mode(o1))
+    b.cfg.dewpoint_fallback_fan = "Turbo"
+    b.cfg.radon_protection_fan = "Night"
+    check("fallback/fan: Night/Turbo (nur vom Geraet waehlbar) -> Low",
+          b.cfg.dewpoint_fallback_fan_speed == FS.Low and b.cfg.radon_protection_fan_speed == FS.Low)
+    b.cfg.dewpoint_fallback_fan = "Foo"
+    check("fallback/fan: unbekannt -> Low", b.cfg.dewpoint_fallback_fan_speed == FS.Low)
+
+    # dewpoint_lost_action=release: TPS weg -> Freigabe, also keine Sperre und keine Notlueftung
+    b, nc, o1, o2, sm, mq = await blind_setup(dewpoint_lost_action="release")
+    await mq(AV, "offline")
+    await mq(MA, "offline")
+    check("fallback/release: Sperre weg, nicht scharf", not nc.dewpoint_block and nc._blind_since is None
+          and mode(o1)[0] == OM.Smart)
+
+    # dewpoint_lost_action=block: Sperre bleibt, Notlueftung greift genauso
+    b, nc, o1, o2, sm, mq = await blind_setup(dewpoint_lost_action="block")
+    await mq(AV, "offline")
+    await mq(MA, "offline")
+    nc._blind_since = _t.monotonic() - 31 * 60
+    await nc.enforce()
+    check("fallback/block: Notlueftung auch bei lost_action=block", nc.dewpoint_fallback and mode(o1)[0] == MHR)
+
+    # Ohne Radon-Messgeraet (nur TPS): keine Notlueftung - es gibt nichts zu bewachen
+    b, o1, o2, sm, mq = mkbridge()
+    nc = b.neuracell
+    await mq(AV, "online")
+    await mq(ST, '{"ventilating": false}')
+    await mq(AV, "offline")
+    for _ in range(3):
+        await nc.enforce()
+    check("fallback/kein Messgeraet: nicht scharf", nc._blind_since is None and mode(o1)[0] == OM.Off)
+
+    # Gespeichertes "online" nach Reconnect ist kein Lebenszeichen: Notlueftung bleibt
+    b, nc, o1, o2, sm, mq = await blind_setup()
+    await mq(AV, "offline")
+    await mq(MA, "offline")
+    nc._blind_since = _t.monotonic() - 31 * 60
+    await nc.enforce()
+    nc.on_broker_connected()
+    await mq(AV, "online", retain=True)
+    await mq(MA, "online", retain=True)
+    await mq(ST, '{"ventilating": false}', retain=True)
+    await nc.enforce()
+    check("fallback/reconnect: gespeichertes online haelt die Notlueftung nicht an",
+          nc.dewpoint_fallback and mode(o1) == (MHR, FS.Low), (nc.dewpoint_fallback, mode(o1)))
+    await mq("dew-point/TP_1/sensors", '{"indoor": {"temp": 19}}')
+    check("fallback/reconnect: Lebenszeichen der TPS -> Ende, Sperre gilt wieder",
+          not nc.dewpoint_fallback and mode(o1)[0] == OM.Off)
+
+    # Persistenz: Notlueftung wird gespeichert und nach einem Neustart fortgesetzt
+    b, nc, o1, o2, sm, mq = await blind_setup()
+    await mq(AV, "offline")
+    await mq(MA, "offline")
+    nc._blind_since = _t.monotonic() - 31 * 60
+    await nc.enforce()
+    nc.persist()
+    saved = json.load(open(bridge.NEURACELL_STATE_FILE))
+    check("fallback/persist: Datei nennt Notlueftung", saved.get("dewpoint_fallback") is True
+          and saved["applied"]["OFF-1"]["operating_mode"] == "ManualHeatRecovery", saved)
+    # Neue Bridge wie nach einem Neustart: Geraete stehen noch in MHR/Low
+    b2, p1, p2, psm, mq2 = mkbridge()
+    p1._status.update({"operating_mode": MHR, "fan_speed": FS.Low})
+    p2._status.update({"operating_mode": OM.Smart})          # Slave: eigenes Feld unveraendert
+    nc2 = b2.neuracell
+    nc2.load_persisted()
+    check("fallback/persist: fortgesetzt", nc2.dewpoint_fallback and nc2._fallback_from_disk
+          and "OFF-1" in nc2._saved_modes)
+    # Stored block message arrives (retained), TPS/meter unknown -> stays
+    await mq2(ST, '{"ventilating": false}', retain=True)
+    await mq2(AV, "online", retain=True)
+    await mq2(MA, "offline", retain=True)
+    await nc2.enforce()
+    check("fallback/persist: nach Neustart bleibt die Notlueftung, kein Off",
+          nc2.dewpoint_fallback and mode(p1) == (MHR, FS.Low) and not p1.mode_calls and not p2.mode_calls,
+          (mode(p1), p1.mode_calls, p2.mode_calls))
+    await mq2(MA, "online")
+    await mq2(MS, '{"mittelwert": 30}')
+    check("fallback/persist: Messgeraet zurueck -> Sperre (Off)", not nc2.dewpoint_fallback and mode(p1)[0] == OM.Off)
+    # Neustart, aber die gespeicherte Sperrmeldung kommt nicht (TPS hat freigegeben und ist weg):
+    # in der Startschonfrist bleibt die Notlueftung, danach endet sie mit der Wiederherstellung
+    nc._persisted = ""            # Datei neu schreiben (sie traegt gerade den Stand von nc2)
+    nc.persist()
+    b3, q1, q2, qsm, mq3 = mkbridge()
+    q1._status.update({"operating_mode": MHR, "fan_speed": FS.Low})
+    nc3 = b3.neuracell
+    nc3.load_persisted()
+    await nc3.enforce()
+    check("fallback/persist: Schonfrist ohne Sperrmeldung -> noch nichts", nc3.dewpoint_fallback and not q1.mode_calls)
+    nc3._started = _t.monotonic() - bridge.STARTUP_GRACE_S - 1
+    await nc3.enforce()
+    check("fallback/persist: nach der Schonfrist ohne Sperre -> Ende, Baseline zurueck",
+          not nc3.dewpoint_fallback and mode(q1)[0] == OM.Smart and not nc3._saved_modes, (mode(q1), nc3._saved_modes))
+    # Datei aufraeumen fuer die anderen Tests
+    try:
+        os.remove(bridge.NEURACELL_STATE_FILE)
+    except FileNotFoundError:
+        pass
+
+    # Konfiguration: Option, Umgebungsvariable, Discovery
+    c = bridge.BridgeConfig()
+    c._apply_extras({"dewpoint_fallback_timeout": 45, "dewpoint_fallback_fan": "High"}.get)
+    os.environ["DEWPOINT_FALLBACK_TIMEOUT"] = "15"
+    os.environ["DEWPOINT_FALLBACK_FAN"] = "Medium"
+    c2 = bridge.BridgeConfig.from_env()
+    del os.environ["DEWPOINT_FALLBACK_TIMEOUT"]
+    del os.environ["DEWPOINT_FALLBACK_FAN"]
+    check("fallback/config: Option und Umgebungsvariable",
+          c.dewpoint_fallback_timeout == 45 and c.dewpoint_fallback_fan_speed == FS.High
+          and c2.dewpoint_fallback_timeout == 15 and c2.dewpoint_fallback_fan_speed == FS.Medium)
+    disc = dict(bridge.build_neuracell_discovery(bridge.BridgeConfig()))
+    ent = [v for k, v in disc.items() if k.endswith("neuracell_dewpoint_fallback/config")]
+    check("fallback/discovery: binary_sensor vorhanden", ent and ent[0]["name"] == "Fallback Ventilation Active"
+          and "dewpoint_fallback" in ent[0]["value_template"], ent)
+
+
 async def _async_suite():
     await test_neuracell()
     await test_neuracell_scoped()
     await test_neuracell_slave_no_repeat()
+    await test_dewpoint_fallback()
     await test_neuracell_robust()
     await test_neuracell_timed_expulsion()
     await test_radon_meter()

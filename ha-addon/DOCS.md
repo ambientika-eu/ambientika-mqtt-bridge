@@ -66,7 +66,12 @@ remembered on the broker). The Ambientika Taupunktsteuerung counts as
 disconnected if it sends nothing within `dewpoint_controller_timeout` (30 min)
 after an add-on restart or a broker reconnect. A third-party dew-point controller needs
 `dewpoint_availability_topic` or `dewpoint_signal_timeout` for that (with
-`dewpoint_source: device` it follows the cloud reads instead). How the two
+`dewpoint_source: device` it follows the cloud reads instead). If both devices
+are disconnected while the dew-point block holds its units Off, nobody watches
+the room any more: after `dewpoint_fallback_timeout` (30 min) the blocked units run
+heat recovery at `dewpoint_fallback_fan` (Low) until the Taupunktsteuerung is connected
+again or the radon meter delivers a value again - the sensor *Fallback Ventilation
+Active* shows it. How the two
 protections work together (radon first, exact restore of every unit's mode) is
 described in the
 [project README](https://github.com/ambientika-eu/ambientika-mqtt-bridge#neuracell-x--patent-pending-radon--dew-point-protection).
@@ -112,6 +117,8 @@ requested while protection controls a unit is not carried over; the log says so.
 | `dewpoint_availability_topic` | *(empty)* | `signal`: availability topic with Last Will of a third-party controller (`online`/`offline`, `true`/`false` or JSON with `state`). The Ambientika controller needs none |
 | `dewpoint_signal_timeout` | `0` | `signal`: minutes without any message from the controller before it counts as disconnected (0 = off). For controllers without Last Will; not applied while a Last Will reports online |
 | `dewpoint_controller_timeout` | `30` | Ambientika Taupunktsteuerung after an add-on restart or a broker reconnect: minutes without any message before it counts as disconnected (0 = off). Covers a controller that went away while the broker was down, when no Last Will comes |
+| `dewpoint_fallback_timeout` | `30` | Fallback ventilation: the dew-point block holds its units Off, but the Taupunktsteuerung and the Ambientika radon meter are both disconnected - no dew-point decision and no radon value any more. After this many minutes the blocked units run heat recovery at `dewpoint_fallback_fan` until the Taupunktsteuerung is connected again or the radon meter delivers a value again, the block is released or radon protection takes over (0 = off). Needs a radon meter on `radon_meter_topic`; applies with every `dewpoint_lost_action` |
+| `dewpoint_fallback_fan` | `Low` | Fan step of the fallback ventilation: `Low`, `Medium` or `High` |
 | `dewpoint_lost_action` | `keep` | While the controller counts as disconnected: `keep` the last block state, `release` ventilation, or `block` the units. Radon keeps priority either way |
 | `dewpoint_indoor_temp_topic` | `ambientika/dewpoint/indoor_temp` | `computed`: indoor temperature in °C |
 | `dewpoint_indoor_humidity_topic` | `ambientika/dewpoint/indoor_humidity` | `computed`: indoor relative humidity in % |
