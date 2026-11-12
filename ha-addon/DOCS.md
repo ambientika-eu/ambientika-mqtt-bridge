@@ -51,6 +51,7 @@ Then save and start the add-on. Your units appear under
 | `humidity_avg_hysteresis_devices` | *(empty)* | The same for single units, overriding the global value for them: `unit=points` entries like `average_window_devices` (0–10), e.g. `A1B2C3D4E5F6=1`; `=0` switches it off for that unit |
 | `temperature_avg_hysteresis` | `0` | Hysteresis of *Temperature (averaged)* for every unit, in °C (0–5; `0` = none) |
 | `temperature_avg_hysteresis_devices` | *(empty)* | The same for single units, overriding the global value: `unit=degrees` entries (0–5), e.g. `A1B2C3D4E5F6=0.3` |
+| `temperature_avg_window_min` | `0` | Own window of *Temperature (averaged)* for every unit, in minutes (0–240; `0` = the unit's window as for the humidity). *Humidity (averaged)* keeps its window, see below |
 | `slave_filter_soft_reset` | `false` | Maintenance acknowledgement for Slave units, see below |
 | `filter_ack_ttl_days` | `90` | How long such an acknowledgement stays valid (1–3650) |
 
@@ -330,6 +331,26 @@ about half the window. The log shows the settings once the units are found, e.g.
 `Humidity (averaged) hysteresis per unit: Gäste Bad 1.5 %; all others 1 %.` and
 `Temperature (averaged) hysteresis: 0.3 °C for every unit.`
 
+**A window of its own for the temperature.** The unit reports whole degrees, so
+every raw step is a full degree: a hysteresis below 1 °C lets it through, one
+above 1 °C shows coarser than the steps it should smooth. Since 1.4.42
+*Temperature (averaged)* can get a longer window of its own, while *Humidity
+(averaged)* keeps the short one that follows a shower:
+
+```yaml
+average_window_devices: "Gäste Bad=15"   # humidity and temperature of this unit
+temperature_avg_window_min: 60           # temperature of every unit 60 min
+temperature_avg_hysteresis: 0.3          # can be combined
+```
+
+The step is then spread over the longer window instead of being held back:
+after one hour the shown value has fully arrived, half of it after 30 minutes.
+`0` (the default) leaves the temperature on the unit's window as before. The
+floor of twenty poll intervals applies here too; the log names the window once
+the units are found (`Temperature (averaged) window: 60 min for every unit`).
+An exponentially weighted mean was simulated as an alternative and not taken:
+for the same calm it reaches a real change later than the plain longer window.
+
 Held-back readings (see above) do not count. After a restart the averaged sensors
 show *unknown* until about two minutes of readings are in (with a long poll
 interval: two reads). Like the raw values they turn *unknown* when the sensor has
@@ -342,6 +363,14 @@ selected on its Master). In `Smart` and `Auto` it stays on that value even
 though the unit switches between concrete functions on its own. The read-only
 sensor **Last Mode** (`last_operating_mode`) shows the function actually running,
 and **Fan Speed** shows the real speed.
+
+**Night Mode** (binary sensor, field `night_alarm`) shows the night flag the
+cloud reports for the unit. In `Smart` and `Auto` the dusk sensor of the zone
+Master decides day and night for the whole zone; *Fan Speed* and *Mode* do not
+show it. Up to 1.4.41 it was named *Night Alarm* and shown as a problem;
+it is the same entity (same entity ID), only name and icon changed. *Light
+Sensor Level* is the dusk sensor's sensitivity setting, not a brightness reading
+- the cloud reports no brightness value.
 
 **Fan Speed** can show `Night` or `Turbo`: the unit chose that step itself. You
 can read these values but not set them. A command that names one (for example a

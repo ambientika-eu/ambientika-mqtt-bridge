@@ -32,6 +32,9 @@ bridge:
   # the published value only moves once the mean has left it by at least that
   # much. Same "unit=value" entries as above; empty = none.
   humidity_avg_hysteresis_devices: ""   # e.g. "A1B2C3D4E5F6=1"
+  # Own window of temperature_avg only, for every unit, in minutes (0-240,
+  # 0 = the window above); humidity_avg keeps its window.
+  temperature_avg_window_min: 0          # e.g. 60
 
 # --- NeuraCell-X radon protection ---
 # Radon alarm -> all devices Intake (Zuluft/supply) at fan Low (Stufe 1).

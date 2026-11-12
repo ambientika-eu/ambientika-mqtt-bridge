@@ -46,6 +46,7 @@ After installation, configure the add-on via the **Configuration** tab:
 | `humidity_avg_hysteresis_devices` | *(empty)* | The same for single units, overriding the global value: `unit=points` entries like `average_window_devices` (0–10), e.g. `A1B2C3D4E5F6=1`; `=0` switches it off for that unit |
 | `temperature_avg_hysteresis` | `0` | Hysteresis of *Temperature (averaged)* for every unit, in °C (0–5; `0` = none) |
 | `temperature_avg_hysteresis_devices` | *(empty)* | The same for single units, overriding the global value: `unit=degrees` entries (0–5), e.g. `A1B2C3D4E5F6=0.3` |
+| `temperature_avg_window_min` | `0` | Own window of *Temperature (averaged)* for every unit, in minutes (0–240; `0` = the unit's window as for the humidity). *Humidity (averaged)* keeps its window, see below |
 | `slave_filter_soft_reset` | `false` | Maintenance acknowledgement for Slave filter counters |
 | `filter_ack_ttl_days` | `90` | How long an acknowledgement stays valid |
 
@@ -149,7 +150,7 @@ Level*, *Device Role*, *Last Mode* (`last_operating_mode`: the concrete function
 a unit in `Smart` / `Auto` is running right now), *Zone*. The text values except
 *Device Role* also have a numeric companion, *… (num)*, for statistics and Grafana.
 
-**Binary sensors** - *Humidity Alarm*, *Night Alarm*.
+**Binary sensors** - *Humidity Alarm*, *Night Mode* (`night_alarm`: the unit's night flag; in `Smart` / `Auto` set by the dusk sensor of the zone Master).
 
 **Diagnostic** - *Last Status Packet* (when the cloud last handed out a status
 packet of this unit) and *Failed Polls* (failed reads since the add-on started,

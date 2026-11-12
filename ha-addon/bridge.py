@@ -192,6 +192,18 @@ AVERAGE_MIN_POLLS = 20
 AVERAGE_DEVICE_WINDOW_MIN = (1.0, 240.0)   # minutes, as the add-on option average_window_min
 AVERAGE_MAX_GAP_POLLS = 2
 AVERAGE_MIN_COVER_S = 120.0
+# Own window of Temperature (averaged) for every unit (temperature_avg_window_min,
+# minutes, 0 = the unit's general window as for Humidity (averaged)). The unit
+# reports whole degrees, so a raw step is always a full degree; a hysteresis
+# below 1 °C cannot hold it back and one above 1 °C shows coarser than the steps
+# it should smooth. A longer window spreads the step over more time instead,
+# without slowing Humidity (averaged), which should follow a shower quickly.
+# Simulated against an exponentially weighted mean (whole-degree readings, half-
+# period 30-45 s, upload 30 s +-10 %): for the same calm the plain longer window
+# reaches 90 % of a real step sooner (60-min window 52 min, EMA with the same
+# calm about 62 min), so the window was taken. Range below; the floor of
+# AVERAGE_MIN_POLLS poll intervals applies here too.
+TEMPERATURE_AVG_WINDOW_RANGE = (0.0, 240.0)      # minutes, 0 = off
 # Hysteresis of the averaged values (humidity_avg_hysteresis /
 # humidity_avg_hysteresis_devices, "name=percent", and since 1.4.41 likewise
 # temperature_avg_hysteresis / temperature_avg_hysteresis_devices, "name=degrees",
@@ -740,6 +752,11 @@ class BridgeConfig:
         # degrees, so a short window wanders by a few tenths in quiet hours.
         self.temperature_avg_hysteresis = 0.0
         self.temperature_avg_hysteresis_devices = ""
+        # Own averaging window of Temperature (averaged) for every unit, in
+        # minutes (0 = none, the default: the unit's general window, see
+        # TEMPERATURE_AVG_WINDOW_RANGE). Kept as typed, parsed by
+        # temperature_avg_window_value().
+        self.temperature_avg_window_min = 0.0
 
         # --- NeuraCell-X radon protection ---
         self.neuracell_enabled = True
@@ -934,6 +951,14 @@ class BridgeConfig:
         return _parse_bounded_float(self.temperature_avg_hysteresis, TEMPERATURE_AVG_HYSTERESIS_RANGE,
                                     self._TEMPERATURE_HYST_SUFFIXES, "degrees", " °C")
 
+    def temperature_avg_window_value(self):
+        """The own window of Temperature (averaged) as (minutes, problem):
+        temperature_avg_window_min parsed and clamped to
+        TEMPERATURE_AVG_WINDOW_RANGE, 0 (= the general window) when empty or
+        unreadable (problem then names why)."""
+        return _parse_bounded_float(self.temperature_avg_window_min, TEMPERATURE_AVG_WINDOW_RANGE,
+                                    ("minutes", "minute", "min", "m"), "minutes", " min")
+
     @property
     def dewpoint_device_block_mode_set(self) -> set:
         """OperatingModes that mean the source TPS device is blocking ventilation.
@@ -1081,6 +1106,7 @@ class BridgeConfig:
             # temperature_avg_hysteresis_value() parse and clamp them.
             ("humidity_avg_hysteresis", ("HUMIDITY_AVG_HYSTERESIS",)),
             ("temperature_avg_hysteresis", ("TEMPERATURE_AVG_HYSTERESIS",)),
+            ("temperature_avg_window_min", ("TEMPERATURE_AVG_WINDOW_MIN",)),
         ):
             v = _env(*names)
             if v:
@@ -1237,15 +1263,17 @@ class BridgeConfig:
         return cfg
 
     def _read_hysteresis_options(self, get) -> None:
-        """Take the four hysteresis options from a getter get(key) (options.json
-        or the bridge: section of config.yaml): the per-unit lists as text (null
-        -> empty), the global values as given (parsed and clamped later by
-        humidity_avg_hysteresis_value() / temperature_avg_hysteresis_value(), so
+        """Take the four hysteresis options and temperature_avg_window_min from
+        a getter get(key) (options.json or the bridge: section of config.yaml):
+        the per-unit lists as text (null -> empty), the global values as given
+        (parsed and clamped later by humidity_avg_hysteresis_value() /
+        temperature_avg_hysteresis_value() / temperature_avg_window_value(), so
         a bad value is reported in the log instead of stopping the start)."""
         for attr in ("humidity_avg_hysteresis_devices", "temperature_avg_hysteresis_devices"):
             v = get(attr)
             setattr(self, attr, "" if v is None else str(v))
-        for attr in ("humidity_avg_hysteresis", "temperature_avg_hysteresis"):
+        for attr in ("humidity_avg_hysteresis", "temperature_avg_hysteresis",
+                     "temperature_avg_window_min"):
             v = get(attr)
             if v is not None:
                 setattr(self, attr, v)
@@ -1490,9 +1518,14 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
         }
         entities.append((f"{base}/sensor/{serial}_{key}/config", p))
 
+    # night_alarm is the cloud's day/night flag of the unit (nightAlarm): on while
+    # the unit runs its night programme (dusk sensor of the zone Master). Up to
+    # 1.4.41 it was shown as "Night Alarm" with device_class problem, i.e. as
+    # "Problem" at night - it is no fault. Name and icon only; the unique_id
+    # (and so the entity_id in Home Assistant) stays as it was.
     bin_defs = [
         ("humidity_alarm", "Humidity Alarm", "moisture"),
-        ("night_alarm", "Night Alarm", "problem"),
+        ("night_alarm", "Night Mode", None),
     ]
     for key, name, dc in bin_defs:
         p = {
@@ -1504,8 +1537,11 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
             "payload_off": "False",
             "availability_topic": avail,
             "device": device_info,
-            "device_class": dc,
         }
+        if dc:
+            p["device_class"] = dc
+        else:
+            p["icon"] = "mdi:weather-night"
         entities.append((f"{base}/binary_sensor/{serial}_{key}/config", p))
 
     select_defs = [
@@ -3061,6 +3097,10 @@ class AmbientikaBridge:
         # serial -> own averaging window in seconds, for the units listed in
         # cfg.average_window_devices (see _resolve_average_windows).
         self._avg_window: dict = {}
+        # Own window of Temperature (averaged) in seconds for every unit, from
+        # cfg.temperature_avg_window_min (0 = the general window, see
+        # _resolve_temperature_window).
+        self._temp_window_s: float = 0.0
         # Hysteresis of the averaged values (see _resolve_hysteresis): per key
         # ("humidity" in percentage points, "temperature" in °C) the global value
         # from humidity_avg_hysteresis / temperature_avg_hysteresis, the units
@@ -3226,11 +3266,34 @@ class AmbientikaBridge:
         held = st is not None and st.get("bad", 0) > 0
         return shown, self._average(serial, key, None if held else shown)
 
-    def _average_window_s(self, serial: str, interval: float) -> float:
-        """Effective averaging window of one unit in seconds: its own from
-        average_window_devices, else AVERAGE_WINDOW_S - at least
+    def _average_window_s(self, serial: str, interval: float, key: Optional[str] = None) -> float:
+        """Effective averaging window of one unit in seconds: for the temperature
+        the own window from temperature_avg_window_min if set, else the unit's own
+        from average_window_devices, else AVERAGE_WINDOW_S - at least
         AVERAGE_MIN_POLLS poll intervals either way."""
-        return max(self._avg_window.get(serial, AVERAGE_WINDOW_S), AVERAGE_MIN_POLLS * interval)
+        own = self._avg_window.get(serial, AVERAGE_WINDOW_S)
+        if key == "temperature" and getattr(self, "_temp_window_s", 0.0) > 0:
+            own = self._temp_window_s
+        return max(own, AVERAGE_MIN_POLLS * interval)
+
+    def _resolve_temperature_window(self) -> None:
+        """Take temperature_avg_window_min (see TEMPERATURE_AVG_WINDOW_RANGE) and
+        log it once (at start-up, after the units are found). The collected
+        readings stay: a longer window fills up, a shorter one cuts at once."""
+        minutes, problem = self.cfg.temperature_avg_window_value()
+        if problem:
+            log.warning("temperature_avg_window_min: %s.", problem)
+        self._temp_window_s = minutes * 60.0 if minutes > 0 else 0.0
+        if self._temp_window_s > 0:
+            try:
+                interval = max(1.0, float(self.cfg.poll_interval))
+            except (TypeError, ValueError):
+                interval = 30.0
+            eff = max(self._temp_window_s, AVERAGE_MIN_POLLS * interval)
+            note = "" if eff == self._temp_window_s else " (set %g, at least %d polls)" % (
+                minutes, AVERAGE_MIN_POLLS)
+            log.info("Temperature (averaged) window: %g min%s for every unit; "
+                     "Humidity (averaged) keeps its window.", eff / 60.0, note)
 
     def _match_unit_entries(self, option: str, entries, unit: str) -> dict:
         """Map parsed per-unit entries (key, label, value) onto the discovered
@@ -3387,7 +3450,7 @@ class AmbientikaBridge:
             interval = max(1.0, float(self.cfg.poll_interval))
         except (TypeError, ValueError):
             interval = 30.0
-        window = self._average_window_s(serial, interval)
+        window = self._average_window_s(serial, interval, key)
         cap = AVERAGE_MAX_GAP_POLLS * interval
         start = now - window
         buf = self._avg_buf.setdefault(serial, {}).setdefault(key, [])
@@ -5148,6 +5211,12 @@ class AmbientikaBridge:
             self._avg_window = {}
             log.error("average_window_devices could not be applied (%r) - every unit "
                       "uses the global window.", e)
+        try:
+            self._resolve_temperature_window()
+        except Exception as e:      # an option typo must never stop the bridge
+            self._temp_window_s = 0.0
+            log.error("temperature_avg_window_min could not be applied (%r) - Temperature "
+                      "(averaged) uses the general window.", e)
         for key in ("humidity", "temperature"):
             try:
                 self._resolve_hysteresis(key)
@@ -5416,8 +5485,17 @@ def main() -> None:
     log.info("MQTT broker   : %s:%s", cfg.mqtt_host, cfg.mqtt_port)
     log.info("Topic prefix  : %s", cfg.topic_prefix)
     log.info("Poll interval : %ss", cfg.poll_interval)
-    log.info("Averaging     : %.0f min (humidity_avg, temperature_avg)",
-             max(AVERAGE_WINDOW_S, AVERAGE_MIN_POLLS * max(1, cfg.poll_interval)) / 60.0)
+    _floor = AVERAGE_MIN_POLLS * max(1, cfg.poll_interval)
+    try:
+        _tw, _ = cfg.temperature_avg_window_value()
+    except Exception:       # never let a banner line stop the start
+        _tw = 0.0
+    if _tw > 0:
+        log.info("Averaging     : %.0f min (humidity_avg), temperature_avg %.0f min",
+                 max(AVERAGE_WINDOW_S, _floor) / 60.0, max(_tw * 60.0, _floor) / 60.0)
+    else:
+        log.info("Averaging     : %.0f min (humidity_avg, temperature_avg)",
+                 max(AVERAGE_WINDOW_S, _floor) / 60.0)
     _hh, _ = cfg.humidity_avg_hysteresis_value()
     _th, _ = cfg.temperature_avg_hysteresis_value()
     if _hh > 0 or _th > 0:

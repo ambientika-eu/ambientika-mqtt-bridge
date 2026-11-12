@@ -3654,6 +3654,37 @@ async def test_average_per_device_discovery():
           (list(b2.devices), b2._avg_window, lc.lines))
 
 
+async def test_temperature_window_discovery():
+    """temperature_avg_window_min wird bei der Geraetesuche angewendet; ein Fehler
+    darin haelt die Bridge nie an."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.average_window_devices = "Bad=15"
+    cfg.temperature_avg_window_min = 60
+    b = bridge.AmbientikaBridge(cfg)
+    b.api = _FakeApi([_FakeHouse(1, [_FakeRoom([FakeDevice(serial="B-1", name="Bad", zone=0)])])])
+    with _LogCapture() as lc:
+        await b._discover_devices()
+    check("disc-twin: nach der Geraetesuche Temperatur 60, Feuchte 15",
+          b._average_window_s("B-1", 30, "temperature") == 3600.0 and b._average_window_s("B-1", 30, "humidity") == 900.0
+          and lc.has("INFO", "Temperature (averaged) window: 60 min"), lc.lines)
+    cfg2 = bridge.BridgeConfig()
+    cfg2.neuracell_enabled = False
+    cfg2.dewpoint_enabled = False
+    b2 = bridge.AmbientikaBridge(cfg2)
+    b2.api = _FakeApi([_FakeHouse(1, [_FakeRoom([FakeDevice(serial="B-1", name="Bad", zone=0)])])])
+
+    def boom():
+        raise RuntimeError("kaputt")
+    cfg2.temperature_avg_window_value = boom
+    with _LogCapture() as lc:
+        await b2._discover_devices()
+    check("disc-twin: Fehler -> Geraetesuche laeuft durch, Temperatur wie Feuchte",
+          "B-1" in b2.devices and b2._temp_window_s == 0.0
+          and lc.has("ERROR", "temperature_avg_window_min could not be applied"), lc.lines)
+
+
 async def test_humidity_hysteresis_discovery():
     """humidity_avg_hysteresis_devices wird bei der Geraetesuche aufgeloest - ein Fehler
     darin haelt die Bridge nie an, und das Fenster je Geraet bleibt davon unberuehrt."""
@@ -4597,6 +4628,146 @@ def test_discovery_1_4_41():
           and ents2["ha/button/X1_reset_filter/config"]["json_attributes_topic"] == "haus/X1/reset_info")
 
 
+# --------------------------------------------------------------------------- 1.4.42
+def test_discovery_1_4_42():
+    """Night Mode statt Night Alarm (Kundenrueckmeldung Nov. 2026): das Tag/Nacht-
+    Kennzeichen der Cloud stand als "Problem" in Home Assistant. Nur Name, Icon und
+    Geraeteklasse aendern sich - unique_id und Topic bleiben, die entity_id in HA
+    damit auch."""
+    cfg = bridge.BridgeConfig()
+    ents = dict(bridge.build_discovery_configs(cfg, "AMB-2", "Kitchen"))
+    nm = ents.get("homeassistant/binary_sensor/AMB-2_night_alarm/config")
+    check("disc42: Night Mode - gleiches Topic, gleiche unique_id",
+          nm is not None and nm["unique_id"] == "ambientika_AMB-2_night_alarm", nm)
+    check("disc42: Name 'Night Mode', keine Geraeteklasse problem, Mond-Icon",
+          nm and nm["name"] == "Night Mode" and "device_class" not in nm and nm.get("icon") == "mdi:weather-night", nm)
+    check("disc42: Wert unveraendert aus night_alarm, True/False",
+          nm and "value_json.night_alarm" in nm["value_template"] and nm["payload_on"] == "True"
+          and nm["payload_off"] == "False" and nm["availability_topic"] == "ambientika/AMB-2/availability", nm)
+    ha = ents.get("homeassistant/binary_sensor/AMB-2_humidity_alarm/config")
+    check("disc42: Humidity Alarm unveraendert (moisture, ohne Icon)",
+          ha and ha["device_class"] == "moisture" and "icon" not in ha and ha["name"] == "Humidity Alarm", ha)
+    uids = [p["unique_id"] for p in ents.values()]
+    check("disc42: unique_ids eindeutig, alles JSON", len(uids) == len(set(uids))
+          and all(json.dumps(p) for p in ents.values()))
+
+
+def test_temperature_window():
+    """Eigenes Fenster fuer Temperature (averaged) (temperature_avg_window_min,
+    Kundenrueckmeldung Nov. 2026): ganze Grad im Rohwert, eine Hysterese unter 1 °C
+    haelt einen Rohschritt nicht. Laengeres Fenster nur fuer die Temperatur, die
+    Feuchte behaelt ihres."""
+    C = bridge.BridgeConfig
+
+    def val(v):
+        c = C()
+        c.temperature_avg_window_min = v
+        return c.temperature_avg_window_value()
+    check("twin: Standard 0 (aus)", C().temperature_avg_window_value() == (0.0, None))
+    check("twin: Zahl 60 (options.json)", val(60) == (60.0, None))
+    check("twin: Text '45 min' (Umgebungsvariable)", val("45 min") == (45.0, None))
+    check("twin: Text '90min'", val("90min") == (90.0, None))
+    for v in (None, "", " ", "null", False):
+        check("twin: leer %r -> 0 ohne Meldung" % (v,), val(v) == (0.0, None), val(v))
+    v, p = val(500)
+    check("twin: 500 -> 240 mit Meldung", v == 240.0 and p and "outside 0-240" in p, (v, p))
+    v, p = val("eine Stunde")
+    check("twin: unlesbar -> 0 mit Meldung", v == 0.0 and p and "not a number" in p, (v, p))
+    v, p = val(-5)
+    check("twin: -5 -> 0 mit Meldung", v == 0.0 and p is not None, (v, p))
+
+    # Konfiguration: options.json, YAML, Umgebung, null, fehlender Schluessel
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    old = os.environ.pop("TEMPERATURE_AVG_WINDOW_MIN", None)
+    try:
+        pj = os.path.join(tmp, "options.json")
+        with open(pj, "w") as f:
+            json.dump({"ambientika_username": "u", "temperature_avg_window_min": 60}, f)
+        check("twin-cfg: options.json", C.from_ha_options(pj).temperature_avg_window_value() == (60.0, None))
+        with open(pj, "w") as f:
+            json.dump({"ambientika_username": "u", "temperature_avg_window_min": None}, f)
+        check("twin-cfg: options.json null -> 0", C.from_ha_options(pj).temperature_avg_window_value() == (0.0, None))
+        with open(pj, "w") as f:
+            json.dump({"ambientika_username": "u"}, f)
+        check("twin-cfg: alte options.json ohne Schluessel -> 0",
+              C.from_ha_options(pj).temperature_avg_window_value() == (0.0, None))
+        yp = os.path.join(tmp, "config.yaml")
+        with open(yp, "w") as f:
+            f.write("bridge:\n  poll_interval: 30\n  temperature_avg_window_min: 45\n")
+        check("twin-cfg: YAML bridge-Abschnitt", C.from_yaml(yp).temperature_avg_window_value() == (45.0, None))
+        os.environ["TEMPERATURE_AVG_WINDOW_MIN"] = "75"
+        check("twin-cfg: Umgebungsvariable", C.from_env().temperature_avg_window_value() == (75.0, None))
+        os.environ["TEMPERATURE_AVG_WINDOW_MIN"] = "null"
+        check("twin-cfg: 'null' (bashio) -> 0", C.from_env().temperature_avg_window_value() == (0.0, None))
+    finally:
+        os.environ.pop("TEMPERATURE_AVG_WINDOW_MIN", None)
+        if old is not None:
+            os.environ["TEMPERATURE_AVG_WINDOW_MIN"] = old
+
+    # Aufloesen und wirksames Fenster: nur die Temperatur, auch gegen average_window_devices
+    b, _ = _house_bridge(["Flur", "Gäste Bad"], awd="Gäste Bad=15")
+    b.cfg.temperature_avg_window_min = 60
+    with _LogCapture() as lc:
+        b._resolve_average_windows()
+        b._resolve_temperature_window()
+    check("twin-res: Startlog nennt das Temperaturfenster",
+          lc.has("INFO", "Temperature (averaged) window: 60 min for every unit; Humidity (averaged) keeps its window."),
+          lc.lines)
+    check("twin-res: Bad - Feuchte 15 min, Temperatur 60 min",
+          b._average_window_s("SN-1", 30, "humidity") == 900.0 and b._average_window_s("SN-1", 30, "temperature") == 3600.0
+          and b._average_window_s("SN-1", 30) == 900.0)
+    check("twin-res: Flur - Feuchte 30 min (global), Temperatur 60 min",
+          b._average_window_s("SN-0", 30, "humidity") == 1800.0 and b._average_window_s("SN-0", 30, "temperature") == 3600.0)
+    b2, _ = _house_bridge(["Bad"], poll=30)
+    b2.cfg.temperature_avg_window_min = 3
+    with _LogCapture() as lc:
+        b2._resolve_temperature_window()
+    check("twin-res: 3 min bei 30 s Abruf -> wirksam 10 min, Log sagt es",
+          b2._average_window_s("SN-0", 30, "temperature") == 600.0
+          and lc.has("INFO", "10 min (set 3, at least 20 polls)"), lc.lines)
+    b3, _ = _house_bridge(["Bad"])
+    b3.cfg.temperature_avg_window_min = "abc"
+    with _LogCapture() as lc:
+        b3._resolve_temperature_window()
+    check("twin-res: unlesbar -> Warnung, Temperatur wie Feuchte",
+          lc.has("WARNING", "temperature_avg_window_min: 'abc' is not a number")
+          and b3._average_window_s("SN-0", 30, "temperature") == 1800.0, lc.lines)
+    b4, _ = _house_bridge(["Bad"])
+    with _LogCapture() as lc:
+        b4._resolve_temperature_window()
+    check("twin-res: 0 -> keine Zeile, Temperatur wie Feuchte",
+          not lc.has("INFO", "Temperature (averaged) window") and b4._average_window_s("SN-0", 30, "temperature") == 1800.0,
+          lc.lines)
+
+    # Zeitreihe: Rohwert springt 17 -> 18 (ganze Grad); 60-min-Fenster fuer die
+    # Temperatur, Feuchte mit 15 min folgt einer Dusche wie bisher
+    b, dev = _avg_bridge(30)
+    b.cfg.average_window_devices = "Gaeste-Bad=15"
+    b.cfg.temperature_avg_window_min = 60
+    b.devices = {"BAD": dev}
+    b._resolve_average_windows()
+    b._resolve_temperature_window()
+    with _Clock() as c:
+        out = [_avg_poll(b, dev, c, 60 if i < 150 else 90, t=17 if i < 150 else 18, dt=30) for i in range(400)]
+    t_avg = [p["temperature_avg"] for p in out]
+    h_avg = [p["humidity_avg"] for p in out]
+    check("twin-zeit: Rohwert unveraendert", out[149]["temperature"] == 17 and out[150]["temperature"] == 18)
+    check("twin-zeit: Temperatur nach 30 min erst halb (60-min-Fenster)",
+          17.4 <= t_avg[150 + 60] <= 17.6, t_avg[150 + 60])
+    check("twin-zeit: Temperatur nach 60 min ganz", t_avg[150 + 121] == 18.0, t_avg[150 + 118:150 + 124])
+    check("twin-zeit: Feuchte nach 15 min ganz (eigenes Fenster bleibt)", h_avg[150 + 31] == 90.0, h_avg[150 + 28:150 + 34])
+    check("twin-zeit: Temperatur gleichmaessig, nie rueckwaerts",
+          all(b2_ >= a for a, b2_ in zip(t_avg[150:], t_avg[151:])), t_avg[150:170])
+    # Hysterese obendrauf bleibt moeglich
+    b.cfg.temperature_avg_hysteresis = 0.3
+    b._resolve_temperature_hysteresis()
+    with _Clock(t=50000.0) as c:
+        out = [_avg_poll(b, dev, c, 60, t=18 if (i // 3) % 2 else 17, dt=30) for i in range(300)]
+    shown = [p["temperature_avg"] for p in out[150:]]
+    check("twin-zeit: mit Hysterese 0.3 ruhig bei 17/18 im Wechsel", len(set(shown)) <= 2, sorted(set(shown)))
+
+
 async def test_poll_diagnostics():
     """Letztes Statuspaket und fehlgeschlagene Abrufe je Geraet (Kundenvorschlag
     Nov. 2026: 1063 Logzeilen von Hand gezaehlt, Geraet war 9 h stromlos)."""
@@ -4933,6 +5104,7 @@ async def _async_suite():
     await test_average()
     await test_average_per_device_discovery()
     await test_humidity_hysteresis_discovery()
+    await test_temperature_window_discovery()
     await test_poll_diagnostics()
     await test_zone_topology_log()
     await test_reset_info()
@@ -4952,6 +5124,8 @@ def main():
     test_humidity_hysteresis()
     test_hysteresis_global_and_temperature()
     test_discovery_1_4_41()
+    test_discovery_1_4_42()
+    test_temperature_window()
     asyncio.run(_async_suite())
     print("\nRESULT:", "ALL PASS" if not FAILS else f"{len(FAILS)} FAIL -> {FAILS}")
     return 1 if FAILS else 0

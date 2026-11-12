@@ -206,6 +206,11 @@ Every categorical value comes with a numeric companion (`*_num`) so long-term
 statistics and Grafana work without a translation table of your own.
 `filter_ack_since` / `filter_ack_until` carry the maintenance acknowledgement of a
 Slave (ISO 8601, see *Filter reset on Master/Slave groups*), `null` without one.
+`night_alarm` is the night flag the cloud reports for the unit; in `Smart` and
+`Auto` the dusk sensor of the zone Master sets it for the whole zone (*Fan Speed*
+and *Mode* do not show it). Home Assistant shows it as the binary sensor *Night
+Mode* (named *Night Alarm* up to 1.4.41, same entity). `light_sensor_level` is the
+dusk sensor's sensitivity setting, not a brightness reading.
 
 ### Commands
 
@@ -283,6 +288,7 @@ environment variable overrides the same setting from `config.yaml`.
 | `HUMIDITY_AVG_HYSTERESIS_DEVICES` | `bridge.humidity_avg_hysteresis_devices` | *(empty)* | Hysteresis of `humidity_avg` for single units, overriding the global value: `unit=points` entries as above, 0-10 (e.g. `A1B2C3D4E5F6=1`; `=0` switches it off for that unit) |
 | `TEMPERATURE_AVG_HYSTERESIS` | `bridge.temperature_avg_hysteresis` | `0` | Hysteresis of `temperature_avg` for every unit, in °C, 0-5 (`0` = none) |
 | `TEMPERATURE_AVG_HYSTERESIS_DEVICES` | `bridge.temperature_avg_hysteresis_devices` | *(empty)* | Hysteresis of `temperature_avg` for single units, overriding the global value: `unit=degrees` entries, 0-5 (e.g. `A1B2C3D4E5F6=0.3`) |
+| `TEMPERATURE_AVG_WINDOW_MIN` | `bridge.temperature_avg_window_min` | `0` | Own window of `temperature_avg` for every unit, in minutes, 0-240 (`0` = the unit's window as for `humidity_avg`; `humidity_avg` keeps its window) |
 | `SLAVE_FILTER_SOFT_RESET` | — | `0` | Record a bridge-side "serviced" acknowledgement when a Slave's filter counter cannot be cleared remotely (see below) |
 | `FILTER_ACK_TTL_DAYS` | — | `90` | How long such an acknowledgement stays valid |
 | `FILTER_ACK_PATH` | — | `/data/filter_ack.json` | Where the acknowledgements are stored (needs a persistent volume) |
@@ -596,6 +602,17 @@ about half the window. The log shows the settings once the units are found
 (`Humidity (averaged) hysteresis per unit: ...; all others 1 %`, `Temperature
 (averaged) hysteresis: 0.3 °C for every unit.`); a value outside its range is
 clamped with a note, an unreadable one counts as 0.
+
+Since 1.4.42 `temperature_avg` can get a window of its own,
+`TEMPERATURE_AVG_WINDOW_MIN` (`temperature_avg_window_min`, 0-240 minutes, `0` =
+the unit's window as before). The unit reports whole degrees, so a raw step is a
+full degree: a hysteresis below 1 °C lets it through, one above 1 °C shows coarser
+than the steps. A longer window for the temperature alone (e.g. 60 minutes, with
+`humidity_avg` staying on 15 for a bathroom) spreads the step instead: half of it
+after 30 minutes, all of it after an hour. The floor of twenty poll intervals
+applies; the log names the window once the units are found. Simulated against an
+exponentially weighted mean: for the same calm the plain window follows a real
+change sooner, so the window was taken.
 
 ### Availability debounce
 
