@@ -180,6 +180,7 @@ the log at start-up. `ambientika` is the default prefix (`MQTT_TOPIC_PREFIX`).
   "humidity": 52,
   "temperature_avg": 21.3,
   "humidity_avg": 61.8,
+  "humidity_raw": 52,
   "air_quality": "Good",
   "humidity_alarm": false,
   "filters_status": "Good",
@@ -504,8 +505,8 @@ the Master, so set modes on the Master.
 
 ### Plausibility of temperature and humidity
 
-Values outside the sensor range are never published (humidity 1-100 %,
-temperature -40 to 85 °C). A single impossible drop such as 6 % humidity between
+Values outside the sensor range are never published (humidity below 1 %,
+temperature outside -40 to 85 °C; humidity above 100 % see below). A single impossible drop such as 6 % humidity between
 55 and 70 % is held back too: a humidity below 20 % is published only if dry air
 (below 25 %) was already measured among the last three readings (a held-back one
 counts) or published within the last hour (at least six poll intervals).
@@ -520,6 +521,16 @@ plausible value is published, for at most ten minutes; after that the value is
 published as unknown, so a failed sensor never looks live. The log notes once when
 values are held back and once when a plausible value returns, at most once an hour
 for a flapping sensor.
+
+A humidity reading above 100 % means the sensor is saturated - steam while
+showering, condensation on the sensor - which is exactly when ventilation has to
+react. Since 1.4.43 such a reading is published as 100 % in `humidity` and counts
+as 100 % for `humidity_avg`; it is never held back. The unit's unchanged reading
+is published next to it as `humidity_raw` (also below 100 %; `null` if the unit
+sends no number) and in Home Assistant as the diagnostic sensor *Humidity raw*,
+disabled by default and without long-term statistics. The log notes the start of
+a saturated stretch once (`humidity 118 from <serial> above 100 % - sensor
+saturated, published as 100 %`), at most once an hour at INFO.
 
 ### Averaged humidity and temperature
 

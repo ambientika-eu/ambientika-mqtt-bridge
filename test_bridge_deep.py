@@ -2621,7 +2621,7 @@ async def test_plausibility():
     # E) harte Grenzen
     b = bridge.AmbientikaBridge(cfg)
     out = run(b, [50, 0, 101, 52])
-    check("plaus: 0 % und 101 % verworfen", out == [50, 50, 50, 52], out)
+    check("plaus: 0 % verworfen, 101 % als gesaettigt 100 % (seit 1.4.43)", out == [50, 50, 100, 52], out)
     out = run(b, [20, -45, -40, 85, 86, 21], key="temperature")
     check("plaus: Temperaturgrenzen -40..85", out == [20, 20, -40, 85, 85, 21], out)
     out = run(b, [True, 53])
@@ -2654,6 +2654,162 @@ async def test_plausibility():
         dev._status["humidity"] = h
         vals.append(b._state_payload("WOZI", dev, dict(dev._status))["humidity"])
     check("plaus: Payload nutzt den Filter", vals == [55, 55, 70], vals)
+
+
+async def test_humidity_saturation():
+    """Gesaettigter Feuchtesensor (> 100 %) beim Duschen: als 100 % veroeffentlicht,
+    zaehlt fuer das Mittel, Rohwert in humidity_raw (Kundenfall Nov. 2026, Bridge 1.4.43)."""
+    cfg = bridge.BridgeConfig()
+    cfg.neuracell_enabled = False
+    cfg.dewpoint_enabled = False
+    cfg.enable_discovery = False
+
+    def run(b, seq, key="humidity"):
+        return [b._plausible("BAD", key, v) for v in seq]
+
+    # A) Kundenfall: 39-50 %, dann direkt 105 / 118 / 141 % -> 100 %, nie die alten 39 %
+    b = bridge.AmbientikaBridge(cfg)
+    with _LogCatch() as lc:
+        out = run(b, [39, 45, 50, 105, 118, 141, 118, 95, 80])
+    check("sat: Werte ueber 100 % als 100 %", out == [39, 45, 50, 100, 100, 100, 100, 95, 80], out)
+    check("sat: kein 'held back', kein 'unknown'",
+          not any("held back" in m or "unknown" in m for _, m in lc.lines), lc.lines)
+    sat = [m for lv, m in lc.lines if "saturated" in m]
+    check("sat: genau eine Logzeile je Saettigungsphase, nennt den Rohwert",
+          len(sat) == 1 and "humidity 105 from BAD above 100 % - sensor saturated, published as 100 %" in sat[0], lc.lines)
+    check("sat: Logzeile auf INFO", [lv for lv, m in lc.lines if "saturated" in m] == ["INFO"], lc.lines)
+
+    # B) Sprung direkt aus dem Start: erster Wert schon gesaettigt
+    b = bridge.AmbientikaBridge(cfg)
+    check("sat: erster Wert 118 -> 100", run(b, [118, 60]) == [100, 60])
+
+    # C) zweite Dusche innerhalb einer Stunde: Logzeile auf DEBUG, Werte unveraendert
+    b = bridge.AmbientikaBridge(cfg)
+    with _LogCatch() as lc:
+        out = run(b, [50, 110, 120, 60, 55, 130, 60])
+    check("sat: zweite Phase richtig", out == [50, 100, 100, 60, 55, 100, 60], out)
+    check("sat: zweite Phase binnen 1 h -> DEBUG",
+          [lv for lv, m in lc.lines if "saturated" in m] == ["INFO", "DEBUG"], lc.lines)
+
+    # D) exakt 100 bleibt ohne Log, 100.5 wird 100; Untergrenze und Trockenpruefung unveraendert
+    b = bridge.AmbientikaBridge(cfg)
+    with _LogCatch() as lc:
+        out = run(b, [100, 100.5, 0, 6, 55])
+    check("sat: 100 ohne Log, 100.5 -> 100, 0 und 6 weiter zurueckgehalten",
+          out == [100, 100, 100, 100, 55], out)
+    check("sat: Logzeilen nur fuer 100.5 und das Zurueckhalten",
+          sum("saturated" in m for _, m in lc.lines) == 1 and sum("held back" in m for _, m in lc.lines) == 1, lc.lines)
+
+    # E) ohne Ausnahme: auch 255 gilt als gesaettigt; inf/NaN/Text/bool bleiben keine Messwerte
+    b = bridge.AmbientikaBridge(cfg)
+    check("sat: 255 -> 100", run(b, [60, 255]) == [60, 100])
+    b = bridge.AmbientikaBridge(cfg)
+    check("sat: inf, -inf, NaN, Text, bool -> zurueckgehalten",
+          run(b, [60, float("inf"), float("-inf"), float("nan"), "x", True]) == [60] * 6)
+
+    # F) Temperatur unberuehrt: ueber 85 °C weiter zurueckgehalten, nicht gekappt
+    b = bridge.AmbientikaBridge(cfg)
+    check("sat: Temperatur nicht gekappt", run(b, [21, 90, 22], key="temperature") == [21, 21, 22])
+
+    # G) Wiederholungspaket waehrend der Saettigung: 100 bleibt, keine zweite Logzeile
+    b = bridge.AmbientikaBridge(cfg)
+    with _LogCatch() as lc:
+        r = [b._plausible("BAD", "humidity", 50),
+             b._plausible("BAD", "humidity", 118),
+             b._plausible("BAD", "humidity", 118, fresh=False),
+             b._plausible("BAD", "humidity", 118, fresh=False)]
+    check("sat: Wiederholungspaket -> 100", r == [50, 100, 100, 100], r)
+    check("sat: Wiederholung loggt nicht", sum("saturated" in m for _, m in lc.lines) == 1, lc.lines)
+    # lange Saettigung (Wiederholungspakete ueber die Haltezeit): nie 'unknown', solange 100 gilt
+    with _Clock() as c:
+        b = bridge.AmbientikaBridge(cfg)
+        b._plausible("BAD", "humidity", 118)
+        c.t += 3 * bridge.PLAUSIBLE_HOLD_S
+        r2 = b._plausible("BAD", "humidity", 118, fresh=False)
+    check("sat: Saettigung ueber die Haltezeit bleibt 100", r2 == 100, r2)
+
+    # H) war vorher ein Wert zurueckgehalten (6 %), beendet 118 die Haltephase als 100
+    b = bridge.AmbientikaBridge(cfg)
+    with _LogCatch() as lc:
+        out = run(b, [55, 6, 118])
+    check("sat: nach zurueckgehaltenem Ausreisser -> 100", out == [55, 55, 100], out)
+    check("sat: Entwarnung im Log", any("plausible again (118)" in m for _, m in lc.lines), lc.lines)
+
+    # I) Payload: humidity 100, humidity_raw unveraendert, JSON gueltig; Mittel zaehlt 100
+    b, dev = _avg_bridge(30)
+    with _Clock() as c:
+        out = [_avg_poll(b, dev, c, h, dt=30) for h in [40] * 60 + [118] * 4]
+    check("sat: Payload humidity 100 / humidity_raw 118",
+          out[-1]["humidity"] == 100 and out[-1]["humidity_raw"] == 118, out[-1])
+    check("sat: humidity_raw im Normalbetrieb = Rohwert", out[0]["humidity_raw"] == 40, out[0])
+    check("sat: Mittel zaehlt die 100 % (steigt, nicht eingefroren)",
+          out[-1]["humidity_avg"] is not None and out[-1]["humidity_avg"] > out[59]["humidity_avg"],
+          (out[59]["humidity_avg"], out[-1]["humidity_avg"]))
+    exp = round((40 * (1800 - 120) + 100 * 120) / 1800, 1)
+    check("sat: Mittel genau (40 % x 28 min + 100 % x 2 min)", out[-1]["humidity_avg"] == exp,
+          (out[-1]["humidity_avg"], exp))
+    for bad in (float("nan"), float("inf"), None, True, "x"):
+        dev._status["humidity"] = bad
+        p = b._state_payload("BAD", dev, dict(dev._status))
+        s = json.dumps(p, allow_nan=False) if True else ""
+        check("sat: humidity_raw %r -> null, JSON ohne NaN" % (bad,),
+              p["humidity_raw"] is None and json.loads(s)["humidity_raw"] is None, p["humidity_raw"])
+    dev._status["humidity"] = 55.5
+    check("sat: humidity_raw Kommazahl bleibt", b._state_payload("BAD", dev, dict(dev._status))["humidity_raw"] == 55.5)
+
+    # J) Kundenfall als Zeitreihe mit Fenster "Dusche=10": Mittel ueber 60 % in wenigen Minuten
+    b, devs = _house_bridge(["Dusche", "Schlafzimmer"], poll=30, awd="Dusche=10")
+    b._resolve_average_windows()
+    dusche = devs["SN-0"]
+    check("sat: Fenster Dusche 10 min", b._avg_window.get("SN-0") == 600.0, b._avg_window)
+    seq = [39, 52] * 30 + [118, 52, 141, 60, 105, 70] * 6 + [95, 80] * 10
+    with _Clock() as c:
+        res = []
+        for h in seq:
+            c.t += 30
+            dusche._status["humidity"] = h
+            res.append(b._state_payload("SN-0", dusche, dict(dusche._status)))
+    raw = [p["humidity"] for p in res]
+    avg = [p["humidity_avg"] for p in res]
+    check("sat: Zeitreihe - nie 39 % waehrend der Dusche, nie unbekannt",
+          all(v is not None for v in raw[60:]) and min(raw[60:96:2]) == 100, raw[58:70])
+    first = next(i for i, v in enumerate(avg) if i >= 60 and v is not None and v > 60)
+    check("sat: Mittel (10 min) ueber 60 % nach hoechstens 5 min Dusche", first - 60 <= 10,
+          (first - 60, avg[58:75]))
+    check("sat: Mittel nie unbekannt", all(v is not None for v in avg[4:]), avg[:6])
+    # zum Vergleich: alte Regel (Werte > 100 zurueckgehalten) haette 39 % gezeigt
+    check("sat: humidity_raw zeigt die echten Werte", [p["humidity_raw"] for p in res[60:63]] == [118, 52, 141])
+
+
+def test_humidity_raw_discovery():
+    cfg = bridge.BridgeConfig()
+    ents = dict(bridge.build_discovery_configs(cfg, "AMB-2", "Bad"))
+    h = ents.get("homeassistant/sensor/AMB-2_humidity_raw/config")
+    check("disc: Humidity raw vorhanden", h is not None, sorted(ents)[:5])
+    check("disc: Humidity raw - Diagnose, standardmaessig aus, ohne state_class",
+          h and h["name"] == "Humidity raw" and h["unique_id"] == "ambientika_AMB-2_humidity_raw"
+          and h["entity_category"] == "diagnostic" and h["enabled_by_default"] is False
+          and "state_class" not in h and h["unit_of_measurement"] == "%"
+          and h["state_topic"] == bridge.state_topic(cfg.topic_prefix, "AMB-2")
+          and h["availability_topic"] == bridge.avail_topic(cfg.topic_prefix, "AMB-2"), h)
+    check("disc: Humidity raw - fehlendes Feld wird unknown",
+          h and h["value_template"] == "{{ value_json.humidity_raw | default(none) }}", h)
+    hum = ents.get("homeassistant/sensor/AMB-2_humidity/config")
+    check("disc: Humidity unveraendert (measurement, device_class humidity)",
+          hum and hum["state_class"] == "measurement" and hum["device_class"] == "humidity"
+          and hum["value_template"] == "{{ value_json.humidity }}", hum)
+    # Jinja-Probe: Template rendert wie Home Assistant es auswerten wuerde
+    try:
+        import jinja2
+        env = jinja2.Environment()
+        t = env.from_string(h["value_template"])
+        r1 = t.render(value_json={"humidity_raw": 118})
+        r2 = t.render(value_json={})
+        r3 = t.render(value_json={"humidity_raw": None})
+        check("disc: Template 118 / fehlend / null -> '118' / 'None' / 'None'",
+              (r1, r2, r3) == ("118", "None", "None"), (r1, r2, r3))
+    except ImportError:
+        check("disc: jinja2 nicht installiert - Template-Probe uebersprungen", True)
 
 
 async def test_zone_master_houses_and_order():
@@ -5094,6 +5250,8 @@ async def _async_suite():
     await test_filter_ack_poll_path()
     await test_shown_mode()
     await test_plausibility()
+    await test_humidity_saturation()
+    test_humidity_raw_discovery()
     await test_zone_master_houses_and_order()
     await test_ack_publish_now()
     await test_ack_startup_run_path()

@@ -144,7 +144,16 @@ MASTER_MODE_MAX_AGE_S = 300.0
 #    counts as a new reading.
 # Meanwhile the last plausible value is published, for at most PLAUSIBLE_HOLD_S;
 # after that the value is published as unknown, so a dead sensor never looks live.
+# A saturated humidity sensor (steam in a bathroom, condensation on the sensor)
+# reports more than 100 % - e.g. 105, 118 or 141 % while showering. That is the
+# very moment ventilation has to react, so such a reading is no outlier: since
+# 1.4.43 it is published as HUMIDITY_SATURATED (100 %) and counts as 100 % for
+# the averaged value. The unit's unchanged reading is published next to it as
+# humidity_raw. One rule for every value above 100, without exceptions: wrongly
+# treated as saturated, a reading costs a few minutes of extraction; held back,
+# a real shower would go unnoticed.
 HUMIDITY_PLAUSIBLE = (1, 100)
+HUMIDITY_SATURATED = 100
 TEMPERATURE_PLAUSIBLE = (-40, 85)
 HUMIDITY_LOW_SUSPECT = 20
 HUMIDITY_LOW_CONFIRM = 25
@@ -1435,6 +1444,16 @@ def _fan_speed_num(v):
     return n + 1 if n is not None else None
 
 
+def _raw_number(v):
+    """A measured value as the unit reported it, for the *_raw fields: an int or
+    finite float as it is, anything else (None, bool, text, NaN, inf) None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
+    return v
+
+
 def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
     device_info = {
         "identifiers": [serial],
@@ -1517,6 +1536,27 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
             "state_class": "measurement",
         }
         entities.append((f"{base}/sensor/{serial}_{key}/config", p))
+
+    # Humidity raw (1.4.43): the unit's reading as reported, also above 100 % when
+    # the sensor is saturated (Humidity shows 100 % then, see HUMIDITY_SATURATED).
+    # A diagnostic entity, disabled until switched on; no state_class, so values
+    # above 100 % stay out of the long-term statistics. The value_template turns a
+    # missing field (payload of an older bridge) into unknown instead of an error.
+    entities.append((
+        f"{base}/sensor/{serial}_humidity_raw/config",
+        {
+            "name": "Humidity raw",
+            "unique_id": f"ambientika_{serial}_humidity_raw",
+            "state_topic": state,
+            "value_template": "{{ value_json.humidity_raw | default(none) }}",
+            "unit_of_measurement": "%",
+            "availability_topic": avail,
+            "device": device_info,
+            "icon": "mdi:water-percent-alert",
+            "enabled_by_default": False,
+            "entity_category": "diagnostic",
+        },
+    ))
 
     # night_alarm is the night flag the cloud reports in the unit's own status
     # (nightAlarm); every unit, a Slave too, reports its own. Up to
@@ -3181,12 +3221,14 @@ class AmbientikaBridge:
         Logged once when values start being held back and once when a plausible
         value arrives again - never on every poll, and at most once an hour per
         value for a flapping sensor.
+        A humidity reading above 100 % (saturated sensor) is published as
+        HUMIDITY_SATURATED and logged once per saturated stretch.
         """
         if value is None:
             return None
         st = self._last_plausible.setdefault(serial, {}).setdefault(
             key, {"last": None, "t": 0.0, "bad": 0, "dry": [], "dry_t": None, "gone": False,
-                  "out": None, "log_t": None, "loud": True})
+                  "out": None, "log_t": None, "loud": True, "sat": False, "sat_log_t": None})
         now = time.monotonic()
         # A flapping sensor (0 % / 55 % / 0 % ...) would otherwise write two lines
         # per flap: the first episode within an hour is logged at INFO (its start
@@ -3211,7 +3253,25 @@ class AmbientikaBridge:
             v = None if isinstance(value, bool) else float(value)
         except (TypeError, ValueError):
             v = None
-        ok = v is not None and v == v and lo <= v <= hi        # v == v: not NaN
+        if v is not None and not math.isfinite(v):           # NaN, +-inf: no reading
+            v = None
+        shown_value = value
+        if key == "humidity" and v is not None and v > hi:
+            # Saturated sensor (see HUMIDITY_SATURATED): published as 100 %.
+            # Logged once per saturated stretch, at most once an hour at INFO.
+            if not st.get("sat"):
+                loud = st.get("sat_log_t") is None or now - st["sat_log_t"] >= 3600.0
+                (log.info if loud else log.debug)(
+                    "%s %r from %s above %s %% - sensor saturated, published as %s %%",
+                    key, value, serial, hi, HUMIDITY_SATURATED)
+                if loud:
+                    st["sat_log_t"] = now
+            st["sat"] = True
+            v = float(HUMIDITY_SATURATED)
+            shown_value = HUMIDITY_SATURATED
+        elif v is not None:
+            st["sat"] = False
+        ok = v is not None and lo <= v <= hi
         why = "outside %s..%s" % (lo, hi)
         if ok and key == "humidity":
             dry = st["dry"]                        # last readings: below CONFIRM?
@@ -3236,8 +3296,8 @@ class AmbientikaBridge:
             if st["bad"]:
                 note("%s of %s plausible again (%r) after %d held-back value(s)",
                      key, serial, value, st["bad"])
-            st.update(last=value, t=now, bad=0, gone=False, out=(value, value))
-            return value
+            st.update(last=shown_value, t=now, bad=0, gone=False, out=(shown_value, value))
+            return shown_value
         if st["bad"] == 0:
             note("%s %r from %s held back (%s) - publishing the last plausible value "
                  "%r meanwhile", key, value, serial, why, st["last"])
@@ -3519,6 +3579,10 @@ class AmbientikaBridge:
             "humidity": hum,
             "temperature_avg": temp_avg,
             "humidity_avg": hum_avg,
+            # The unit's humidity reading as reported, also above 100 % (since
+            # 1.4.43; see HUMIDITY_SATURATED). Only a finite number - a NaN would
+            # make the whole state payload invalid JSON for Home Assistant.
+            "humidity_raw": _raw_number(s["humidity"]),
             "air_quality": s["air_quality"],
             "humidity_alarm": s["humidity_alarm"],
             "filters_status": fs_eff,

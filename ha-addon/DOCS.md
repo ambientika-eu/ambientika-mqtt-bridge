@@ -226,7 +226,7 @@ the mode on the Master instead.
 ## Implausible readings
 
 Temperature and humidity outside the sensor range are never published (humidity
-1-100 %, temperature -40 to 85 °C). A single impossible drop such as 6 % humidity
+below 1 %, temperature outside -40 to 85 °C; humidity above 100 % see below). A single impossible drop such as 6 % humidity
 between 55 and 70 % is held back as well: below 20 % a value is published only if
 dry air was already measured shortly before (among the last three readings, or a
 published dry reading within the last hour). Rises, shower peaks and the normal
@@ -236,6 +236,23 @@ status packet again within two minutes (the cloud keeps the unit's last packet)
 does not count as a new reading. Meanwhile the last plausible value stays, for at most ten minutes, then
 the value shows as unknown - a failed sensor never looks live. Both events are
 written to the log once, at most once an hour for a flapping sensor.
+
+**Saturated sensor.** While showering the humidity sensor can report more than
+100 % (e.g. 105, 118 or 141 %): it is saturated, the room is full of steam - the
+very moment the ventilation has to react. Since 1.4.43 such a reading shows as
+100 % in *Humidity* and counts as 100 % for *Humidity (averaged)*; it is never
+held back, so an automation on either sensor sees the shower at once. The unit's
+unchanged reading is in the diagnostic sensor **Humidity raw** (`humidity_raw` in
+the state topic; disabled by default, switch it on under the device's entities;
+no long-term statistics, so values above 100 % stay out of them). The log notes
+the start of a saturated stretch once (`humidity 118 from <serial> above 100 % -
+sensor saturated, published as 100 %`).
+
+For a shower automation, give the bathroom a short window of its own so that
+*Humidity (averaged)* follows the shower quickly, e.g.
+`average_window_devices: "Bathroom=10"` (the unit's name as in the app, or its
+serial number). With the default poll interval of 30 s, 10 minutes is the
+shortest window (twenty poll intervals).
 
 ## Averaged humidity and temperature
 

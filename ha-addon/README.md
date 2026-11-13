@@ -159,7 +159,9 @@ unit itself is unavailable, see DOCS.md -, *Filter Reset Status* (disabled by
 default: `idle`, `running`, `confirmed`, `acknowledged`, `unconfirmed`; its
 attributes, like the reset button's, say what a reset does on this unit) and,
 with `slave_filter_soft_reset` on, *Filter Acknowledged Since* and *Filter
-Acknowledgement Valid Until*.
+Acknowledgement Valid Until*, and *Humidity raw* (disabled by default: the unit's
+unchanged humidity reading; above 100 % the sensor is saturated and *Humidity*
+shows 100 %, see DOCS.md).
 
 **NeuraCell-X** (one extra device) - *Radon Protection Active*, *Radon Level*,
 *Radon Meter Connected*, *Dew Point Controller Connected*, *Ventilation Blocked
