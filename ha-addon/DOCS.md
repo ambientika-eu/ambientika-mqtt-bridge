@@ -365,9 +365,8 @@ sensor **Last Mode** (`last_operating_mode`) shows the function actually running
 and **Fan Speed** shows the real speed.
 
 **Night Mode** (binary sensor, field `night_alarm`) shows the night flag the
-cloud reports for the unit. In `Smart` and `Auto` the dusk sensor of the zone
-Master decides day and night for the whole zone; *Fan Speed* and *Mode* do not
-show it. Up to 1.4.41 it was named *Night Alarm* and shown as a problem;
+cloud reports in this unit's status - every unit, a Slave too, reports its own
+flag. *Fan Speed* and *Mode* do not show it. Up to 1.4.41 it was named *Night Alarm* and shown as a problem;
 it is the same entity (same entity ID), only name and icon changed. *Light
 Sensor Level* is the dusk sensor's sensitivity setting, not a brightness reading
 - the cloud reports no brightness value.

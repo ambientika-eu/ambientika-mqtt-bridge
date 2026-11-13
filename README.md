@@ -206,9 +206,8 @@ Every categorical value comes with a numeric companion (`*_num`) so long-term
 statistics and Grafana work without a translation table of your own.
 `filter_ack_since` / `filter_ack_until` carry the maintenance acknowledgement of a
 Slave (ISO 8601, see *Filter reset on Master/Slave groups*), `null` without one.
-`night_alarm` is the night flag the cloud reports for the unit; in `Smart` and
-`Auto` the dusk sensor of the zone Master sets it for the whole zone (*Fan Speed*
-and *Mode* do not show it). Home Assistant shows it as the binary sensor *Night
+`night_alarm` is the night flag the cloud reports in this unit's status; every
+unit, a Slave too, reports its own (*Fan Speed* and *Mode* do not show it). Home Assistant shows it as the binary sensor *Night
 Mode* (named *Night Alarm* up to 1.4.41, same entity). `light_sensor_level` is the
 dusk sensor's sensitivity setting, not a brightness reading.
 

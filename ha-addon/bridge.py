@@ -1518,8 +1518,8 @@ def build_discovery_configs(cfg: BridgeConfig, serial: str, device_name: str):
         }
         entities.append((f"{base}/sensor/{serial}_{key}/config", p))
 
-    # night_alarm is the cloud's day/night flag of the unit (nightAlarm): on while
-    # the unit runs its night programme (dusk sensor of the zone Master). Up to
+    # night_alarm is the night flag the cloud reports in the unit's own status
+    # (nightAlarm); every unit, a Slave too, reports its own. Up to
     # 1.4.41 it was shown as "Night Alarm" with device_class problem, i.e. as
     # "Problem" at night - it is no fault. Name and icon only; the unique_id
     # (and so the entity_id in Home Assistant) stays as it was.

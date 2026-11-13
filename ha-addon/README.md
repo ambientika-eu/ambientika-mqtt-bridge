@@ -150,7 +150,7 @@ Level*, *Device Role*, *Last Mode* (`last_operating_mode`: the concrete function
 a unit in `Smart` / `Auto` is running right now), *Zone*. The text values except
 *Device Role* also have a numeric companion, *… (num)*, for statistics and Grafana.
 
-**Binary sensors** - *Humidity Alarm*, *Night Mode* (`night_alarm`: the unit's night flag; in `Smart` / `Auto` set by the dusk sensor of the zone Master).
+**Binary sensors** - *Humidity Alarm*, *Night Mode* (`night_alarm`: the night flag the cloud reports in this unit's status).
 
 **Diagnostic** - *Last Status Packet* (when the cloud last handed out a status
 packet of this unit) and *Failed Polls* (failed reads since the add-on started,
