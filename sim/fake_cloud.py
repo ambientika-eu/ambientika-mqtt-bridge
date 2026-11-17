@@ -10,6 +10,10 @@ units (two zones, Masters and Slaves). Point the bridge at it with
 AMBIENTIKA_HOST=http://127.0.0.1:PORT (or ambientika_host in options.json /
 ambientika.host in config.yaml). Login: kunde@example.com / geheim#1 äöü.
 
+Used by test_system_sim.py (bridge as process or image), by
+iobroker-adapter/test/system.test.js (whole chain with ioBroker) and by
+sim/home-assistant/run.sh (live test in a real Home Assistant).
+
 A control API under /_ctl lets a test change values and switch on faults:
 
     GET  /_ctl/log      every call the bridge made (JSON list)

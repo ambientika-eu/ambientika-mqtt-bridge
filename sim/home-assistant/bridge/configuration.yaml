@@ -1,0 +1,15 @@
+homeassistant:
+  name: Sim
+  unit_system: metric
+  time_zone: Europe/Rome
+
+http:
+  server_host: 127.0.0.1
+  server_port: 18123
+
+logger:
+  default: warning
+  logs:
+    custom_components.simtest: info
+
+simtest:
