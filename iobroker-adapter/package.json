@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "ioBroker adapter for Ambientika ventilation units via MQTT",
   "author": {
-    "name": "Ambientika / SUEDWIND",
+    "name": "Südwind GmbH",
     "email": "info@ambientika.eu"
   },
   "homepage": "https://www.ambientika.eu",

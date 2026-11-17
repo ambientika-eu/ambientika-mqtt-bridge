@@ -684,7 +684,7 @@ The bridge installs [`ambientika_py`](https://github.com/wingertge/ambientika-py
 
 ## License
 
-MIT License – © Ambientika / SUEDWIND
+MIT License – © Südwind GmbH (SUEDWIND S.R.L.)
 
 ---
 

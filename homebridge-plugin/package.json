@@ -5,7 +5,7 @@
     "description": "Homebridge plugin for Ambientika ventilation units – Apple Home, Google Home, Amazon Alexa",
     "license": "MIT",
     "author": {
-          "name": "Ambientika / SUEDWIND",
+          "name": "Südwind GmbH",
           "email": "info@ambientika.eu",
           "url": "https://www.ambientika.eu"
     },

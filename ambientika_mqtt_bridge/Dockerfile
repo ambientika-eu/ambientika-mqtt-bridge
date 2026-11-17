@@ -13,7 +13,7 @@ LABEL \
             io.hass.arch="${BUILD_ARCH}" \
                 io.hass.type="addon" \
                     io.hass.version="${BUILD_VERSION}" \
-                        maintainer="Ambientika / SUEDWIND"
+                        maintainer="Südwind GmbH"
 
                         # Install Python plus build tools needed for aiohttp / yarl / multidict on ARM
                         RUN apk add --no-cache \

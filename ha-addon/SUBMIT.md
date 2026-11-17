@@ -34,7 +34,7 @@ Structure:
 ```yaml
 name: Ambientika Add-ons
 url: https://github.com/ambientika-eu/ambientika-ha-addon
-maintainer: Ambientika / SUEDWIND <info@ambientika.eu>
+maintainer: Südwind GmbH <info@ambientika.eu>
 ```
 
 ### Step 3: Submit to HACS
