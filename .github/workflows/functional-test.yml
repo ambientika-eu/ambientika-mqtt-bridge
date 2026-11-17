@@ -4,8 +4,12 @@ name: Functional test (bridge logic)
 # HA discovery, dew-point math, config parsing, NeuraCell-X radon/dew-point
 # logic (baseline restore + priority), the real state-payload path and command
 # handling, plus the time-lapse scenario simulation of NeuraCell-X (restart,
-# Last Wills, fallback ventilation over simulated hours). Complements
-# smoke-test.yml (which does Docker build + import check).
+# Last Wills, fallback ventilation over simulated hours), and the system test
+# of bridge.py as a real process between a stand-in for the Ambientika cloud
+# (sim/fake_cloud.py) and a real Mosquitto: outages, answers that cannot be
+# read, requests the cloud never answers, broker restart, start without cloud
+# or broker, configuration. Complements smoke-test.yml (Docker build, import
+# check and the same system test for every image).
 
 on:
   push:
@@ -15,6 +19,8 @@ on:
       - "test_bridge_deep.py"
       - "test_neuracell_scenarios.py"
       - "test_filter_reset_diag.py"
+      - "test_system_sim.py"
+      - "sim/**"
       - "requirements.txt"
       - ".github/workflows/functional-test.yml"
   pull_request:
@@ -24,6 +30,8 @@ on:
       - "test_bridge_deep.py"
       - "test_neuracell_scenarios.py"
       - "test_filter_reset_diag.py"
+      - "test_system_sim.py"
+      - "sim/**"
       - "requirements.txt"
       - ".github/workflows/functional-test.yml"
   workflow_dispatch:
@@ -60,3 +68,16 @@ jobs:
 
       - name: Run filter reset safety test
         run: python test_filter_reset_diag.py
+
+      - name: Install Mosquitto
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mosquitto
+          sudo systemctl stop mosquitto || true
+          # Ubuntu confines /usr/sbin/mosquitto to /etc/mosquitto and its data
+          # folders; the test starts brokers with their own configuration.
+          sudo cp /usr/sbin/mosquitto /usr/local/bin/mosquitto-test
+          echo "SIM_MOSQUITTO=/usr/local/bin/mosquitto-test" >> "$GITHUB_ENV"
+
+      - name: Run system test (cloud stand-in, real broker, bridge as a process)
+        run: python test_system_sim.py

@@ -282,6 +282,7 @@ environment variable overrides the same setting from `config.yaml`.
 | `AVAILABILITY_FAILURE_THRESHOLD` | `bridge.availability_failure_threshold` | `3` | Consecutive failed polls before a device is flagged offline |
 | `LOG_LEVEL` | `bridge.log_level` | `INFO` | Logging level |
 | `COMMAND_COALESCE_MS` | — | `800` | Commands for the same device within this window are applied in one call (`0` = off) |
+| `CLOUD_TIMEOUT` | — | `20` | Seconds the bridge waits for one answer of the Ambientika cloud, 2-300. A request without an answer counts as a failed poll; the other units are polled on. |
 | `AVERAGE_WINDOW_MIN` | — | `30` | Window of `humidity_avg` / `temperature_avg` in minutes, 1-1440 (add-on option `average_window_min`: 1-240; at least twenty poll intervals either way) |
 | `AVERAGE_WINDOW_DEVICES` | `bridge.average_window_devices` | *(empty)* | Own window for single units: `unit=minutes` entries, comma-separated, by serial number or unit name as in the app, 1-240 (e.g. `A1B2C3D4E5F6=15, Schlafzimmer Eltern=60`). The serial number is the safe way; in a name, upper/lower case does not matter and a hyphen, underscore or space count as the same separator (see *Averaged humidity and temperature*) |
 | `HUMIDITY_AVG_HYSTERESIS` | `bridge.humidity_avg_hysteresis` | `0` | Hysteresis of `humidity_avg` for every unit, in percentage points, 0-10 (`0` = none); the published value only moves once the mean has left it by at least that much (see *Averaged humidity and temperature*) |

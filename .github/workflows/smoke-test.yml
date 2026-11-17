@@ -6,7 +6,8 @@ name: Smoke test (build + import check + run)
 # then runs each image for real: against a local stand-in for the Ambientika
 # cloud (sim/fake_cloud.py) and a real Mosquitto broker, driven by
 # test_system_sim.py - start, discovery, values, commands, filter reset,
-# broker restart, clean stop, Last Will, configuration.
+# outages, requests the cloud never answers, broker restart, clean stop,
+# Last Will, start without cloud or broker, configuration.
 #
 # Note: ha-addon and ambientika_mqtt_bridge use the Home Assistant
 # add-on build convention with ARG BUILD_FROM. In a real HA install
@@ -127,7 +128,5 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # The groups hang and startfail belong to the request time limit of the
-      # bridge and are run by the functional test once that is in.
       - name: Run the image against the cloud stand-in and a real broker
-        run: python test_system_sim.py ${{ matrix.image.sim }} "${{ matrix.image.tag }}" --only start,commands,broker,config
+        run: python test_system_sim.py ${{ matrix.image.sim }} "${{ matrix.image.tag }}"

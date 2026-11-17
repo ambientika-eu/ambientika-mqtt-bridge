@@ -70,6 +70,39 @@ except ImportError as exc:
 log = logging.getLogger("ambientika_bridge")
 
 
+# Time limit for one request to the Ambientika cloud, in seconds. The library
+# sends its requests without one, so aiohttp's default of five minutes applied:
+# a request the cloud accepted but never answered held the poll loop that long,
+# and every other unit kept its last values and looked live meanwhile.
+def _read_cloud_timeout() -> float:
+    try:
+        v = float(os.environ.get("CLOUD_TIMEOUT", "") or 20)
+    except ValueError:
+        v = 20.0
+    return min(max(v, 2.0), 300.0)
+
+
+CLOUD_TIMEOUT = _read_cloud_timeout()
+
+
+async def _cloud(call):
+    """Await one call to the Ambientika cloud, for CLOUD_TIMEOUT seconds at most.
+
+    Raises asyncio.TimeoutError when the answer does not come in time; every
+    caller treats that like any other connection problem (_is_network_error).
+    """
+    return await asyncio.wait_for(call, timeout=CLOUD_TIMEOUT)
+
+
+class BrokerUnreachable(Exception):
+    """The first connection to the MQTT broker failed (wrong host or port, broker not running)."""
+
+    def __init__(self, where: str, cause: BaseException) -> None:
+        super().__init__("%s (%s: %s)" % (where, type(cause).__name__, cause))
+        self.where = where
+        self.cause = cause
+
+
 def _is_network_error(exc: BaseException) -> bool:
     """A connection problem to the Ambientika cloud (timeout, refused, reset).
 
@@ -81,12 +114,20 @@ def _is_network_error(exc: BaseException) -> bool:
                             TimeoutError, ConnectionError))
 
 
+def _exc_text(exc: BaseException) -> str:
+    """Type and message of an exception; a timeout carries no message of its own."""
+    text = str(exc)
+    if not text and isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        text = "no answer within %g s" % CLOUD_TIMEOUT
+    return "%s: %s" % (type(exc).__name__, text)
+
+
 def _log_cloud_exception(what: str, exc: BaseException) -> None:
     """Log an exception from a cloud call (`what` names the call and the unit):
     one line for a connection problem, the full traceback for anything else."""
     if _is_network_error(exc):
-        log.warning("%s: no connection to the Ambientika cloud (%s: %s) - retrying on the "
-                    "next poll.", what, type(exc).__name__, exc)
+        log.warning("%s: no connection to the Ambientika cloud (%s) - retrying on the "
+                    "next poll.", what, _exc_text(exc))
     else:
         log.exception("%s: %s", what, exc)
 
@@ -3093,6 +3134,7 @@ class AmbientikaBridge:
         self._pending_cmds: dict = {}
         self._cmd_timers: dict = {}
         self._stop_event: Optional[asyncio.Event] = None
+        self._run_task: Optional["asyncio.Task"] = None     # the task inside run(), for stop()
         self.neuracell = NeuraCellXController(self, cfg)
         # serial -> number of consecutive failed polls (availability debounce),
         # and serial -> monotonic time of the last hourly summary of an offline
@@ -3877,7 +3919,8 @@ class AmbientikaBridge:
                    "Content-Type": "application/json"}
         m = method.upper()
         try:
-            async with aiohttp.ClientSession() as sess:
+            async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=CLOUD_TIMEOUT)) as sess:
                 if m == "GET":
                     cm = sess.get(url, headers=headers, params=body)
                 elif m == "POST":
@@ -3892,7 +3935,7 @@ class AmbientikaBridge:
                     return (r.status, r.headers.get("Allow"), text)
         except Exception as e:
             log.warning("filter reset request %s %s raised for %s: %s",
-                        m, path, device.serial_number, e)
+                        m, path, device.serial_number, _exc_text(e))
             return (None, None, None)
 
     def _note_live_role(self, serial: str, status) -> None:
@@ -4245,7 +4288,7 @@ class AmbientikaBridge:
         """
         self._reauth_ts = time.monotonic()
         try:
-            res = await authenticate(self.cfg.username, self.cfg.password, self.cfg.host)
+            res = await _cloud(authenticate(self.cfg.username, self.cfg.password, self.cfg.host))
             if isinstance(res, Failure):
                 log.warning("re-auth (%s) failed: %s", reason, res)
                 return False
@@ -4265,7 +4308,7 @@ class AmbientikaBridge:
                      reason, len(self.devices))
             return True
         except Exception as e:
-            log.warning("re-auth (%s) raised: %s", reason, e)
+            log.warning("re-auth (%s) raised: %s", reason, _exc_text(e))
             return False
 
 
@@ -4571,9 +4614,16 @@ class AmbientikaBridge:
 
     async def read_status(self, device: Device) -> Optional[dict]:
         try:
-            res = await device.status()
+            res = await _cloud(device.status())
         except Exception as e:
-            _log_cloud_exception("status() raised for %s" % device.serial_number, e)
+            if _is_network_error(e):
+                _log_cloud_exception("status() raised for %s" % device.serial_number, e)
+            else:
+                # The cloud answered, but not with a status (an error page, a
+                # cut-off answer): one line, the traceback only at DEBUG.
+                log.warning("status() of %s: the answer of the Ambientika cloud could not be "
+                            "read (%s: %s)", device.serial_number, type(e).__name__, str(e)[:200])
+                log.debug("status() answer of %s", device.serial_number, exc_info=True)
             return None
         if isinstance(res, Failure):
             log.warning("status() failed for %s: %s", device.serial_number, res)
@@ -4613,7 +4663,7 @@ class AmbientikaBridge:
             "light_sensor_level": light,
         }
         try:
-            res = await device.change_mode(mode)
+            res = await _cloud(device.change_mode(mode))
         except Exception as e:
             _log_cloud_exception("change_mode raised for %s" % device.serial_number, e)
             return False
@@ -5109,7 +5159,7 @@ class AmbientikaBridge:
             "humidity_level": hum, "light_sensor_level": light,
         }
         try:
-            res = await device.change_mode(mode)
+            res = await _cloud(device.change_mode(mode))
         except Exception as e:
             _log_cloud_exception("change_mode raised for %s" % serial, e)
             return
@@ -5217,7 +5267,7 @@ class AmbientikaBridge:
     # ----- Ambientika -----
     async def _login(self) -> None:
         log.info("Authenticating with Ambientika API at %s ...", self.cfg.host)
-        res = await authenticate(self.cfg.username, self.cfg.password, self.cfg.host)
+        res = await _cloud(authenticate(self.cfg.username, self.cfg.password, self.cfg.host))
         if isinstance(res, Failure):
             log.error("Authentication failed: %s", res)
             raise RuntimeError("Cannot authenticate with Ambientika API. Check username/password.")
@@ -5227,7 +5277,7 @@ class AmbientikaBridge:
 
     async def _discover_devices(self) -> None:
         assert self.api is not None
-        houses_res = await self.api.houses()
+        houses_res = await _cloud(self.api.houses())
         if isinstance(houses_res, Failure):
             log.error("Could not fetch houses: %s", houses_res)
             raise RuntimeError("Could not fetch houses from Ambientika API.")
@@ -5317,8 +5367,12 @@ class AmbientikaBridge:
             for serial, device in sorted(
                     self.devices.items(),
                     key=lambda kv: self._role_of(kv[1]) != "master"):
+                if self._stop_event.is_set():
+                    break
+                answered = False
                 try:
-                    res = await device.status()
+                    res = await _cloud(device.status())
+                    answered = True
                     if isinstance(res, Failure):
                         try:
                             code = res.failure().get("status_code")
@@ -5354,8 +5408,18 @@ class AmbientikaBridge:
                     # as the hourly summary; anything else as before.
                     if _is_network_error(e) and self._poll_failure_quiet(serial):
                         self._note_poll_failure(serial, "exception during poll",
-                                                detail="no connection to the Ambientika cloud (%s: %s)"
-                                                % (type(e).__name__, e))
+                                                detail="no connection to the Ambientika cloud (%s)"
+                                                % _exc_text(e))
+                    elif not answered and not _is_network_error(e):
+                        # The cloud answered, but not with a status the library can
+                        # read (an error page, a cut-off answer). Counted and logged
+                        # like any other failed poll: a line for each of the first
+                        # failures, then the hourly summary - the full traceback of
+                        # every poll filled the log before. It is kept at DEBUG.
+                        log.debug("unreadable status answer for %s", serial, exc_info=True)
+                        self._note_poll_failure(serial, "unreadable answer",
+                                                detail="the answer of the Ambientika cloud could not "
+                                                "be read (%s: %s)" % (type(e).__name__, str(e)[:200]))
                     else:
                         _log_cloud_exception("Error polling %s" % serial, e)
                         self._note_poll_failure(serial, "exception during poll")
@@ -5428,12 +5492,16 @@ class AmbientikaBridge:
     async def run(self) -> None:
         self.loop = asyncio.get_running_loop()
         self._stop_event = asyncio.Event()
+        self._run_task = asyncio.current_task()
 
         await self._login()
         await self._discover_devices()
         if self.cfg.neuracell_enabled or self.cfg.dewpoint_enabled:
             self.neuracell.load_persisted()
-        self._mqtt_connect()
+        try:
+            self._mqtt_connect()
+        except OSError as e:
+            raise BrokerUnreachable("%s:%s" % (self.cfg.mqtt_host, self.cfg.mqtt_port), e) from e
         # Subscriptions, discovery and NeuraCell-X status are (re)published from
         # the on_connect callback once the CONNACK is received (see _on_mqtt_connect).
         # Resume any filter reset that was still unconfirmed before a restart or
@@ -5501,10 +5569,24 @@ class AmbientikaBridge:
                          self.cfg.dewpoint_fallback_fan, self.cfg.dewpoint_fallback_timeout)
         await self._poll_loop()
 
+    def _cancel_run_later(self) -> None:
+        def _cancel() -> None:
+            task = self._run_task
+            if task is not None and not task.done():
+                task.cancel()
+        try:
+            self.loop.call_later(1.0, _cancel)
+        except Exception:
+            pass
+
     def stop(self) -> None:
         log.info("Shutting down ...")
         if self._stop_event is not None and self.loop is not None:
             self.loop.call_soon_threadsafe(self._stop_event.set)
+            # The poll loop ends at once when it is waiting for the next poll. A
+            # request still out to the cloud would hold it until its time limit,
+            # so that one is cancelled after a moment.
+            self.loop.call_soon_threadsafe(self._cancel_run_later)
         if self.client is not None:
             try:
                 # A clean DISCONNECT suppresses the Last Will, so announce
@@ -5585,14 +5667,21 @@ def main() -> None:
         asyncio.run(bridge.run())
     except KeyboardInterrupt:
         bridge.stop()
+    except asyncio.CancelledError:
+        pass    # stopped while a request to the cloud was still out
+    except BrokerUnreachable as e:
+        log.error("Fatal error: no connection to the MQTT broker %s (%s: %s). Check mqtt_host and "
+                  "mqtt_port and that the broker is running; with the add-on watchdog switched on "
+                  "the bridge starts again by itself.", e.where, type(e.cause).__name__, e.cause)
+        sys.exit(1)
     except Exception as e:
         if _is_network_error(e):
             # No connection to the cloud at start (e.g. Home Assistant came up
             # before the router): one line, no traceback. The add-on's watchdog
             # (switch in its settings) starts it again.
-            log.error("Fatal error: no connection to the Ambientika cloud (%s: %s). Check the "
+            log.error("Fatal error: no connection to the Ambientika cloud (%s). Check the "
                       "internet connection; with the add-on watchdog switched on it starts "
-                      "again by itself.", type(e).__name__, e)
+                      "again by itself.", _exc_text(e))
         else:
             log.exception("Fatal error: %s", e)
         sys.exit(1)

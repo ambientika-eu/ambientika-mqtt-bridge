@@ -4263,6 +4263,137 @@ def test_cloud_error_log():
           and not bridge._is_network_error(ValueError("x")))
 
 
+def test_cloud_timeout():
+    """Zeitlimit fuer Anfragen an die Cloud (CLOUD_TIMEOUT) und die Texte dazu."""
+    alt = os.environ.get("CLOUD_TIMEOUT")
+    try:
+        got = {}
+        for v in (None, "", "7", "0.5", "9999", "abc", "12.5"):
+            if v is None:
+                os.environ.pop("CLOUD_TIMEOUT", None)
+            else:
+                os.environ["CLOUD_TIMEOUT"] = v
+            got[v] = bridge._read_cloud_timeout()
+    finally:
+        if alt is None:
+            os.environ.pop("CLOUD_TIMEOUT", None)
+        else:
+            os.environ["CLOUD_TIMEOUT"] = alt
+    check("timeout: Vorgabe 20 s, leer und Unsinn ebenso", got[None] == 20 and got[""] == 20 and got["abc"] == 20, got)
+    check("timeout: Wert aus der Umgebung, begrenzt auf 2..300 s",
+          got["7"] == 7 and got["12.5"] == 12.5 and got["0.5"] == 2 and got["9999"] == 300, got)
+    t = bridge._exc_text(asyncio.TimeoutError())
+    check("timeout: Text nennt das Limit statt einer leeren Meldung", "no answer within" in t and t.endswith(" s"), t)
+    check("timeout: andere Fehler mit Typ und Meldung", bridge._exc_text(ValueError("x")) == "ValueError: x")
+    e = bridge.BrokerUnreachable("core-mosquitto:1883", ConnectionRefusedError(111, "Connection refused"))
+    check("broker: Fehler nennt Host, Port und Ursache",
+          e.where == "core-mosquitto:1883" and "ConnectionRefusedError" in str(e) and "core-mosquitto:1883" in str(e), str(e))
+
+
+async def test_cloud_timeout_poll():
+    """Ein Geraet, dessen Anfrage die Cloud nie beantwortet, haelt die anderen nicht auf;
+    eine unlesbare Antwort zaehlt als Fehlabruf ohne Traceback; Stop bricht eine offene Anfrage ab."""
+    import logging as _lg
+    alt = bridge.CLOUD_TIMEOUT
+    bridge.CLOUD_TIMEOUT = 0.15
+    try:
+        async def nie():
+            await asyncio.sleep(60)
+        t0 = time.monotonic()
+        try:
+            await bridge._cloud(nie())
+            abgelaufen = False
+        except asyncio.TimeoutError:
+            abgelaufen = True
+        check("timeout: Anfrage ohne Antwort endet am Limit", abgelaufen and time.monotonic() - t0 < 2.0,
+              time.monotonic() - t0)
+
+        async def gleich():
+            return 42
+        check("timeout: Antwort innerhalb des Limits kommt durch", await bridge._cloud(gleich()) == 42)
+
+        class Haengt(FakeDevice):
+            async def status(self):
+                await asyncio.sleep(60)
+
+        class Unlesbar(FakeDevice):
+            async def status(self):
+                raise TypeError("string indices must be integers, not 'str'")
+
+        cfg = bridge.BridgeConfig()
+        cfg.neuracell_enabled = False
+        cfg.dewpoint_enabled = False
+        cfg.enable_discovery = False
+        cfg.poll_interval = 0.05
+        b = bridge.AmbientikaBridge(cfg)
+        b.client = FakeClient()
+        gut = FakeDevice("GUT", "Flur", 0)
+        gut.role = "Master"
+        b.devices = {"HAENGT": Haengt("HAENGT", "Bad", 0), "UNLESBAR": Unlesbar("UNLESBAR", "Kueche", 0), "GUT": gut}
+        for d in b.devices.values():
+            if d is not gut:
+                d.role = "SlaveEqualMaster"
+        b._reauth_ts = time.monotonic()
+        recs = []
+        h = _lg.Handler()
+        h.emit = recs.append
+        bridge.log.addHandler(h)
+        try:
+            b._stop_event = asyncio.Event()
+            task = asyncio.create_task(b._poll_loop())
+            await asyncio.sleep(1.6)
+            b._stop_event.set()
+            await asyncio.wait_for(task, 3)
+        finally:
+            bridge.log.removeHandler(h)
+        gut_states = [t for t, _ in b.client.pub if t == "ambientika/GUT/state"]
+        check("timeout: das gesunde Geraet wird weiter abgefragt (%d Statusmeldungen)" % len(gut_states),
+              len(gut_states) >= 3, len(gut_states))
+        avail = {s: [pl for t, pl in b.client.pub if t == "ambientika/%s/availability" % s] for s in b.devices}
+        check("timeout: haengendes Geraet nach 3 Fehlabrufen offline, gesundes online",
+              avail["HAENGT"][-1:] == ["offline"] and avail["GUT"][-1:] == ["online"], avail)
+        check("unlesbar: zaehlt als Fehlabruf -> offline", avail["UNLESBAR"][-1:] == ["offline"], avail)
+        check("unlesbar: keine Zeile mit Traceback",
+              not [r for r in recs if r.exc_info and r.levelno >= _lg.INFO], [r.getMessage() for r in recs if r.exc_info])
+        texte = [r.getMessage() for r in recs if r.levelno >= _lg.WARNING]
+        check("unlesbar: eine Warnung nennt Geraet, Fehlertyp und Meldung",
+              any("UNLESBAR" in m and "could not be read" in m and "TypeError" in m for m in texte), texte[:6])
+        check("timeout: Warnung nennt das Limit", any("HAENGT" in m and "no answer within" in m for m in texte), texte[:6])
+        diag = [json.loads(pl) for t, pl in b.client.pub if t == "ambientika/UNLESBAR/diagnostics"]
+        check("unlesbar: Diagnose nennt den Grund", diag and diag[-1]["last_failure_reason"] == "unreadable answer",
+              diag[-1] if diag else None)
+
+        # Stop, waehrend eine Anfrage offen ist: nicht bis zum Limit warten
+        bridge.CLOUD_TIMEOUT = 30
+        b2 = bridge.AmbientikaBridge(cfg)
+        b2.client = FakeClient()
+        b2.devices = {"HAENGT": Haengt("HAENGT", "Bad", 0)}
+        b2._reauth_ts = time.monotonic()
+
+        async def lauf():
+            b2.loop = asyncio.get_running_loop()
+            b2._stop_event = asyncio.Event()
+            b2._run_task = asyncio.current_task()
+            await b2._poll_loop()
+        task = asyncio.create_task(lauf())
+        await asyncio.sleep(0.2)
+        t0 = time.monotonic()
+        b2.stop()
+        try:
+            await asyncio.wait_for(task, 5)
+            ende = "fertig"
+        except asyncio.CancelledError:
+            ende = "abgebrochen"
+        except asyncio.TimeoutError:
+            ende = "haengt"
+        check("stop: offene Anfrage wird nach 1 s abgebrochen (%.1f s, %s)" % (time.monotonic() - t0, ende),
+              ende == "abgebrochen" and time.monotonic() - t0 < 3.0, ende)
+        check("stop: Bridge meldet sich am Broker ab",
+              ("ambientika/bridge/availability", "offline") in b2.client.pub, b2.client.pub[-3:])
+    finally:
+        bridge.CLOUD_TIMEOUT = alt
+
+
 async def test_dewpoint_fallback():
     """1.4.40: Notluftung - Sperre aktiv, aber Taupunktsteuerung UND Radon-Messgeraet weg.
 
@@ -4556,7 +4687,9 @@ class _Wall:
         self._orig = None
 
     def __enter__(self):
-        self._orig = bridge.AmbientikaBridge._wall_time
+        # aus __dict__, damit beim Zuruecksetzen wieder die staticmethod dasteht
+        # (der Zugriff ueber die Klasse liefert nur die nackte Funktion)
+        self._orig = bridge.AmbientikaBridge.__dict__["_wall_time"]
         bridge.AmbientikaBridge._wall_time = staticmethod(lambda: self.t)
         return self
 
@@ -5266,11 +5399,13 @@ async def _async_suite():
     await test_poll_diagnostics()
     await test_zone_topology_log()
     await test_reset_info()
+    await test_cloud_timeout_poll()
 
 
 def main():
     FAILS.clear()
     test_cloud_error_log()
+    test_cloud_timeout()
     test_discovery()
     test_dewpoint()
     test_config()
