@@ -66,6 +66,21 @@ CLOCK = FakeTime(real_time)
 bridge.time = CLOCK
 POLL_S = 30.0
 
+# Die Simulation meldet sich nie an der Cloud an. Die Fake-Uhr laeuft ueber alle
+# Szenarien zusammen mehr als sechs Stunden - damit wird in der Poll-Schleife die
+# periodische Anmeldung faellig, und die ginge mit leeren Zugangsdaten an die
+# echte Cloud. Jede Sim ersetzt deshalb _reauth; kaeme trotzdem eine Anmeldung
+# zustande, landet sie hier, wird gezaehlt und am Ende geprueft.
+SIGN_INS = []
+
+
+async def _no_sign_in(username, password, host=None, *a, **k):
+    SIGN_INS.append(host)
+    return Failure({"status_code": None, "data": "the simulation does not sign in"})
+
+
+bridge.authenticate = _no_sign_in
+
 
 # --------------------------------------------------------------------------- Fakes
 class FakeClient:
@@ -193,6 +208,10 @@ class Sim:
         self._pending = []
         self.b._dispatch = lambda coro: self._pending.append(coro)
         self.start_min = 0.0
+
+        async def no_reauth(reason):        # kein Token-Refresh gegen die Cloud (siehe SIGN_INS)
+            return True
+        self.b._reauth = no_reauth
 
     # --- Ereignisse ---
     def at(self, minute, topic, payload, retain=False):
@@ -530,10 +549,6 @@ async def scenario_unit_unplugged():
     sim = Sim(units, "E", neuracell_enabled=False, dewpoint_enabled=False)
     for sn in units:
         sim.b._device_house[sn] = 1
-
-    async def no_reauth(reason):          # 9 h Simulation: kein echter Token-Refresh gegen die Cloud
-        return True
-    sim.b._reauth = no_reauth
     t_start = {}
 
     def unplug(s):
@@ -608,6 +623,8 @@ async def main_async():
     await scenario_broker_restart_no_block()
     await scenario_radon_during_fallback()
     await scenario_unit_unplugged()
+    print("\n[Cloud]")
+    check("keine Anmeldung an die Cloud aus der Simulation", not SIGN_INS, SIGN_INS)
 
 
 def main():
