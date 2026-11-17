@@ -53,8 +53,19 @@ sudo -u iobroker iobroker add ambientika
 
 Then open the new instance `ambientika.0` in Admin and enter the broker settings.
 
-To update, run the `npm install` line with the newer release package and restart the
-instance (`iobroker restart ambientika`); `iobroker add` is only needed once.
+To update, install the newer release package the same way, load its files into ioBroker
+and restart the instance; `iobroker add` is only needed once:
+
+```bash
+cd /opt/iobroker
+sudo -u iobroker npm install --omit=dev \
+  https://github.com/ambientika-eu/ambientika-mqtt-bridge/releases/download/v1.6.35/iobroker.ambientika-1.6.35.tgz
+sudo -u iobroker iobroker upload ambientika
+sudo -u iobroker iobroker restart ambientika
+```
+
+Settings, units and their names are kept; states that are new in a version appear with
+the first message of each unit.
 
 ## Configuration
 
