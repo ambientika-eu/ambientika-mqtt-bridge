@@ -14,7 +14,7 @@ A control API under /_ctl lets a test change values and switch on faults:
 
     GET  /_ctl/log      every call the bridge made (JSON list)
     POST /_ctl/clear    empty that log
-    POST /_ctl/unit     {"serial": ..., "set": {...status fields...},
+    POST /_ctl/unit     {"serial": ..., "set": {...status fields...}, "name": "name in the app",
                          "fault": null | "404" | "500" | "hang" | "garbage" | "html"}
     POST /_ctl/outage   {"mode": "ok" | "500" | "hang" | "refuse-auth"}
     POST /_ctl/expire   invalidate the token (the bridge has to log in again)
@@ -185,7 +185,9 @@ async def change(req):
           and str(b.get("operatingMode")) in [str(i) for i in range(12)]
           and type(b.get("fanSpeed")) is int and b.get("fanSpeed") in (0, 1, 2)
           and type(b.get("humidityLevel")) is int and b.get("humidityLevel") in (0, 1, 2)
-          and type(b.get("lightSensorLevel")) is int and b.get("lightSensorLevel") in (0, 1, 2, 3))
+          # older clients send no light sensor level; the unit keeps its own then
+          and ("lightSensorLevel" not in b
+               or (type(b["lightSensorLevel"]) is int and b["lightSensorLevel"] in (0, 1, 2, 3))))
     log("change-mode", serial=serial, body=b, ok=ok)
     if not ok:
         return web.json_response(
@@ -200,7 +202,8 @@ async def change(req):
         st["lastOperatingMode"] = old
     st["fanSpeed"] = FANS[b["fanSpeed"]]
     st["humidityLevel"] = HUMS[b["humidityLevel"]]
-    st["lightSensorLevel"] = LIGHTS[b["lightSensorLevel"]]
+    if "lightSensorLevel" in b:
+        st["lightSensorLevel"] = LIGHTS[b["lightSensorLevel"]]
     save()
     return web.Response(status=200)
 
@@ -243,6 +246,8 @@ async def ctl_unit(req):
         u["status"].update(b["set"])
     if "fault" in b:
         u["fault"] = b["fault"]
+    if "name" in b:
+        u["name"] = b["name"]
     save()
     return web.json_response({"ok": True})
 
