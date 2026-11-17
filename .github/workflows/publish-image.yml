@@ -1,8 +1,9 @@
 name: Publish standalone image (GHCR)
 
-# Builds the standalone bridge image (root Dockerfile) and pushes it to
-# GitHub Container Registry whenever a release is published. Also runnable
-# by hand (workflow_dispatch) for a chosen tag/branch.
+# Builds the standalone bridge image (root Dockerfile) for amd64 and arm64
+# (Raspberry Pi 4/5 and other 64-bit ARM boards) and pushes it to GitHub
+# Container Registry whenever a release is published. Also runnable by hand
+# (workflow_dispatch) for a chosen tag/branch.
 on:
   release:
     types: [published]
@@ -38,6 +39,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up QEMU (arm64 build)
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -46,6 +50,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
             BUILD_VERSION=${{ steps.ver.outputs.version }}

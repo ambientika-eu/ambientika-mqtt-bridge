@@ -7,7 +7,9 @@ name: Smoke test (build + import check + run)
 # cloud (sim/fake_cloud.py) and a real Mosquitto broker, driven by
 # test_system_sim.py - start, discovery, values, commands, filter reset,
 # outages, requests the cloud never answers, broker restart, clean stop,
-# Last Will, start without cloud or broker, configuration.
+# Last Will, start without cloud or broker, configuration. The standalone
+# image is also built for arm64 (as published to GHCR) and started under
+# emulation: start, discovery and values.
 #
 # Note: ha-addon and ambientika_mqtt_bridge use the Home Assistant
 # add-on build convention with ARG BUILD_FROM. In a real HA install
@@ -57,6 +59,16 @@ jobs:
             build_args: |
               BUILD_VERSION=ci
             sim: --image
+          - name: root (Debian, arm64 emulated)
+            dockerfile: Dockerfile
+            context: .
+            tag: ambientika-bridge:root-arm64
+            platform: linux/arm64
+            build_args: |
+              BUILD_VERSION=ci
+            sim: --image
+            sim_args: --only start
+            time_factor: "6"
           - name: ha-addon (Alpine)
             dockerfile: ha-addon/Dockerfile
             context: ha-addon
@@ -80,6 +92,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Set up QEMU (emulated builds)
+        if: matrix.image.platform
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -88,6 +104,7 @@ jobs:
         with:
           context: ${{ matrix.image.context }}
           file: ${{ matrix.image.dockerfile }}
+          platforms: ${{ matrix.image.platform || 'linux/amd64' }}
           push: false
           load: true
           tags: ${{ matrix.image.tag }}
@@ -95,7 +112,7 @@ jobs:
 
       - name: Import check - LightSensorLevel and friends
         run: |
-          docker run --rm --entrypoint python "${{ matrix.image.tag }}" -c "
+          docker run --rm --platform "${{ matrix.image.platform || 'linux/amd64' }}" --entrypoint python "${{ matrix.image.tag }}" -c "
           import sys
           print('Python:', sys.version)
 
@@ -129,4 +146,6 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run the image against the cloud stand-in and a real broker
-        run: python test_system_sim.py ${{ matrix.image.sim }} "${{ matrix.image.tag }}"
+        env:
+          SIM_TIME_FACTOR: ${{ matrix.image.time_factor || '1' }}
+        run: python test_system_sim.py ${{ matrix.image.sim }} "${{ matrix.image.tag }}" ${{ matrix.image.sim_args }}

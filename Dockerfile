@@ -3,12 +3,14 @@ FROM python:3.11-slim
 ARG BUILD_VERSION
 ENV BRIDGE_VERSION=${BUILD_VERSION}
 
-WORKDIR /app
+LABEL \
+  org.opencontainers.image.title="Ambientika MQTT Bridge" \
+  org.opencontainers.image.description="MQTT bridge for Ambientika ventilation units" \
+  org.opencontainers.image.source="https://github.com/ambientika-eu/ambientika-mqtt-bridge" \
+  org.opencontainers.image.vendor="Südwind GmbH" \
+  org.opencontainers.image.licenses="MIT"
 
-# git is required for pip to install ambientika_py from its upstream Git repo
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
-    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
