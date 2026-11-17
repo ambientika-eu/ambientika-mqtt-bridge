@@ -1,14 +1,27 @@
 name: ioBroker adapter test
 
+# test:    package checks and the adapter in a real js-controller against a
+#          broker that plays the bridge (Node 20 and 22).
+# system:  the whole chain with real processes - cloud stand-in (sim/fake_cloud.py),
+#          bridge.py, Mosquitto, adapter in js-controller 7.2.5 - and the adapter
+#          alone against anything that can turn up on a broker.
+
 on:
   push:
     branches: [main]
     paths:
       - "iobroker-adapter/**"
+      - "bridge.py"
+      - "sim/**"
+      - "requirements.txt"
       - ".github/workflows/iobroker-adapter-test.yml"
   pull_request:
     paths:
       - "iobroker-adapter/**"
+      - "bridge.py"
+      - "sim/**"
+      - "requirements.txt"
+      - ".github/workflows/iobroker-adapter-test.yml"
   workflow_dispatch:
 
 permissions:
@@ -30,3 +43,29 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm ci
       - run: npm test
+
+  system:
+    name: System test (cloud stand-in, bridge, Mosquitto, adapter)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Mosquitto and the bridge requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mosquitto
+          sudo systemctl stop mosquitto || true
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - run: npm ci
+        working-directory: iobroker-adapter
+      - run: npm run test:system
+        working-directory: iobroker-adapter
+        env:
+          SIM_PYTHON: python
+          JS_CONTROLLER: "7.2.5"

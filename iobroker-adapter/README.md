@@ -47,14 +47,14 @@ The adapter is not yet in the ioBroker repository. Install it from the release p
 ```bash
 cd /opt/iobroker
 sudo -u iobroker npm install --omit=dev \
-  https://github.com/ambientika-eu/ambientika-mqtt-bridge/releases/download/v1.6.34/iobroker.ambientika-1.6.34.tgz
+  https://github.com/ambientika-eu/ambientika-mqtt-bridge/releases/download/v1.6.35/iobroker.ambientika-1.6.35.tgz
 sudo -u iobroker iobroker add ambientika
 ```
 
 Then open the new instance `ambientika.0` in Admin and enter the broker settings.
 
-To update, run the same two commands with the newer release package; `iobroker add` is
-only needed once.
+To update, run the `npm install` line with the newer release package and restart the
+instance (`iobroker restart ambientika`); `iobroker add` is only needed once.
 
 ## Configuration
 
@@ -68,7 +68,9 @@ only needed once.
 | Topic prefix of the bridge | `ambientika` | Must match `topic_prefix` of the bridge |
 | Discovery prefix | `homeassistant` | The adapter reads the unit names from the bridge's discovery messages. Leave empty if the bridge does not publish discovery; the units are then named by serial number. |
 
-`ambientika.0.info.connection` shows whether the adapter is connected to the broker.
+`ambientika.0.info.connection` shows whether the adapter is connected to the broker,
+`ambientika.0.info.bridge` whether the bridge itself is running (it reports that to the
+broker and the broker reports it when the bridge disappears).
 
 ## States
 
@@ -79,10 +81,13 @@ Every unit appears as `ambientika.0.<serial>` with the name it has in the Ambien
 | State | Values | Description |
 |-------|--------|-------------|
 | `operating_mode` | Smart, Auto, ManualHeatRecovery, Night, AwayHome, Surveillance, TimedExpulsion, Expulsion, Intake, MasterSlaveFlow, SlaveMasterFlow, Off | Operating mode. For paired units set the mode on the master. |
-| `fan_speed` | Low, Medium, High | Fan speed. Night and Turbo are shown when the unit selects them itself (e.g. in Smart mode) but cannot be set. |
+| `fan_speed` | Low, Medium, High (Night, Turbo) | Fan speed. Night and Turbo are steps the unit selects itself (e.g. in Smart mode). They are shown, and when one of them is written (a scene that restores what it saw) the bridge sets the nearest step instead: Low for Night, High for Turbo. |
 | `humidity_level` | Dry, Normal, Moist | Humidity setting |
-| `light_sensor_level` | Off, Low, Medium | Sensitivity of the twilight sensor |
-| `reset_filter` | button | Resets the filter counter (write `true`) |
+| `light_sensor_level` | Off, Low, Medium (NotAvailable) | Sensitivity of the twilight sensor |
+| `reset_filter` | button | Resets the filter counter (write `true`); `reset_state` shows how it went |
+
+A value that is not in the list is not sent; the log of the instance says which values
+are allowed. The same happens while the broker is not connected.
 
 ### Read only
 
@@ -98,8 +103,23 @@ Every unit appears as `ambientika.0.<serial>` with the name it has in the Ambien
 | `night_alarm` | Night mode signal of the unit (twilight sensor) |
 | `operating_mode_raw`, `last_operating_mode` | The unit's own mode and its last mode |
 | `device_role`, `zone_index` | Master/slave role and zone |
-| `online` | Unit reachable (from the bridge's availability topic) |
+| `online` | Unit reachable: the bridge receives its status, the bridge itself is running and the broker is connected. While it is `false` the other states keep their last values. |
+| `reset_state` | Status of the last filter reset: `idle`, `running`, `confirmed`, `unconfirmed`, `acknowledged` |
 | `*_num` | Numeric companion values for charts |
+
+### Diagnostics
+
+In the channel `ambientika.0.<serial>.diagnostics`, for the question "why is this unit
+offline from time to time":
+
+| State | Description |
+|-------|-------------|
+| `last_status` | Time of the last status packet the bridge received from the cloud for this unit |
+| `poll_failures_total` | Failed polls since the bridge started (`bridge_started`) |
+| `poll_failures_consecutive` | Failed polls in a row; `0` while the unit answers |
+| `last_failure`, `last_failure_reason` | Time and reason of the last failed poll |
+| `last_outage_start`, `last_outage_end`, `last_outage_polls` | The most recent outage: first and last failed poll and how many there were |
+| `reset_note` | What the filter reset does on this unit (a coupled Slave keeps its own counter) |
 
 ### NeuraCell-X®
 
@@ -120,9 +140,14 @@ on({ id: 'ambientika.0.A0B1C2D3E401.humidity_avg', change: 'ne' }, obj => {
 
 ## Troubleshooting
 
-- **No units appear:** check that `info.connection` is true and that the bridge publishes
-  `ambientika/<serial>/state` on the same broker (e.g. with MQTT Explorer). The topic prefix
-  must be identical in bridge and adapter.
+- **No units appear:** check that `info.connection` and `info.bridge` are true and that the
+  bridge publishes `ambientika/<serial>/state` on the same broker (e.g. with MQTT Explorer).
+  The topic prefix must be identical in bridge and adapter.
+- **`info.connection` stays false:** the log of the instance names the reason once (wrong
+  host or port, login refused, certificate not accepted). The adapter keeps trying every
+  5 seconds.
+- **All units show `online` false:** `info.bridge` is false, so the bridge is stopped or has
+  lost its connection to the broker. The values return by themselves when it is back.
 - **Units are named by serial number:** the names come from the bridge's discovery messages
   (bridge option `enable_discovery`, on by default) and the discovery prefix must match.
 - **A command has no effect:** the bridge log shows every received command

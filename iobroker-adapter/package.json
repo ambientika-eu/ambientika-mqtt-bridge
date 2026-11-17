@@ -1,6 +1,6 @@
 {
   "name": "iobroker.ambientika",
-  "version": "1.6.34",
+  "version": "1.6.35",
   "description": "ioBroker adapter for Ambientika ventilation units via the Ambientika MQTT Bridge",
   "author": {
     "name": "Südwind GmbH",
@@ -30,6 +30,7 @@
   "scripts": {
     "test:package": "mocha test/package.test.js --exit",
     "test:integration": "mocha test/integration.test.js --exit",
+    "test:system": "mocha test/system.test.js --exit",
     "test": "npm run test:package && npm run test:integration"
   },
   "dependencies": {

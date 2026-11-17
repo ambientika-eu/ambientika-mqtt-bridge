@@ -1,8 +1,13 @@
 {
     "common": {
         "name": "ambientika",
-        "version": "1.6.34",
+        "version": "1.6.35",
         "news": {
+            "1.6.35": {
+                "en": "Shows whether the bridge itself is running (info.bridge); units are set offline while the bridge or the broker is away. New states: filter reset status, poll diagnostics, all numeric values of the bridge. Fan steps Night and Turbo and the light sensor value NotAvailable can be set like in Home Assistant. Hardened against unexpected messages on the broker.",
+                "de": "Zeigt, ob die Bridge selbst läuft (info.bridge); Geräte werden offline gesetzt, solange Bridge oder Broker fehlen. Neue Datenpunkte: Status des Filter-Resets, Abruf-Diagnose, alle Zahlenwerte der Bridge. Lüfterstufen Night und Turbo sowie der Lichtsensor-Wert NotAvailable lassen sich wie in Home Assistant setzen. Robuster gegen unerwartete Nachrichten auf dem Broker.",
+                "it": "Mostra se il bridge stesso è in funzione (info.bridge); gli apparecchi vengono impostati offline finché bridge o broker non sono raggiungibili. Nuovi stati: stato del reset del filtro, diagnostica delle interrogazioni, tutti i valori numerici del bridge. Le velocità Night e Turbo e il valore NotAvailable del sensore di luce si possono impostare come in Home Assistant. Più robusto contro messaggi inattesi sul broker."
+            },
             "1.6.34": {
                 "en": "First complete release: reads the topics of the Ambientika MQTT Bridge (state, availability, NeuraCell-X), unit names from discovery, commands for mode, fan speed, humidity level, light sensor and filter reset, configuration page in Admin.",
                 "de": "Erste vollständige Version: liest die Topics der Ambientika MQTT Bridge (Status, Verfügbarkeit, NeuraCell-X), Gerätenamen aus der Discovery, Befehle für Modus, Lüfterstufe, Feuchtestufe, Lichtsensor und Filter-Reset, Konfigurationsseite im Admin.",
@@ -95,6 +100,19 @@
             "common": {
                 "role": "indicator.connected",
                 "name": "Connected to the MQTT broker",
+                "type": "boolean",
+                "read": true,
+                "write": false,
+                "def": false
+            },
+            "native": {}
+        },
+        {
+            "_id": "info.bridge",
+            "type": "state",
+            "common": {
+                "role": "indicator.reachable",
+                "name": "Ambientika MQTT Bridge online",
                 "type": "boolean",
                 "read": true,
                 "write": false,
