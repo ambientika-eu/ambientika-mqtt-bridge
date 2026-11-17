@@ -1,20 +1,28 @@
-name: Smoke test (build + import check)
+name: Smoke test (build + import check + run)
 
-# Builds all three Docker images and verifies that the ambientika_py
-# library, including the LightSensorLevel class, can be imported.
-# This catches the class of error reported in issue #1 before it can
-# reach end users.
+# Builds all three Docker images, verifies that the ambientika_py library,
+# including the LightSensorLevel class, can be imported (this catches the
+# class of error reported in issue #1 before it can reach end users), and
+# then runs each image for real: against a local stand-in for the Ambientika
+# cloud (sim/fake_cloud.py) and a real Mosquitto broker, driven by
+# test_system_sim.py - start, discovery, values, commands, filter reset,
+# broker restart, clean stop, Last Will, configuration.
 #
 # Note: ha-addon and ambientika_mqtt_bridge use the Home Assistant
 # add-on build convention with ARG BUILD_FROM. In a real HA install
-# the Supervisor injects this base image. For our smoke test we pass
-# the official HA amd64 Alpine base directly.
+# the Supervisor takes the base image from build.yaml. For the smoke
+# test we pass the amd64 image named there. The add-on images are
+# started the way the Supervisor starts them: with /data/options.json
+# and run.sh.
 
 on:
   push:
     branches: [main]
     paths:
       - "**/Dockerfile"
+      - "**/build.yaml"
+      - "**/config.yaml"
+      - "**/run.sh"
       - "**/requirements.txt"
       - "**/*.py"
       - ".github/workflows/smoke-test.yml"
@@ -22,6 +30,9 @@ on:
     branches: [main]
     paths:
       - "**/Dockerfile"
+      - "**/build.yaml"
+      - "**/config.yaml"
+      - "**/run.sh"
       - "**/requirements.txt"
       - "**/*.py"
       - ".github/workflows/smoke-test.yml"
@@ -42,19 +53,27 @@ jobs:
             dockerfile: Dockerfile
             context: .
             tag: ambientika-bridge:root
-            build_args: ""
+            build_args: |
+              BUILD_VERSION=ci
+            sim: --image
           - name: ha-addon (Alpine)
             dockerfile: ha-addon/Dockerfile
             context: ha-addon
             tag: ambientika-bridge:ha-addon
             build_args: |
-              BUILD_FROM=ghcr.io/home-assistant/amd64-base:latest
+              BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.20
+              BUILD_VERSION=ci
+              BUILD_ARCH=amd64
+            sim: --addon-image
           - name: ambientika_mqtt_bridge slug (Alpine)
             dockerfile: ambientika_mqtt_bridge/Dockerfile
             context: ambientika_mqtt_bridge
             tag: ambientika-bridge:slug
             build_args: |
-              BUILD_FROM=ghcr.io/home-assistant/amd64-base:latest
+              BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.20
+              BUILD_VERSION=ci
+              BUILD_ARCH=amd64
+            sim: --addon-image
 
     steps:
       - name: Checkout
@@ -90,3 +109,21 @@ jobs:
           import returns
           print('OK: paho.mqtt, yaml, aiohttp, returns all importable')
           "
+
+      - name: Setup Python (test driver)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Mosquitto and the test driver's dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mosquitto
+          sudo systemctl stop mosquitto || true
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # The groups hang and startfail belong to the request time limit of the
+      # bridge and are run by the functional test once that is in.
+      - name: Run the image against the cloud stand-in and a real broker
+        run: python test_system_sim.py ${{ matrix.image.sim }} "${{ matrix.image.tag }}" --only start,commands,broker,config
