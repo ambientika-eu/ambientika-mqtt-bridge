@@ -17,6 +17,9 @@
 #              which points at sim/fake_cloud.py. Checked: config flow, entities,
 #              climate services, button, outages, reload. SIM_SCENARIO=same-name gives
 #              two units the same name.
+#
+# Updates of the integration (an old version sets an installation up, a new one
+# takes over) are tested by sim/home-assistant/upgrade_test.py.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/../.." && pwd)"
 HASS="${HASS:-hass}"; PYTHON="${PYTHON:-python3}"; MOSQUITTO="${MOSQUITTO:-mosquitto}"

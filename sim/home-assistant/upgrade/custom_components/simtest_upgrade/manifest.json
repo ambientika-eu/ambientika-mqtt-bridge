@@ -1,0 +1,10 @@
+{
+  "domain": "simtest_upgrade",
+  "name": "Simulation test driver for updates of the HACS integration",
+  "codeowners": [],
+  "dependencies": [],
+  "documentation": "https://example.invalid",
+  "iot_class": "local_push",
+  "requirements": [],
+  "version": "0.0.1"
+}

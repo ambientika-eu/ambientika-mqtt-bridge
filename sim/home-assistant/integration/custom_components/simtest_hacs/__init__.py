@@ -2,6 +2,10 @@
 
 The integration is the released code; only its DEFAULT_HOST points at the local
 stand-in for the Ambientika cloud. Results go to SIM_HA_RESULT.
+
+Two things are checked from version 1.3 on and only noted for older versions:
+binary sensors of a unit without status are unavailable, and an account that is
+already set up is refused a second time.
 """
 import asyncio
 import json
@@ -15,6 +19,7 @@ import voluptuous as vol
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.loader import async_get_integration
 
 DOMAIN = "simtest_hacs"
 CONFIG_SCHEMA = vol.Schema({DOMAIN: object}, extra=vol.ALLOW_EXTRA)
@@ -91,6 +96,11 @@ async def run(hass: HomeAssistant):
     async def refresh(ids):
         await hass.services.async_call("homeassistant", "update_entity", {"entity_id": ids}, blocking=True)
 
+    integration = await async_get_integration(hass, "ambientika")
+    version = tuple(int(x) for x in str(integration.version).split(".")[:2])
+    since_1_3 = version >= (1, 3)
+    _LOGGER.info("integration version %s", integration.version)
+
     if os.environ.get("SIM_SCENARIO") == "same-name":
         # two units carry the same name in the app
         try:
@@ -99,8 +109,8 @@ async def run(hass: HomeAssistant):
             res = await flow.async_configure(res["flow_id"], {"username": USER, "password": PASSWORD})
             await hass.async_block_till_done()
             entry = hass.config_entries.async_entries("ambientika")[0]
-            ents = [e for e in ent.entities.values() if e.config_entry_id == entry.entry_id]
-            devs = [d for d in dev.devices.values() if entry.entry_id in d.config_entries]
+            ents = er.async_entries_for_config_entry(ent, entry.entry_id)
+            devs = dr.async_entries_for_config_entry(dev, entry.entry_id)
             counts = {}
             for e in ents:
                 counts[e.domain] = counts.get(e.domain, 0) + 1
@@ -134,8 +144,8 @@ async def run(hass: HomeAssistant):
         entries = hass.config_entries.async_entries("ambientika")
         entry = entries[0] if entries else None
         check("entry loaded", entry is not None and entry.state.value == "loaded", entry.state if entry else None)
-        ents = [e for e in ent.entities.values() if entry and e.config_entry_id == entry.entry_id]
-        devs = [d for d in dev.devices.values() if entry and entry.entry_id in d.config_entries]
+        ents = er.async_entries_for_config_entry(ent, entry.entry_id) if entry else []
+        devs = dr.async_entries_for_config_entry(dev, entry.entry_id) if entry else []
         check("five devices with the names of the app", sorted(d.name for d in devs) == sorted(NAMES),
               sorted(d.name for d in devs))
         by = {}
@@ -245,8 +255,13 @@ async def run(hass: HomeAssistant):
         k_states = {i: st(i) for i in k_ids}
         check("unit without status packet: climate and sensors become unavailable",
               all(v == "unavailable" for i, v in k_states.items() if i.startswith(("climate.", "sensor."))), k_states)
-        RESULTS.append({"name": "OBSERVATION binary sensors of a unit without status packet", "ok": True,
-                        "detail": str({i: v for i, v in k_states.items() if i.startswith("binary_sensor.")})})
+        k_binary = {i: v for i, v in k_states.items() if i.startswith("binary_sensor.")}
+        if since_1_3:
+            check("unit without status packet: its binary sensors are unavailable too",
+                  k_binary and all(v == "unavailable" for v in k_binary.values()), k_binary)
+        else:
+            RESULTS.append({"name": "OBSERVATION binary sensors of a unit without status packet", "ok": True,
+                            "detail": str(k_binary)})
         check("the other units stay available", st(climate) not in (None, "unavailable"))
         await cloud.unit(SLAVE2, fault=None)
         await refresh(k_ids)
@@ -264,17 +279,24 @@ async def run(hass: HomeAssistant):
               [i for i in all_ids if st(i) in (None, "unavailable")])
 
         # ---- reload and unload
-        n_before = len([e for e in ent.entities.values() if e.config_entry_id == entry.entry_id])
+        n_before = len(er.async_entries_for_config_entry(ent, entry.entry_id))
         check("reload of the entry", await hass.config_entries.async_reload(entry.entry_id) and entry.state.value == "loaded",
               entry.state)
         await hass.async_block_till_done()
-        n_after = len([e for e in ent.entities.values() if e.config_entry_id == entry.entry_id])
+        n_after = len(er.async_entries_for_config_entry(ent, entry.entry_id))
         check("no entity added or lost over the reload (%d)" % n_after, n_after == n_before
-              and not [e.entity_id for e in ent.entities.values() if e.entity_id.endswith("_2")], (n_before, n_after))
+              and not [e.entity_id for e in er.async_entries_for_config_entry(ent, entry.entry_id)
+                       if e.entity_id.endswith("_2")], (n_before, n_after))
         res = await flow.async_init("ambientika", context={"source": "user"})
         res = await flow.async_configure(res["flow_id"], {"username": USER, "password": PASSWORD})
-        RESULTS.append({"name": "OBSERVATION second set-up with the same account", "ok": True,
-                        "detail": "%s %s" % (res.get("type"), res.get("reason") or res.get("title"))})
+        if since_1_3:
+            check("second set-up with the same account: refused as already set up",
+                  res.get("type") == "abort" and res.get("reason") == "already_configured"
+                  and len(hass.config_entries.async_entries("ambientika")) == 1,
+                  "%s %s" % (res.get("type"), res.get("reason") or res.get("title")))
+        else:
+            RESULTS.append({"name": "OBSERVATION second set-up with the same account", "ok": True,
+                            "detail": "%s %s" % (res.get("type"), res.get("reason") or res.get("title"))})
         await hass.async_block_till_done()
         check("unload of the entry", await hass.config_entries.async_unload(entry.entry_id) and entry.state.value == "not_loaded",
               entry.state)
