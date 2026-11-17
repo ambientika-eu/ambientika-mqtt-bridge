@@ -1,0 +1,106 @@
+{
+    "common": {
+        "name": "ambientika",
+        "version": "1.6.34",
+        "news": {
+            "1.6.34": {
+                "en": "First complete release: reads the topics of the Ambientika MQTT Bridge (state, availability, NeuraCell-X), unit names from discovery, commands for mode, fan speed, humidity level, light sensor and filter reset, configuration page in Admin.",
+                "de": "Erste vollständige Version: liest die Topics der Ambientika MQTT Bridge (Status, Verfügbarkeit, NeuraCell-X), Gerätenamen aus der Discovery, Befehle für Modus, Lüfterstufe, Feuchtestufe, Lichtsensor und Filter-Reset, Konfigurationsseite im Admin.",
+                "it": "Prima versione completa: legge i topic dell'Ambientika MQTT Bridge (stato, disponibilità, NeuraCell-X), nomi degli apparecchi dalla discovery, comandi per modalità, velocità, livello di umidità, sensore di luce e reset del filtro, pagina di configurazione in Admin."
+            }
+        },
+        "titleLang": {
+            "en": "Ambientika ventilation",
+            "de": "Ambientika Lüftung",
+            "it": "Ambientika ventilazione",
+            "fr": "Ventilation Ambientika",
+            "es": "Ventilación Ambientika",
+            "nl": "Ambientika ventilatie",
+            "pl": "Wentylacja Ambientika",
+            "pt": "Ventilação Ambientika",
+            "ru": "Вентиляция Ambientika",
+            "uk": "Вентиляція Ambientika",
+            "zh-cn": "Ambientika 通风"
+        },
+        "desc": {
+            "en": "Ambientika ventilation units with heat recovery via the Ambientika MQTT Bridge",
+            "de": "Ambientika Lüftungsgeräte mit Wärmerückgewinnung über die Ambientika MQTT Bridge",
+            "it": "Apparecchi di ventilazione Ambientika con recupero di calore tramite l'Ambientika MQTT Bridge",
+            "fr": "Unités de ventilation Ambientika avec récupération de chaleur via l'Ambientika MQTT Bridge",
+            "es": "Equipos de ventilación Ambientika con recuperación de calor a través del Ambientika MQTT Bridge",
+            "nl": "Ambientika ventilatie-units met warmteterugwinning via de Ambientika MQTT Bridge",
+            "pl": "Urządzenia wentylacyjne Ambientika z odzyskiem ciepła przez Ambientika MQTT Bridge",
+            "pt": "Unidades de ventilação Ambientika com recuperação de calor através do Ambientika MQTT Bridge",
+            "ru": "Вентиляционные устройства Ambientika с рекуперацией тепла через Ambientika MQTT Bridge",
+            "uk": "Вентиляційні пристрої Ambientika з рекуперацією тепла через Ambientika MQTT Bridge",
+            "zh-cn": "通过 Ambientika MQTT Bridge 连接带热回收的 Ambientika 通风设备"
+        },
+        "authors": ["Südwind GmbH <info@ambientika.eu>"],
+        "keywords": ["ambientika", "ventilation", "lüftung", "heat recovery", "mqtt", "radon"],
+        "licenseInformation": {
+            "type": "free",
+            "license": "MIT"
+        },
+        "platform": "Javascript/Node.js",
+        "icon": "ambientika.png",
+        "extIcon": "https://raw.githubusercontent.com/ambientika-eu/ambientika-mqtt-bridge/main/iobroker-adapter/admin/ambientika.png",
+        "readme": "https://github.com/ambientika-eu/ambientika-mqtt-bridge/blob/main/iobroker-adapter/README.md",
+        "enabled": true,
+        "loglevel": "info",
+        "mode": "daemon",
+        "type": "climate-control",
+        "compact": true,
+        "connectionType": "local",
+        "dataSource": "push",
+        "tier": 3,
+        "adminUI": {
+            "config": "json"
+        },
+        "dependencies": [
+            {
+                "js-controller": ">=5.0.19"
+            }
+        ],
+        "globalDependencies": [
+            {
+                "admin": ">=6.13.16"
+            }
+        ]
+    },
+    "native": {
+        "mqttHost": "localhost",
+        "mqttPort": 1883,
+        "mqttUser": "",
+        "mqttPassword": "",
+        "mqttTls": false,
+        "mqttTlsInsecure": false,
+        "mqttPrefix": "ambientika",
+        "discoveryPrefix": "homeassistant"
+    },
+    "protectedNative": ["mqttPassword"],
+    "encryptedNative": ["mqttPassword"],
+    "objects": [],
+    "instanceObjects": [
+        {
+            "_id": "info",
+            "type": "channel",
+            "common": {
+                "name": "Information"
+            },
+            "native": {}
+        },
+        {
+            "_id": "info.connection",
+            "type": "state",
+            "common": {
+                "role": "indicator.connected",
+                "name": "Connected to the MQTT broker",
+                "type": "boolean",
+                "read": true,
+                "write": false,
+                "def": false
+            },
+            "native": {}
+        }
+    ]
+}

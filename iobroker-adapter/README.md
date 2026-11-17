@@ -5,188 +5,138 @@
 > **Powered by NeuraCell-X® — the patent-pending AI Neural Control System.**
 > Active radon protection and intelligent dew-point (Taupunkt) ventilation control.
 
-# ioBroker Adapter: Ambientika
+# ioBroker adapter: Ambientika
 
-ioBroker adapter for **Ambientika** ventilation units, connecting them via MQTT
-to the ioBroker smart home platform.
+ioBroker adapter for **Ambientika** ventilation units with heat recovery. It reads the
+topics of the [Ambientika MQTT Bridge](https://github.com/ambientika-eu/ambientika-mqtt-bridge)
+from your MQTT broker and shows every unit as an ioBroker device. Commands from ioBroker go
+back to the units through the bridge.
 
-> **ioBroker** is the most popular open-source smart home platform in Germany
-> and Austria (>200,000 installations).
+Maintained by **Südwind GmbH**, the manufacturer of Ambientika. Version 1.6.34 matches
+bridge 1.6.34.
 
-## Features
-
-- Automatic device discovery via MQTT
-- Real-time state updates: mode, fan speed, temperature, humidity, air quality
-- Filter alarm notification
-- Bidirectional control: set mode and fan speed from ioBroker
-- Works with all ioBroker visualizations (VIS, VIS-2, Lovelace, etc.)
-- Compatible with ioBroker Alexa, Google Home, Apple HomeKit adapters
-
-## Architecture
+## How it works
 
 ```
-Ambientika Device
-       |
-  [Ambientika MQTT Bridge]
-       |  MQTT: ambientika/<id>/status
-       v
-  [MQTT Broker (Mosquitto)]
-       |
-  [ioBroker ambientika Adapter]  <-- this adapter
-       |
-  ioBroker object tree:
-  ambientika.0
-  ├── <deviceId>
-  │   ├── mode          (string, writable)
-  │   ├── fanSpeed      (number 0-100, writable)
-  │   ├── temperature   (number °C)
-  │   ├── humidity      (number %)
-  │   ├── airQuality    (number ppm)
-  │   ├── filterAlarm   (boolean)
-  │   ├── online        (boolean)
-  │   └── rssi          (number dBm)
+Ambientika units ── Ambientika cloud ── Ambientika MQTT Bridge
+                                              │  ambientika/<serial>/state
+                                              ▼
+                                         MQTT broker (Mosquitto or ioBroker.mqtt)
+                                              │
+                                              ▼
+                                    ioBroker adapter "ambientika"
+                                              │
+                                     ambientika.0.<serial>.*
 ```
+
+The adapter does not talk to the cloud itself. The bridge must be running (Home Assistant
+add-on, Docker or Python) and publish to the same broker.
 
 ## Prerequisites
 
-1. ioBroker installed and running
-2. [Ambientika MQTT Bridge](https://github.com/ambientika-eu/ambientika-mqtt-bridge) running
-3. MQTT broker accessible from ioBroker (e.g. `ioBroker.mqtt` adapter)
+1. ioBroker with js-controller 5 or newer and Admin 6.13 or newer
+2. A running [Ambientika MQTT Bridge](https://github.com/ambientika-eu/ambientika-mqtt-bridge)
+3. An MQTT broker that both the bridge and ioBroker can reach (Mosquitto, or the
+   `ioBroker.mqtt` adapter in server mode)
 
 ## Installation
 
-### Method 1: From GitHub (manual)
+The adapter is not yet in the ioBroker repository. Install it from the release package
+(run on the ioBroker host):
 
 ```bash
-# Navigate to your ioBroker installation
 cd /opt/iobroker
-
-# Install adapter
-npm install github:ambientika-eu/ambientika-mqtt-bridge#main --prefix node_modules/iobroker.ambientika
-
-# Or clone and install locally
-cd /opt/iobroker/node_modules
-git clone https://github.com/ambientika-eu/ambientika-mqtt-bridge.git
-cp -r ambientika-mqtt-bridge/iobroker-adapter ./iobroker.ambientika
-cd iobroker.ambientika
-npm install
-
-# Add to ioBroker
-iobroker add ambientika
+sudo -u iobroker npm install --omit=dev \
+  https://github.com/ambientika-eu/ambientika-mqtt-bridge/releases/download/v1.6.34/iobroker.ambientika-1.6.34.tgz
+sudo -u iobroker iobroker add ambientika
 ```
 
-### Method 2: ioBroker Admin UI (when published)
+Then open the new instance `ambientika.0` in Admin and enter the broker settings.
 
-1. Open ioBroker Admin
-2. Go to **Adapter** tab
-3. Search for `ambientika`
-4. Click **+** to install
-5. Create an instance
+To update, run the same two commands with the newer release package; `iobroker add` is
+only needed once.
 
 ## Configuration
 
-After installation, open the adapter instance settings:
-
 | Setting | Default | Description |
 |---------|---------|-------------|
-| MQTT Host | `localhost` | Hostname/IP of your MQTT broker |
-| MQTT Port | `1883` | MQTT broker port |
-| MQTT User | *(empty)* | Username (if authentication enabled) |
-| MQTT Password | *(empty)* | Password |
-| MQTT Prefix | `ambientika` | Topic prefix (must match MQTT bridge setting) |
-| TLS | off | Enable for MQTT over TLS (port 8883) |
+| MQTT broker host | `localhost` | Host name or IP of the broker |
+| Port | `1883` | Broker port (usually 8883 with TLS) |
+| User / Password | *(empty)* | Broker login, if required. The password is stored encrypted. |
+| Use TLS | off | MQTT over TLS (`mqtts`) |
+| Accept self-signed certificates | off | Only with TLS |
+| Topic prefix of the bridge | `ambientika` | Must match `topic_prefix` of the bridge |
+| Discovery prefix | `homeassistant` | The adapter reads the unit names from the bridge's discovery messages. Leave empty if the bridge does not publish discovery; the units are then named by serial number. |
 
-## States Reference
+`ambientika.0.info.connection` shows whether the adapter is connected to the broker.
 
-### Read + Write
+## States
 
-| State | Type | Values | Description |
-|-------|------|--------|-------------|
-| `mode` | string | OFF, HRV, SUPPLY, EXHAUST, NIGHT, AUTO | Operating mode |
-| `fanSpeed` | number | 0–100 | Fan speed in % |
+Every unit appears as `ambientika.0.<serial>` with the name it has in the Ambientika app.
 
-### Read Only
+### Read and write
 
-| State | Type | Unit | Description |
-|-------|------|------|-------------|
-| `temperature` | number | °C | Indoor temperature |
-| `humidity` | number | % | Relative humidity |
-| `airQuality` | number | ppm | CO₂ equivalent |
-| `filterAlarm` | boolean | — | Filter change required |
-| `online` | boolean | — | Device reachability |
-| `rssi` | number | dBm | WiFi signal strength |
+| State | Values | Description |
+|-------|--------|-------------|
+| `operating_mode` | Smart, Auto, ManualHeatRecovery, Night, AwayHome, Surveillance, TimedExpulsion, Expulsion, Intake, MasterSlaveFlow, SlaveMasterFlow, Off | Operating mode. For paired units set the mode on the master. |
+| `fan_speed` | Low, Medium, High | Fan speed. Night and Turbo are shown when the unit selects them itself (e.g. in Smart mode) but cannot be set. |
+| `humidity_level` | Dry, Normal, Moist | Humidity setting |
+| `light_sensor_level` | Off, Low, Medium | Sensitivity of the twilight sensor |
+| `reset_filter` | button | Resets the filter counter (write `true`) |
 
-## Automation Examples
+### Read only
 
-### Blockly: Auto Night Mode
+| State | Description |
+|-------|-------------|
+| `temperature`, `humidity` | Current reading of the unit |
+| `temperature_avg`, `humidity_avg` | Averaged readings (see the bridge options `average_window_min` and following) |
+| `humidity_raw` | Humidity as reported, also above 100 % |
+| `air_quality` | Air quality (VeryGood, Good, Medium, Poor, Bad) |
+| `filters_status`, `filters_status_raw` | Effective filter status and the unit's own value |
+| `filter_ack_since`, `filter_ack_until` | Maintenance acknowledgement for slaves, if set |
+| `humidity_alarm` | Humidity alarm of the unit |
+| `night_alarm` | Night mode signal of the unit (twilight sensor) |
+| `operating_mode_raw`, `last_operating_mode` | The unit's own mode and its last mode |
+| `device_role`, `zone_index` | Master/slave role and zone |
+| `online` | Unit reachable (from the bridge's availability topic) |
+| `*_num` | Numeric companion values for charts |
 
-```
-On time 22:00
-  → Set ambientika.0.<deviceId>.mode = "NIGHT"
-On time 06:00
-  → Set ambientika.0.<deviceId>.mode = "HRV"
-```
+### NeuraCell-X®
 
-### JavaScript Rule: High Humidity Alert
+Under `ambientika.0.neuracell`, if the bridge runs radon or dew-point protection:
+`radon_protection`, `radon`, `radon_threshold`, `radon_meter_connected`, `dewpoint_block`,
+`dewpoint_controller_connected`, `dewpoint_fallback`, `indoor_dew_point`,
+`outdoor_dew_point`, `override_active`. All read only.
+
+## Example: ventilate the bathroom after a shower
 
 ```javascript
-on({id: "ambientika.0.DEV001.humidity", change: "gt"}, (obj) => {
-    if (obj.state.val > 70) {
-        // Set to exhaust mode to remove humidity
-        setState("ambientika.0.DEV001.mode", "EXHAUST");
-        // Send notification
-        sendTo("telegram.0", "Ambientika: High humidity " + obj.state.val + "% - switching to exhaust mode");
+on({ id: 'ambientika.0.E05A1B9BAF0C.humidity_avg', change: 'ne' }, obj => {
+    if (obj.state.val > 75) {
+        setState('ambientika.0.E05A1B9BAF0C.fan_speed', 'High');
     }
 });
 ```
 
-### Use with Apple HomeKit (ioBroker)
+## Troubleshooting
 
-Install the `ioBroker.yahka` adapter to expose Ambientika devices to Apple Home:
-
-1. Install `ioBroker.yahka`
-2. Map `ambientika.0.<id>.fanSpeed` → HomeKit Fan Speed
-3. Map `ambientika.0.<id>.mode` (OFF/HRV) → HomeKit Fan On/Off
-
-## Visualization
-
-Use **ioBroker VIS-2** or **ioBroker Lovelace** to build a dashboard.
-Example widgets:
-- Slider for `fanSpeed`
-- Dropdown for `mode`
-- Gauge for `temperature` and `humidity`
-- LED indicator for `filterAlarm`
+- **No units appear:** check that `info.connection` is true and that the bridge publishes
+  `ambientika/<serial>/state` on the same broker (e.g. with MQTT Explorer). The topic prefix
+  must be identical in bridge and adapter.
+- **Units are named by serial number:** the names come from the bridge's discovery messages
+  (bridge option `enable_discovery`, on by default) and the discovery prefix must match.
+- **A command has no effect:** the bridge log shows every received command
+  (`Command received: serial=… attr=…`).
 
 ## Related
 
-- [Main Repository](https://github.com/ambientika-eu/ambientika-mqtt-bridge)
-- [Home Assistant Add-on](../ha-addon/)
-- [Matter Bridge](../matter-bridge/) – Apple Home, Google Home, Alexa
-- [Homebridge Plugin](../homebridge-plugin/)
-- [Node-RED Flow](../examples/node-red/)
+- [Ambientika MQTT Bridge](https://github.com/ambientika-eu/ambientika-mqtt-bridge)
+- [Home Assistant add-on](https://github.com/ambientika-eu/ambientika-ha-addon)
+- [Homebridge plugin](../homebridge-plugin/) and [Matter bridge](../matter-bridge/)
+- Support: info@ambientika.eu
 
 ## License
 
-MIT License
+MIT License, © Südwind GmbH (SUEDWIND S.R.L.)
 
----
-
-## NeuraCell-X® — patent-pending radon & dew-point protection
-
-![NeuraCell-X®](neuracell-x-logo.png)
-
-This component surfaces the live status of **NeuraCell-X®**, the *patent-pending* AI Neural
-Control System built into the Ambientika MQTT Bridge:
-
-- **Radon protection (highest priority):** when the radon meter alarms, every unit
-  switches to supply / Intake mode at fan **Stufe 1** — a gentle fresh-air overpressure
-  that actively slows radon ingress.
-- **Dew-point control (Taupunktsteuerung):** when ventilating would raise indoor
-  humidity, the units switch **off**; when conditions are favourable again, ventilation
-  is released.
-- Radon **overrides** the dew-point block, and every device is restored to the **exact**
-  mode it had before once all protections clear.
-
-**Exposed under the `ambientika.0.neuracell` channel:** `radon_protection`, `radon`, `radon_threshold`, `dewpoint_block`, `indoor_dew_point`, `outdoor_dew_point`, `override_active`. All read-only.
-
-*NeuraCell-X® and PhaseCell-X® are registered trademarks of Südwind / Ambientika. Patent pending.*
+*NeuraCell-X® and PhaseCell-X® are registered trademarks. Patent pending.*

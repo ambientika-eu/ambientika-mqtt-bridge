@@ -1,49 +1,53 @@
 {
   "name": "iobroker.ambientika",
-  "version": "0.1.0",
-  "description": "ioBroker adapter for Ambientika ventilation units via MQTT",
+  "version": "1.6.34",
+  "description": "ioBroker adapter for Ambientika ventilation units via the Ambientika MQTT Bridge",
   "author": {
     "name": "Südwind GmbH",
     "email": "info@ambientika.eu"
   },
-  "homepage": "https://www.ambientika.eu",
+  "homepage": "https://github.com/ambientika-eu/ambientika-mqtt-bridge/tree/main/iobroker-adapter",
   "license": "MIT",
   "keywords": [
     "ioBroker",
     "Ambientika",
     "ventilation",
+    "heat recovery",
     "MQTT",
-    "smart home",
-    "Lueftung"
+    "Lüftung"
   ],
   "main": "main.js",
+  "files": [
+    "admin/",
+    "main.js",
+    "io-package.json",
+    "LICENSE",
+    "README.md"
+  ],
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18"
   },
   "scripts": {
-    "start": "node main.js"
+    "test:package": "mocha test/package.test.js --exit",
+    "test:integration": "mocha test/integration.test.js --exit",
+    "test": "npm run test:package && npm run test:integration"
   },
   "dependencies": {
-    "@iobroker/adapter-core": "^3.1.6",
-    "mqtt": "^5.3.4"
+    "@iobroker/adapter-core": "^3.2.3",
+    "mqtt": "^5.10.0"
   },
   "devDependencies": {
-    "@iobroker/testing": "^4.1.3"
-  },
-  "ioBroker": {
-    "type": "other",
-    "icon": "admin/ambientika.png",
-    "adminTab": false,
-    "schedule": null,
-    "mode": "daemon",
-    "readme": "https://github.com/ambientika-eu/ambientika-mqtt-bridge/blob/main/iobroker-adapter/README.md",
-    "loglevel": "info",
-    "messagebox": false,
-    "compact": false,
-    "datapoints": 15
+    "@iobroker/testing": "^5.1.1",
+    "aedes": "^0.51.3",
+    "chai": "^4.5.0",
+    "mocha": "^10.8.2"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/ambientika-eu/ambientika-mqtt-bridge.git"
+    "url": "git+https://github.com/ambientika-eu/ambientika-mqtt-bridge.git",
+    "directory": "iobroker-adapter"
+  },
+  "bugs": {
+    "url": "https://github.com/ambientika-eu/ambientika-mqtt-bridge/issues"
   }
 }

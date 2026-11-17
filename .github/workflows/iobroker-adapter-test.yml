@@ -1,0 +1,32 @@
+name: ioBroker adapter test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "iobroker-adapter/**"
+      - ".github/workflows/iobroker-adapter-test.yml"
+  pull_request:
+    paths:
+      - "iobroker-adapter/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    defaults:
+      run:
+        working-directory: iobroker-adapter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: npm test

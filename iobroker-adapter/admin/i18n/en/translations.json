@@ -1,0 +1,12 @@
+{
+    "The adapter reads the topics of the Ambientika MQTT Bridge. Use the same MQTT broker and topic prefix as the bridge.": "The adapter reads the topics of the Ambientika MQTT Bridge. Use the same MQTT broker and topic prefix as the bridge.",
+    "MQTT broker host": "MQTT broker host",
+    "Port": "Port",
+    "User": "User",
+    "Password": "Password",
+    "Use TLS (mqtts)": "Use TLS (mqtts)",
+    "Accept self-signed certificates": "Accept self-signed certificates",
+    "Topic prefix of the bridge": "Topic prefix of the bridge",
+    "Discovery prefix (unit names)": "Discovery prefix (unit names)",
+    "Leave empty if the bridge does not publish Home Assistant discovery": "Leave empty if the bridge does not publish Home Assistant discovery"
+}

@@ -1,0 +1,59 @@
+{
+    "i18n": true,
+    "type": "panel",
+    "items": {
+        "_info": {
+            "type": "staticText",
+            "text": "The adapter reads the topics of the Ambientika MQTT Bridge. Use the same MQTT broker and topic prefix as the bridge.",
+            "xs": 12, "sm": 12, "md": 12, "lg": 12, "xl": 12
+        },
+        "mqttHost": {
+            "type": "text",
+            "label": "MQTT broker host",
+            "newLine": true,
+            "xs": 12, "sm": 8, "md": 6, "lg": 4, "xl": 4
+        },
+        "mqttPort": {
+            "type": "number",
+            "label": "Port",
+            "min": 1, "max": 65535,
+            "xs": 12, "sm": 4, "md": 2, "lg": 2, "xl": 2
+        },
+        "mqttUser": {
+            "type": "text",
+            "label": "User",
+            "newLine": true,
+            "xs": 12, "sm": 6, "md": 4, "lg": 3, "xl": 3
+        },
+        "mqttPassword": {
+            "type": "password",
+            "label": "Password",
+            "repeat": false,
+            "xs": 12, "sm": 6, "md": 4, "lg": 3, "xl": 3
+        },
+        "mqttTls": {
+            "type": "checkbox",
+            "label": "Use TLS (mqtts)",
+            "newLine": true,
+            "xs": 12, "sm": 6, "md": 4, "lg": 3, "xl": 3
+        },
+        "mqttTlsInsecure": {
+            "type": "checkbox",
+            "label": "Accept self-signed certificates",
+            "hidden": "!data.mqttTls",
+            "xs": 12, "sm": 6, "md": 4, "lg": 3, "xl": 3
+        },
+        "mqttPrefix": {
+            "type": "text",
+            "label": "Topic prefix of the bridge",
+            "newLine": true,
+            "xs": 12, "sm": 6, "md": 4, "lg": 3, "xl": 3
+        },
+        "discoveryPrefix": {
+            "type": "text",
+            "label": "Discovery prefix (unit names)",
+            "help": "Leave empty if the bridge does not publish Home Assistant discovery",
+            "xs": 12, "sm": 6, "md": 4, "lg": 3, "xl": 3
+        }
+    }
+}
