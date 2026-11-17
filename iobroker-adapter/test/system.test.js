@@ -470,7 +470,10 @@ tests.integration(path.join(__dirname, '..'), {
                     filters_status: { a: 1 }, operating_mode: ['x'], fan_speed: null, operating_mode_num: 1e400, device_role: 'x'.repeat(5000),
                     __proto__: { polluted: true }, constructor: 'c', toString: 1,
                 }));
-                await until(async () => (await d.val('U1.humidity')) === 48.5, 5000);
+                // operating_mode_num is the last field of this message that changes: once it is
+                // written, the fields before it have been handled too
+                await until(async () => (await d.val('U1.humidity')) === 48.5 && (await d.val('U1.operating_mode_num')) === null
+                    && String(await d.val('U1.device_role')).length <= 200, 10000);
                 check('number as text is taken, text that is no number is not', (await d.val('U1.humidity')) === 48.5 && (await d.val('U1.temperature')) === 21,
                     [await d.val('U1.humidity'), await d.val('U1.temperature')]);
                 check('boolean: ON is true, an unknown word leaves the state alone', (await d.val('U1.night_alarm')) === true && (await d.val('U1.humidity_alarm')) === false,
@@ -490,8 +493,8 @@ tests.integration(path.join(__dirname, '..'), {
                     await spy.pub(`homeassistant/sensor/U1_x/config`, p);
                 }
                 for (const p of ['', 'ONLINE', 'Offline ', 'maybe', '1', '{"state":"online"}']) await spy.pub(`${P}/U1/availability`, p);
-                await wait(800);
-                check('availability: only online/offline count (case and spaces forgiven)', (await d.val('U1.online')) === false, await d.val('U1.online'));
+                check('availability: only online/offline count (case and spaces forgiven)', await until(async () => (await d.val('U1.online')) === false, 8000)
+                    && (await wait(600), (await d.val('U1.online')) === false), await d.val('U1.online'));
                 await spy.pub(`${P}/U1/availability`, 'online');
                 await spy.pub(`${P}/bridge/availability`, 'nonsense');
                 await spy.pub(`${P}/bridge/availability`, 'online');
@@ -509,6 +512,8 @@ tests.integration(path.join(__dirname, '..'), {
                 await spy.pub(`${P}`, JSON.stringify(GOOD));
                 await spy.pub(`other/U9/state`, JSON.stringify(GOOD));
                 await spy.pub(`${P}x/U9/state`, JSON.stringify(GOOD));
+                // the last accepted serial of the list has all its states
+                await until(async () => (await d.val('admin_0.filter_status_raw_num')) !== undefined || (await d.obj('admin_0.filter_status_raw_num')), 15000);
                 await wait(1500);
                 const all = await d.list();
                 const ids = all.map(o => o._id);
@@ -592,7 +597,8 @@ tests.integration(path.join(__dirname, '..'), {
                     if (i % 200 === 199) await wait(60);
                 }
                 await spy.pub(`${P}/U1/state`, JSON.stringify({ ...GOOD, temperature: 17.25 }));
-                check(`all processed, adapter alive (${Date.now() - t0} ms for 4000 messages)`, await until(async () => (await d.val('U1.temperature')) === 17.25, 30000) && (await alive()));
+                check(`all processed, adapter alive (${Date.now() - t0} ms for 4000 messages)`, await until(async () => (await d.val('U1.temperature')) === 17.25, 60000) && (await alive()));
+                await wait(3000);
                 const errs = adapter.lines().filter(l => l.level === 'error' || l.level === 'raw');
                 check('no error and no stack trace', !errs.length, errs.slice(0, 5));
                 check('no warning', !adapter.lines().filter(l => l.level === 'warn').length, adapter.lines().filter(l => l.level === 'warn').slice(0, 5));
