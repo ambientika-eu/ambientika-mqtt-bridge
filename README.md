@@ -53,11 +53,23 @@ git clone https://github.com/ambientika-eu/ambientika-mqtt-bridge.git
 cd ambientika-mqtt-bridge
 cp .env.example .env
 cp config.example.yaml config.yaml
-# Edit .env (or config.yaml) with your Ambientika credentials and MQTT broker settings
+# Enter your Ambientika credentials in .env or in config.yaml; a value set in .env wins
 docker compose up -d
 ```
 
-All settings are listed under [Configuration](#configuration).
+This starts the published image [`ghcr.io/ambientika-eu/ambientika-mqtt-bridge`](https://github.com/ambientika-eu/ambientika-mqtt-bridge/pkgs/container/ambientika-mqtt-bridge) (amd64 and arm64) together with a Mosquitto broker. To update, run `docker compose pull` and then `docker compose up -d`; `docker compose up -d --build` builds the image from this folder instead.
+
+The compose file brings its own Mosquitto broker on port 1883, which accepts connections without user name and password - meant for a home network you trust. If you already run a broker, start the bridge alone instead (no repository needed):
+
+```bash
+docker run -d --name ambientika-bridge --restart unless-stopped \
+  -e AMBIENTIKA_USER=your@email.com -e AMBIENTIKA_PASS=yourpassword \
+  -e MQTT_HOST=192.168.1.10 -e MQTT_USER=mqttuser -e MQTT_PASSWORD=mqttpassword \
+  -v ambientika_bridge_data:/data \
+  ghcr.io/ambientika-eu/ambientika-mqtt-bridge:latest
+```
+
+Further settings go in as more `-e` variables or as a `config.yaml` mounted at `/config/config.yaml`. Every release is also available under its version number, e.g. `:1.6.36`. All settings are listed under [Configuration](#configuration).
 
 ---
 

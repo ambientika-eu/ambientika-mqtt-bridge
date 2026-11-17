@@ -1,7 +1,9 @@
-version: "3.8"
 services:
   ambientika-bridge:
-    image: ambientika-mqtt-bridge
+    # The published image (amd64 and arm64). "docker compose pull" fetches a
+    # newer version; "docker compose up -d --build" builds the image from
+    # this folder instead.
+    image: ghcr.io/ambientika-eu/ambientika-mqtt-bridge:latest
     build: .
     restart: unless-stopped
     # Either fill in ./config.yaml (see config.example.yaml) or set these in .env
