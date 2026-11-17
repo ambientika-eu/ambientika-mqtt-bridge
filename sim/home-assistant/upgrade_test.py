@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Update test of the integration 'Ambientika for Home Assistant' in a real Home Assistant.
 
-    python sim/home-assistant/upgrade_test.py --old PATH --new PATH [--only a,b] [--hass HASS] [--keep]
+    python sim/home-assistant/upgrade_test.py --old PATH --new PATH [--previous PATH] [--only a,b]
+                                              [--hass HASS] [--keep]
 
-PATH is a folder custom_components/ambientika: --old is the released version an
-installation comes from, --new the version under test. Both run unchanged
-except for DEFAULT_HOST, which points at sim/fake_cloud.py.
+PATH is a folder custom_components/ambientika: --old is version 1.2.x, which
+built the unique IDs from the names of the units, --new the version under
+test, and --previous the last released version that already builds them from
+the serial numbers (1.3 or newer). All run unchanged except for DEFAULT_HOST,
+which points at sim/fake_cloud.py.
 
 A scenario is a row of phases. In every phase one of the two versions is put
 into the configuration folder and Home Assistant runs until the test driver
@@ -28,6 +31,9 @@ Scenarios:
   sign-in-expires       the sign-in of the cloud expires while Home Assistant runs
   start-http-error-old-version, sign-in-expires-old-version
                         the same situations with the old version, to show what the new one fixes
+  previous-update       update from the previous version (only with --previous): nothing in the
+                        registries changes
+  previous-downgrade    new version, back to the previous one, forward again (only with --previous)
 
 Needs: hass (pip install homeassistant, plus the requirements in the manifest of
 the integration) and python with aiohttp for the stand-in.
@@ -127,7 +133,7 @@ OLD_SAME_NAME = [r"does not generate unique IDs"]
 # lines that belong to a cloud that fails on purpose
 FAILING_CLOUD = [r"Could not fetch status for device", r"Updating device \S+ failed", r"Writing to device \S+: failed",
                  r"press \S+: failed", r"signing in again failed", r"did not accept user name and password",
-                 r"answered the sign-in with HTTP status 500"]
+                 r"answered the sign-in with HTTP status 500", r"No status from (the unit|any of the)"]
 NOT_READY = [r"integration not ready yet: .*Ambientika cloud"]
 # Home Assistant writes these with the traceback of the error that ended the set-up
 OLD_SETUP_ERROR = [r"Error setting up entry"]
@@ -187,7 +193,19 @@ SCENARIOS = {
     "sign-in-expires-old-version": [
         Phase("old", "old", allow=FAILING_CLOUD),
     ],
+    "previous-update": [
+        Phase("previous", "previous", forbid=[NOT_MOVED]),
+        Phase("new-first", "new", forbid=[NOT_MOVED]),
+        Phase("new-second", "new", forbid=[NOT_MOVED]),
+    ],
+    "previous-downgrade": [
+        Phase("new", "new", forbid=[NOT_MOVED]),
+        Phase("previous", "previous", forbid=[NOT_MOVED]),
+        Phase("new-again", "new", forbid=[NOT_MOVED]),
+    ],
 }
+# scenarios that need --previous
+WITH_PREVIOUS = [name for name, phases in SCENARIOS.items() if any(p.version == "previous" for p in phases)]
 
 # What newer versions of Home Assistant say about the old version of the
 # integration (fixed in 1.3).
@@ -260,7 +278,8 @@ def run_scenario(name, args, rows):
             cloud.ctl("POST", "/_ctl/clear", {})  # every phase sees only its own calls
             if phase.before:
                 phase.before(cloud, work)
-            version = install(config, args.old if phase.version == "old" else args.new, cloud.url)
+            version = install(config, {"old": args.old, "new": args.new, "previous": args.previous}[phase.version],
+                              cloud.url)
             result = os.path.join(work, "result-%s.json" % phase.name)
             log_path = os.path.join(work, "hass-%s.log" % phase.name)
             env = dict(os.environ, SIM_SCENARIO=name, SIM_PHASE=phase.name, SIM_HA_RESULT=result, SIM_WORK=work,
@@ -318,16 +337,20 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--old", required=True, help="custom_components/ambientika of the released version")
     ap.add_argument("--new", required=True, help="custom_components/ambientika of the version under test")
+    ap.add_argument("--previous", default="", help="custom_components/ambientika of the last released version "
+                                                    "with unique IDs from the serial numbers (1.3 or newer)")
     ap.add_argument("--hass", default=os.environ.get("HASS", "hass"))
     ap.add_argument("--python", default=sys.executable, help="python with aiohttp, for the stand-in")
     ap.add_argument("--only", default="", help="comma-separated scenarios")
     ap.add_argument("--json", default="", help="write all results to this file")
     ap.add_argument("--keep", action="store_true", help="keep the work folders")
     args = ap.parse_args()
-    names = [n for n in args.only.split(",") if n] or list(SCENARIOS)
+    names = [n for n in args.only.split(",") if n] or [n for n in SCENARIOS if args.previous or n not in WITH_PREVIOUS]
     unknown = [n for n in names if n not in SCENARIOS]
     if unknown:
         ap.error("unknown scenario: %s" % ", ".join(unknown))
+    if not args.previous and [n for n in names if n in WITH_PREVIOUS]:
+        ap.error("these scenarios need --previous: %s" % ", ".join(n for n in names if n in WITH_PREVIOUS))
     rows, failed = [], []
     for name in names:
         if not run_scenario(name, args, rows):

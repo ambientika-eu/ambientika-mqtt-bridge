@@ -16,8 +16,10 @@ sim/home-assistant/run.sh (live test in a real Home Assistant).
 
 A control API under /_ctl lets a test change values and switch on faults:
 
-    GET  /_ctl/log      every call the bridge made (JSON list)
-    POST /_ctl/clear    empty that log
+    GET  /_ctl/log      the calls that change or fail something: sign-ins, commands, filter
+                        resets, refused and hanging requests (JSON list)
+    GET  /_ctl/counts   how often each endpoint was called, status requests per unit
+    POST /_ctl/clear    empty that log and the counts
     POST /_ctl/unit     {"serial": ..., "set": {...status fields...}, "name": "name in the app",
                          "fault": null | "404" | "500" | "hang" | "garbage" | "html"}
     POST /_ctl/outage   {"mode": "ok" | "500" | "hang" | "refuse-auth"}
@@ -91,6 +93,20 @@ def log(kind, **kw):
     save()
 
 
+# How often each endpoint was called since the last /_ctl/clear, whatever the
+# answer was; status requests per unit. For tests that count how often a client
+# asks. Kept in memory only.
+COUNTS = {}
+
+
+def count(kind, serial=None):
+    if serial is None:
+        COUNTS[kind] = COUNTS.get(kind, 0) + 1
+    else:
+        per_unit = COUNTS.setdefault(kind, {})
+        per_unit[serial] = per_unit.get(serial, 0) + 1
+
+
 def token():
     return "tok-%d" % S["token_no"]
 
@@ -114,6 +130,7 @@ async def gate(req):
 
 
 async def auth(req):
+    count("auth")
     if S["outage"] == "500":
         return web.json_response({"message": "Internal Server Error"}, status=500)
     if S["outage"] == "hang":
@@ -131,6 +148,7 @@ async def auth(req):
 
 
 async def houses(req):
+    count("houses")
     bad = await gate(req)
     if bad is not None:  # a response object is "empty", and so false, for older aiohttp versions
         return bad
@@ -138,6 +156,7 @@ async def houses(req):
 
 
 async def house(req):
+    count("house")
     bad = await gate(req)
     if bad is not None:  # a response object is "empty", and so false, for older aiohttp versions
         return bad
@@ -151,6 +170,7 @@ async def house(req):
 
 
 async def status(req):
+    count("status", req.query.get("deviceSerialNumber", ""))
     bad = await gate(req)
     if bad is not None:  # a response object is "empty", and so false, for older aiohttp versions
         return bad
@@ -174,6 +194,7 @@ async def status(req):
 
 
 async def change(req):
+    count("change-mode")
     bad = await gate(req)
     if bad is not None:  # a response object is "empty", and so false, for older aiohttp versions
         return bad
@@ -213,6 +234,7 @@ async def change(req):
 
 
 async def reset(req):
+    count("reset-filter")
     bad = await gate(req)
     if bad is not None:  # a response object is "empty", and so false, for older aiohttp versions
         return bad
@@ -237,8 +259,13 @@ async def ctl_log(req):
     return web.json_response(S["log"])
 
 
+async def ctl_counts(req):
+    return web.json_response(COUNTS)
+
+
 async def ctl_clear(req):
     S["log"] = []
+    COUNTS.clear()
     save()
     return web.json_response({"ok": True})
 
@@ -275,6 +302,7 @@ async def ctl_state(req):
 async def ctl_reset(req):
     global S
     S = fresh()
+    COUNTS.clear()
     save()
     return web.json_response({"ok": True})
 
@@ -288,6 +316,7 @@ app.add_routes([
     web.post("/device/change-mode", change),
     web.get("/device/reset-filter", reset),
     web.get("/_ctl/log", ctl_log),
+    web.get("/_ctl/counts", ctl_counts),
     web.post("/_ctl/clear", ctl_clear),
     web.post("/_ctl/unit", ctl_unit),
     web.post("/_ctl/outage", ctl_outage),

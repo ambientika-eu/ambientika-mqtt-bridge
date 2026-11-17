@@ -356,22 +356,32 @@ async def old_setup(ctx, customise=False, expect=30, snap="old"):
               sorted(e.entity_id for e in ents) in OLD_ENTITY_IDS, sorted(e.entity_id for e in ents))
         note("old version: entity IDs and names of the climate entity and the button of 'Flur'",
              [(i, ctx.attr(i, "friendly_name")) for i in (ctx.one(FLUR, "climate"), ctx.one(FLUR, "filter_reset"))])
-        areas = ar.async_get(ctx.hass)
-        wohnen, schlafen = areas.async_create("Wohnen"), areas.async_create("Schlafen")
-        ctx.ent.async_update_entity(ctx.one(FLUR, "air_quality"), new_entity_id="sensor.luft_im_flur")
-        ctx.ent.async_update_entity(ctx.one(FLUR, "filter_status"), name="Mein Filter", icon="mdi:air-filter")
-        ctx.ent.async_update_entity(ctx.one(KIND, "night_alarm"), disabled_by=er.RegistryEntryDisabler.USER)
-        ctx.ent.async_update_entity(ctx.one(WOHNEN, "humidity_alarm"), hidden_by=er.RegistryEntryHider.USER)
-        ctx.ent.async_update_entity(ctx.one(SCHLAFEN, "climate"), area_id=schlafen.id)
-        ctx.dev.async_update_device(ctx.device(WOHNEN).id, area_id=wohnen.id)
-        ctx.dev.async_update_device(ctx.device(BAD).id, name_by_user="Gästebad unten")
-        await ctx.hass.async_block_till_done()
-        await asyncio.sleep(1)
-        check("customised: renamed entity ID, own name and icon, one entity disabled, one hidden, areas, own device name",
-              ctx.ent.async_get("sensor.luft_im_flur") is not None and ctx.st(ctx.one(KIND, "night_alarm")) is None,
-              (ctx.one(FLUR, "air_quality"), ctx.st(ctx.one(KIND, "night_alarm"))))
+        await customise_installation(ctx)
     await ctx.all_available("old version: every entity has a value")
     await ctx.save(snap, ctx.snapshot())
+
+
+async def customise_installation(ctx, own_area="climate"):
+    """What a user changes in Home Assistant: an entity ID, a name, an icon, areas, hidden and disabled entities.
+
+    own_area names the entity that gets an area of its own. Since 1.3 the
+    climate entity is the unit itself (no name of its own), and newer versions
+    of Home Assistant give such an entity the area of its device only.
+    """
+    areas = ar.async_get(ctx.hass)
+    wohnen, schlafen = areas.async_create("Wohnen"), areas.async_create("Schlafen")
+    ctx.ent.async_update_entity(ctx.one(FLUR, "air_quality"), new_entity_id="sensor.luft_im_flur")
+    ctx.ent.async_update_entity(ctx.one(FLUR, "filter_status"), name="Mein Filter", icon="mdi:air-filter")
+    ctx.ent.async_update_entity(ctx.one(KIND, "night_alarm"), disabled_by=er.RegistryEntryDisabler.USER)
+    ctx.ent.async_update_entity(ctx.one(WOHNEN, "humidity_alarm"), hidden_by=er.RegistryEntryHider.USER)
+    ctx.ent.async_update_entity(ctx.one(SCHLAFEN, own_area), area_id=schlafen.id)
+    ctx.dev.async_update_device(ctx.device(WOHNEN).id, area_id=wohnen.id)
+    ctx.dev.async_update_device(ctx.device(BAD).id, name_by_user="Gästebad unten")
+    await ctx.hass.async_block_till_done()
+    await asyncio.sleep(1)
+    check("customised: renamed entity ID, own name and icon, one entity disabled, one hidden, areas, own device name",
+          ctx.ent.async_get("sensor.luft_im_flur") is not None and ctx.st(ctx.one(KIND, "night_alarm")) is None,
+          (ctx.one(FLUR, "air_quality"), ctx.st(ctx.one(KIND, "night_alarm"))))
 
 
 async def new_first(ctx, snap="old", save="new", untouched=(), added=0, live=None, with_commands=True):
@@ -764,7 +774,70 @@ async def password_new(ctx):
     await ctx.all_available("after the reload: every entity has a value", 30)
 
 
+async def previous_setup(ctx):
+    """The last released version sets the installation up, and the user customises it."""
+    if not await ctx.set_up():
+        return
+    snapshot = ctx.snapshot()
+    check("previous version: 30 entities with the entity IDs of a new installation",
+          sorted(e["entity_id"] for e in snapshot["entities"]) == NEW_ENTITY_IDS,
+          sorted(e["entity_id"] for e in snapshot["entities"]))
+    check("previous version: every unique ID is serial number + key",
+          all(e["unique_id"] == new_id(e) and e["serial"] for e in snapshot["entities"]),
+          [e["unique_id"] for e in snapshot["entities"]])
+    await customise_installation(ctx, own_area="filter_status")
+    await ctx.all_available("previous version: every entity has a value")
+    await ctx.save("previous", ctx.snapshot())
+
+
+def same_names(ctx, before, what):
+    changed = {b["entity_id"]: (b["friendly_name"], ctx.attr(b["entity_id"], "friendly_name"))
+               for b in before["entities"] if b["live"] and ctx.attr(b["entity_id"], "friendly_name") != b["friendly_name"]}
+    check("%s: every entity is shown under the same name as before" % what, not changed, changed)
+
+
+async def previous_new_first(ctx):
+    check("entry loaded after the update", await ctx.loaded(), ctx.state_of_entry())
+    before = await ctx.load("previous")
+    compare(ctx, before)
+    await ctx.all_available("after the update: every entity has a value", 29)
+    same_names(ctx, before, "after the update")
+    check("the entity renamed by the user is still sensor.luft_im_flur and has a value",
+          ctx.st("sensor.luft_im_flur") not in (None, "unavailable"), ctx.st("sensor.luft_im_flur"))
+    check("the entity disabled by the user is still disabled", ctx.st(ctx.one(KIND, "night_alarm")) is None,
+          ctx.st(ctx.one(KIND, "night_alarm")))
+    await commands(ctx)
+    await ctx.save("new", ctx.snapshot())
+
+
+async def previous_new_second(ctx):
+    await stable(ctx, "new", 29)
+
+
+async def previous_back(ctx):
+    """Back on the previous version, which knows the same unique IDs."""
+    check("entry loaded", await ctx.loaded(), ctx.state_of_entry())
+    before = await ctx.load("new")
+    compare(ctx, before, what="back on the previous version")
+    await ctx.all_available("back on the previous version: every entity has a value", 30)
+    same_names(ctx, before, "back on the previous version")
+    await commands(ctx)
+
+
+async def previous_forward(ctx):
+    check("entry loaded", await ctx.loaded(), ctx.state_of_entry())
+    before = await ctx.load("new")
+    compare(ctx, before, what="forward again")
+    await ctx.all_available("forward again: every entity has a value", 30)
+    same_names(ctx, before, "forward again")
+    await commands(ctx)
+
+
 PHASES = {
+    "previous-update:previous": previous_setup, "previous-update:new-first": previous_new_first,
+    "previous-update:new-second": previous_new_second,
+    "previous-downgrade:new": downgrade_new, "previous-downgrade:previous": previous_back,
+    "previous-downgrade:new-again": previous_forward,
     "plain:old": plain_old, "plain:new-first": plain_new_first, "plain:new-second": plain_new_second,
     "same-name:old": same_old, "same-name:new-first": same_new_first, "same-name:new-second": same_new_second,
     "renamed:old": renamed_old, "renamed:old-again": renamed_old_again,

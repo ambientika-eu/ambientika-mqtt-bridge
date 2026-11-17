@@ -6,6 +6,12 @@ stand-in for the Ambientika cloud. Results go to SIM_HA_RESULT.
 Two things are checked from version 1.3 on and only noted for older versions:
 binary sensors of a unit without status are unavailable, and an account that is
 already set up is refused a second time.
+
+From version 1.4 on the status of a unit is read once for all its entities.
+Checked from then on, noted for older versions: how often the cloud is asked
+(at the set-up, per minute, for an update of all entities of a unit), one line
+in the log for a unit that stops answering, and a request the cloud never
+answers.
 """
 import asyncio
 import json
@@ -29,6 +35,7 @@ CLOUD = os.environ["SIM_CLOUD_URL"]
 RESULT = os.environ["SIM_HA_RESULT"]
 USER, PASSWORD = "kunde@example.com", "geheim#1 äöü"
 MASTER, SLAVE2 = "A0B1C2D3E402", "A0B1C2D3E403"
+SERIALS = ["A0B1C2D3E401", "A0B1C2D3E402", "A0B1C2D3E403", "A0B1C2D3E404", "A0B1C2D3E405"]
 NAMES = ["Flur", "Wohnzimmer", "Kinderzimmer", "Gäste-Bad", "Schlafzimmer Eltern"]
 RESULTS = []
 
@@ -37,6 +44,22 @@ def check(name, cond, detail=None):
     RESULTS.append({"name": name, "ok": bool(cond), "detail": None if cond else str(detail)[:900]})
     _LOGGER.info("%s %s%s", "PASS" if cond else "FAIL", name, "" if cond else "  <<< %s" % str(detail)[:900])
     return bool(cond)
+
+
+def note(name, detail):
+    RESULTS.append({"name": "OBSERVATION " + name, "ok": True, "detail": str(detail)[:900]})
+    _LOGGER.info("NOTE %s: %s", name, str(detail)[:900])
+
+
+class Warnings(logging.Handler):
+    """The warnings and errors the integration writes to the log."""
+
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append("%s %s" % (record.levelname, record.getMessage()))
 
 
 async def until(fn, timeout=20.0, step=0.2):
@@ -67,6 +90,10 @@ class Cloud:
 
     async def clear(self):
         await self.req("POST", "/_ctl/clear", {})
+
+    async def asked(self):
+        """How often the status of each unit was asked for since the last clear()."""
+        return (await self.req("GET", "/_ctl/counts")).get("status", {})
 
     async def unit(self, serial, set=None, fault="-"):
         body = {"serial": serial}
@@ -99,7 +126,10 @@ async def run(hass: HomeAssistant):
     integration = await async_get_integration(hass, "ambientika")
     version = tuple(int(x) for x in str(integration.version).split(".")[:2])
     since_1_3 = version >= (1, 3)
+    since_1_4 = version >= (1, 4)
     _LOGGER.info("integration version %s", integration.version)
+    warnings = Warnings()
+    logging.getLogger("custom_components.ambientika").addHandler(warnings)
 
     if os.environ.get("SIM_SCENARIO") == "same-name":
         # two units carry the same name in the app
@@ -137,6 +167,7 @@ async def run(hass: HomeAssistant):
         res = await flow.async_configure(res["flow_id"], {"username": USER, "password": "falsch"})
         check("wrong password: the form comes back with the error 'auth'",
               res["type"] == "form" and res.get("errors") == {"base": "auth"}, res.get("errors"))
+        await cloud.clear()
         res = await flow.async_configure(res["flow_id"], {"username": USER, "password": PASSWORD})
         check("right password: entry created, titled with the user name",
               res["type"] == "create_entry" and res["title"] == USER, {k: res.get(k) for k in ("type", "title", "errors")})
@@ -144,6 +175,15 @@ async def run(hass: HomeAssistant):
         entries = hass.config_entries.async_entries("ambientika")
         entry = entries[0] if entries else None
         check("entry loaded", entry is not None and entry.state.value == "loaded", entry.state if entry else None)
+        counts = await cloud.req("GET", "/_ctl/counts")
+        asked = counts.get("status", {})
+        detail = "sign-ins %s (one of them checks the password in the dialog), status requests per unit %s" % (
+            counts.get("auth"), sorted(asked.values()))
+        if since_1_4:
+            check("set-up: one sign-in after the one of the dialog, the status of every unit read once",
+                  counts.get("auth") == 2 and sorted(asked) == SERIALS and set(asked.values()) == {1}, detail)
+        else:
+            note("what the set-up asks the cloud", detail)
         ents = er.async_entries_for_config_entry(ent, entry.entry_id) if entry else []
         devs = dr.async_entries_for_config_entry(dev, entry.entry_id) if entry else []
         check("five devices with the names of the app", sorted(d.name for d in devs) == sorted(NAMES),
@@ -164,10 +204,27 @@ async def run(hass: HomeAssistant):
         climate = (f_ents.get("climate") or [None])[0]
         button = (f_ents.get("button") or [None])[0]
         all_ids = [e.entity_id for e in ents if not e.disabled_by]
+        reading_ids = [i for i in all_ids if not i.startswith("button.")]
+        early = {i: st(i) for i in reading_ids if st(i) in (None, "unavailable", "unknown")}
+        if since_1_4:
+            check("right after the set-up every entity shows a value, without an update being asked for", not early, early)
+        else:
+            note("entities without a value right after the set-up", sorted(early))
         await refresh(all_ids)
         states = {i: st(i) for i in all_ids}
         bad = {k: v for k, v in states.items() if v in (None, "unavailable")}
         check("every entity has a state and is available", not bad, bad)
+        flur_reading = [i for i in reading_ids if flur and ent.entities[i].device_id == flur.id]
+        await cloud.clear()
+        await refresh(flur_reading)
+        asked = await cloud.asked()
+        # a reading of all units that falls into this moment asks for both units
+        own = asked.get(MASTER, 0) - asked.get(SLAVE2, 0)
+        if since_1_4:
+            check("update of the %d reading entities of one unit (homeassistant.update_entity): the cloud is asked once"
+                  % len(flur_reading), own == 1 and len(flur_reading) == 5, asked)
+        else:
+            note("update of the %d reading entities of one unit" % len(flur_reading), "status requests: %s" % asked)
         check("climate of 'Flur': on, preset Smart, fan medium, 21 °C, 55 %",
               climate and st(climate) not in ("off", "unavailable") and attr(climate, "preset_mode") == "Smart"
               and attr(climate, "fan_mode") == "medium" and attr(climate, "current_temperature") == 21
@@ -186,6 +243,14 @@ async def run(hass: HomeAssistant):
         check("preset Night -> change-mode with mode 3, fan and humidity level kept",
               call and call[0]["ok"] and str(call[0]["body"]["operatingMode"]) == "3" and call[0]["body"]["fanSpeed"] == 1
               and call[0]["body"]["humidityLevel"] == 1, call)
+        check("Home Assistant shows the preset Night right after the command, without an update being asked for",
+              attr(climate, "preset_mode") == "Night", attr(climate, "preset_mode"))
+        asked = await cloud.asked()
+        own = asked.get(MASTER, 0) - asked.get(SLAVE2, 0)
+        if since_1_4:
+            check("after the command the status of that unit is read once", own == 1, asked)
+        else:
+            note("status requests after a command", asked)
         await refresh([climate])
         check("Home Assistant shows the preset Night", attr(climate, "preset_mode") == "Night", attr(climate, "preset_mode"))
         await cloud.clear()
@@ -277,6 +342,59 @@ async def run(hass: HomeAssistant):
         await refresh(all_ids)
         check("cloud back: everything available again", not [i for i in all_ids if st(i) in (None, "unavailable")],
               [i for i in all_ids if st(i) in (None, "unavailable")])
+
+        # ---- nobody asks for an update: the integration reads by itself
+        k_reading = [i for i in k_ids if not i.startswith("button.")]
+        await cloud.unit(MASTER, set={"temperature": 19.5})
+        await cloud.unit(SLAVE2, fault="404")
+        await cloud.clear()
+        del warnings.lines[:]
+        await asyncio.sleep(62)
+        asked = await cloud.asked()
+        check("a changed value arrives by itself within a minute (19.5 °C)",
+              attr(climate, "current_temperature") == 19.5, attr(climate, "current_temperature"))
+        check("a unit that stops answering becomes unavailable by itself",
+              all(st(i) == "unavailable" for i in k_reading), {i: st(i) for i in k_reading})
+        detail = "status requests per unit in 62 s: %s" % {s[-2:]: asked.get(s, 0) for s in SERIALS}
+        if since_1_4:
+            check("one status request per unit every 30 s for all its entities (2 or 3 in 62 s, the same for every unit)",
+                  sorted(asked) == SERIALS and all(2 <= n <= 3 for n in asked.values())
+                  and max(asked.values()) - min(asked.values()) <= 1, detail)
+            check("the unit that stopped answering is reported once in the log, not at every reading",
+                  len(warnings.lines) == 1 and SLAVE2 in warnings.lines[0], warnings.lines[:8])
+        else:
+            note("how often the cloud is asked", detail)
+            note("log while one unit does not answer for 62 s", "%d warnings and errors, e.g. %s"
+                 % (len(warnings.lines), warnings.lines[:1]))
+        await cloud.unit(SLAVE2, fault=None)
+        back = await until(lambda: all(st(i) not in (None, "unavailable") for i in k_reading), 75)
+        check("the unit answers again: available by itself", back, {i: st(i) for i in k_reading})
+
+        if since_1_4:
+            # ---- requests the cloud accepts and never answers
+            await cloud.unit(SLAVE2, fault="hang")
+            await cloud.unit(MASTER, set={"temperature": 18.5})
+            t0 = time.monotonic()
+            followed = await until(lambda: attr(climate, "current_temperature") == 18.5, 50)
+            check("the request for one unit is never answered: the other units are still read on time (%.0f s)"
+                  % (time.monotonic() - t0), followed, attr(climate, "current_temperature"))
+            gone = await until(lambda: all(st(i) == "unavailable" for i in k_reading), 80)
+            check("  ... and that unit becomes unavailable after the time limit (%.0f s)" % (time.monotonic() - t0),
+                  gone, {i: st(i) for i in k_reading})
+            await cloud.unit(SLAVE2, fault=None)
+            back = await until(lambda: all(st(i) not in (None, "unavailable") for i in k_reading), 80)
+            check("  ... and is available again once it answers", back, {i: st(i) for i in k_reading})
+            await cloud.outage("hang")
+            t0 = time.monotonic()
+            gone = await until(lambda: all(st(i) == "unavailable" for i in reading_ids), 100)
+            check("the cloud answers no request at all: every unit unavailable after the time limit (%.0f s), "
+                  "Home Assistant keeps running" % (time.monotonic() - t0), gone,
+                  {i: st(i) for i in reading_ids if st(i) != "unavailable"})
+            await cloud.outage("ok")
+            t0 = time.monotonic()
+            back = await until(lambda: not [i for i in reading_ids if st(i) in (None, "unavailable")], 100)
+            check("the cloud answers again: everything available by itself (%.0f s)" % (time.monotonic() - t0), back,
+                  [i for i in reading_ids if st(i) in (None, "unavailable")])
 
         # ---- reload and unload
         n_before = len(er.async_entries_for_config_entry(ent, entry.entry_id))

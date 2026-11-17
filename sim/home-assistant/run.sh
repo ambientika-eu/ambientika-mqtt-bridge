@@ -15,8 +15,9 @@
 #              bridge stopped and killed.
 # integration: the released integration is copied unchanged except for DEFAULT_HOST,
 #              which points at sim/fake_cloud.py. Checked: config flow, entities,
-#              climate services, button, outages, reload. SIM_SCENARIO=same-name gives
-#              two units the same name.
+#              climate services, button, outages, how often the cloud is asked,
+#              requests the cloud never answers, reload. SIM_SCENARIO=same-name
+#              gives two units the same name.
 #
 # Updates of the integration (an old version sets an installation up, a new one
 # takes over) are tested by sim/home-assistant/upgrade_test.py.
