@@ -4285,9 +4285,251 @@ def test_cloud_timeout():
     t = bridge._exc_text(asyncio.TimeoutError())
     check("timeout: Text nennt das Limit statt einer leeren Meldung", "no answer within" in t and t.endswith(" s"), t)
     check("timeout: andere Fehler mit Typ und Meldung", bridge._exc_text(ValueError("x")) == "ValueError: x")
-    e = bridge.BrokerUnreachable("core-mosquitto:1883", ConnectionRefusedError(111, "Connection refused"))
-    check("broker: Fehler nennt Host, Port und Ursache",
-          e.where == "core-mosquitto:1883" and "ConnectionRefusedError" in str(e) and "core-mosquitto:1883" in str(e), str(e))
+
+
+async def test_start_waits():
+    """Fehlt beim Start die Cloud oder der Broker oder wird die Anmeldung abgelehnt, wartet die
+    Bridge und versucht es erneut, statt sich zu beenden (1.6.37)."""
+    import logging as _lg
+    from returns.result import Failure, Success
+
+    class Cap(_lg.Handler):
+        def __init__(self):
+            super().__init__()
+            self.recs = []
+
+        def emit(self, r):
+            self.recs.append(r)
+
+    check("start: Pausen in Worten",
+          [bridge._span(x) for x in (2, 10, 89, 120, 300, 1800)] == ["2 s", "10 s", "89 s", "2 min", "5 min", "30 min"],
+          [bridge._span(x) for x in (2, 10, 89, 120, 300, 1800)])
+    check("start: Statuscode eines abgelehnten Aufrufs",
+          bridge._failure_code(Failure({"status_code": 400, "data": "x"})) == 400
+          and bridge._failure_code(Failure("kaputt")) is None and bridge._failure_code(Success(1)) is None
+          and bridge._failure_code(Failure({"status_code": "400"})) is None)
+    alt = os.environ.get("START_RETRY_S")
+    try:
+        got = {}
+        for v in (None, "", "3", "abc", "0", "-5"):
+            if v is None:
+                os.environ.pop("START_RETRY_S", None)
+            else:
+                os.environ["START_RETRY_S"] = v
+            got[v] = bridge._read_seconds("START_RETRY_S", 10.0)
+    finally:
+        if alt is None:
+            os.environ.pop("START_RETRY_S", None)
+        else:
+            os.environ["START_RETRY_S"] = alt
+    check("start: Pause aus der Umgebung nur fuer Tests, Vorgabe sonst, nie null",
+          got[None] == 10 and got[""] == 10 and got["abc"] == 10 and got["3"] == 3 and got["0"] == 0.1 and got["-5"] == 0.1, got)
+    check("start: Vorgaben 10 s bis 5 min (Cloud), bis 1 min (Broker), 1 bis 30 min (Anmeldung abgelehnt)",
+          (bridge.START_RETRY_S, bridge.START_RETRY_MAX_S, bridge.BROKER_RETRY_MAX_S,
+           bridge.SIGN_IN_RETRY_S, bridge.SIGN_IN_RETRY_MAX_S) == (10, 300, 60, 60, 1800),
+          (bridge.START_RETRY_S, bridge.START_RETRY_MAX_S, bridge.BROKER_RETRY_MAX_S,
+           bridge.SIGN_IN_RETRY_S, bridge.SIGN_IN_RETRY_MAX_S))
+
+    def neu():
+        cfg = bridge.BridgeConfig()
+        cfg.username, cfg.password = "kunde@example.com", "geheim"
+        cfg.mqtt_host, cfg.mqtt_port = "core-mosquitto", 1883
+        b = bridge.AmbientikaBridge(cfg)
+        b.loop = asyncio.get_running_loop()
+        b._stop_event = asyncio.Event()
+        waits = []
+
+        async def warte(seconds):
+            waits.append(seconds)
+            return False
+        b._wait_or_stop = warte
+        return b, waits
+
+    # ---- _login unterscheidet abgelehnt / Fehlerantwort
+    echt = bridge.authenticate
+    antwort = {}
+
+    async def auth(user, password, host):
+        return antwort["res"]
+    bridge.authenticate = auth
+    try:
+        b, _ = neu()
+        was = {}
+        for code in (400, 401, 403, 500, 404, None):
+            antwort["res"] = Failure({"status_code": code, "data": "x"})
+            try:
+                await b._login()
+                was[code] = "ok"
+            except bridge.SignInRejected:
+                was[code] = "abgelehnt"
+            except bridge.CloudAnswerError:
+                was[code] = "fehler"
+        check("start: 400/401/403 bei der Anmeldung = abgelehnt, alles andere = Cloud nicht bereit",
+              was == {400: "abgelehnt", 401: "abgelehnt", 403: "abgelehnt", 500: "fehler", 404: "fehler", None: "fehler"}, was)
+    finally:
+        bridge.authenticate = echt
+
+    # ---- _start_cloud: Pausen und Meldungen
+    async def lauf(folge):
+        b, waits = neu()
+        folge = list(folge)
+
+        async def login():
+            e = folge.pop(0)
+            if e is not None:
+                raise e
+
+        async def units():
+            return None
+        b._login, b._discover_devices = login, units
+        h = Cap()
+        bridge.log.addHandler(h)
+        try:
+            ok = await b._start_cloud()
+        finally:
+            bridge.log.removeHandler(h)
+        return ok, waits, h.recs, folge
+
+    ok, waits, recs, rest = await lauf([bridge.SignInRejected("HTTP status 400")] * 7 + [None])
+    check("start: Anmeldung abgelehnt -> naechster Versuch nach 1, 2, 4 ... hoechstens 30 Minuten, dann gestartet",
+          ok and waits == [60, 120, 240, 480, 960, 1800, 1800] and not rest, waits)
+    check("start: abgelehnt -> je Versuch eine Fehlerzeile mit Hinweis auf Benutzername/Passwort, ohne Traceback",
+          len(recs) == 7 and all(r.levelno == _lg.ERROR and not r.exc_info
+                                 and "did not accept user name and password" in r.getMessage()
+                                 and "ambientika_password" in r.getMessage() for r in recs)
+          and "Next attempt in 60 s" in recs[0].getMessage() and "Next attempt in 30 min" in recs[-1].getMessage(),
+          [r.getMessage()[-40:] for r in recs])
+    import aiohttp as _ah
+    netz = _ah.ClientConnectionError("Cannot connect to host app.ambientika.eu:4521")
+    ok, waits, recs, rest = await lauf([netz, asyncio.TimeoutError()] + [netz] * 5 + [None])
+    check("start: Cloud nicht erreichbar -> 10, 20, 40 ... hoechstens 300 s, dann gestartet",
+          ok and waits == [10, 20, 40, 80, 160, 300, 300], waits)
+    check("start: nicht erreichbar -> je Versuch eine Warnung ohne Traceback, Zeitlimit mit Text",
+          len(recs) == 7 and all(r.levelno == _lg.WARNING and not r.exc_info
+                                 and r.getMessage().startswith("No connection to the Ambientika cloud") for r in recs)
+          and "no answer within" in recs[1].getMessage(), [r.getMessage()[:90] for r in recs[:2]])
+    ok, waits, recs, rest = await lauf([bridge.CloudAnswerError("it answered the sign-in with HTTP status 500"),
+                                        KeyError("jwtToken"), None])
+    laut = [r for r in recs if r.levelno >= _lg.WARNING]    # der Traceback der unlesbaren Antwort steht nur auf DEBUG
+    check("start: Fehlerantwort und unlesbare Antwort -> warten, je eine Warnung ohne Traceback",
+          ok and waits == [10, 20] and [r.levelno for r in laut] == [_lg.WARNING, _lg.WARNING]
+          and "not ready: it answered the sign-in with HTTP status 500" in laut[0].getMessage()
+          and "could not be read (KeyError" in laut[1].getMessage() and not laut[1].exc_info,
+          [(r.levelname, r.getMessage()[:70]) for r in recs])
+    ok, waits, recs, rest = await lauf([netz, bridge.SignInRejected("HTTP status 400"), netz,
+                                        bridge.SignInRejected("HTTP status 400"), None])
+    check("start: beide Pausen wachsen getrennt (Netz 10, 20 / abgelehnt 60, 120)", ok and waits == [10, 60, 20, 120], waits)
+
+    # gestoppt waehrend des Wartens: kein weiterer Versuch, kein Fehler
+    b, _ = neu()
+    versuche = []
+
+    async def login_nie():
+        versuche.append(1)
+        raise netz
+
+    async def gestoppt(seconds):
+        b._stop_event.set()
+        return True
+    b._login, b._wait_or_stop = login_nie, gestoppt
+    check("start: beim Warten gestoppt -> Ende ohne weiteren Versuch",
+          await b._start_cloud() is False and len(versuche) == 1, versuche)
+    b, _ = neu()
+    b._stop_event.set()
+    b._login = login_nie
+    check("start: schon gestoppt -> gar kein Versuch", await b._start_cloud() is False and len(versuche) == 1, versuche)
+
+    # das echte Warten endet sofort, wenn gestoppt wird
+    cfg = bridge.BridgeConfig()
+    b = bridge.AmbientikaBridge(cfg)
+    b._stop_event = asyncio.Event()
+    t0 = time.monotonic()
+    asyncio.get_running_loop().call_later(0.05, b._stop_event.set)
+    check("start: Warten endet beim Stoppen sofort", await b._wait_or_stop(30) is True and time.monotonic() - t0 < 2,
+          time.monotonic() - t0)
+    b._stop_event.clear()
+    t0 = time.monotonic()
+    check("start: Warten ohne Stopp dauert die Pause", await b._wait_or_stop(0.1) is False
+          and 0.08 <= time.monotonic() - t0 < 2, time.monotonic() - t0)
+
+    # ---- _start_broker
+    b, waits = neu()
+    fehler = [ConnectionRefusedError(111, "Connection refused"), OSError("Name or service not known"),
+              ConnectionRefusedError(111, "Connection refused"), ConnectionRefusedError(111, "Connection refused"), None]
+
+    def verbinden():
+        b.client = FakeClient()
+        e = fehler.pop(0)
+        if e is not None:
+            raise e
+    b._mqtt_connect = verbinden
+    b.neuracell._started = time.monotonic() - 1000      # Zustand wurde lange vor dem Broker geladen
+    h = Cap()
+    bridge.log.addHandler(h)
+    try:
+        ok = await b._start_broker()
+    finally:
+        bridge.log.removeHandler(h)
+    check("broker: nicht erreichbar -> 10, 20, 40, hoechstens 60 s, dann verbunden",
+          ok and waits == [10, 20, 40, 60] and b.client is not None, waits)
+    check("broker: die Schonfrist fuer gespeicherte Baselines beginnt mit der Verbindung, nicht mit dem Laden",
+          time.monotonic() - b.neuracell._started < 5, time.monotonic() - b.neuracell._started)
+    check("broker: Meldung nennt Host, Port und Ursache, ohne Traceback",
+          len(h.recs) == 4 and all(r.levelno == _lg.WARNING and not r.exc_info
+                                   and "No connection to the MQTT broker core-mosquitto:1883" in r.getMessage()
+                                   for r in h.recs)
+          and "ConnectionRefusedError" in h.recs[0].getMessage() and "Ambientika cloud" not in h.recs[0].getMessage(),
+          [r.getMessage()[:110] for r in h.recs[:2]])
+    b, waits = neu()
+
+    def nie_verbunden():
+        b.client = FakeClient()
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    async def gestoppt2(seconds):
+        b._stop_event.set()
+        return True
+    b._mqtt_connect, b._wait_or_stop = nie_verbunden, gestoppt2
+    check("broker: beim Warten gestoppt -> Ende, kein halber Client bleibt",
+          await b._start_broker() is False and b.client is None, b.client)
+
+    # ---- im Betrieb: abgelehnte Anmeldung nicht bei jedem Abruf
+    bridge.authenticate = auth
+    try:
+        b, _ = neu()
+        d = FakeDevice("SER1", "Flur", 1, mkstatus())
+        b.devices = {"SER1": d}
+        antwort["res"] = Failure({"status_code": 400, "data": "Username or password is incorrect"})
+        h = Cap()
+        bridge.log.addHandler(h)
+        try:
+            t0 = time.monotonic()
+            pausen = []
+            for _ in range(7):
+                ok = await b._reauth("401")
+                pausen.append(round(b._reauth_not_before - time.monotonic()))
+        finally:
+            bridge.log.removeHandler(h)
+        check("reauth: abgelehnt -> naechster Versuch erst nach 1, 2, 4 ... hoechstens 30 Minuten",
+              ok is False and pausen == [60, 120, 240, 480, 960, 1800, 1800], pausen)
+        check("reauth: abgelehnt -> eine Fehlerzeile je Versuch mit Hinweis auf das Passwort der App",
+              len(h.recs) == 7 and all(r.levelno == _lg.ERROR and "does not accept user name and password" in r.getMessage()
+                                       for r in h.recs) and "Next attempt to sign in in 60 s" in h.recs[0].getMessage(),
+              [r.getMessage()[-45:] for r in h.recs[:2]])
+        antwort["res"] = Failure({"status_code": 500, "data": "x"})
+        vorher = b._reauth_not_before
+        await b._reauth("401")
+        check("reauth: Fehlerantwort der Cloud aendert die Wartezeit nicht", b._reauth_not_before == vorher)
+
+        class Api:
+            _api = object()
+        antwort["res"] = Success(Api())
+        ok = await b._reauth("401")
+        check("reauth: wieder angenommen -> Wartezeit und Pause zurueckgesetzt, Geraete zeigen auf die neue Anmeldung",
+              ok is True and b._reauth_not_before == 0.0 and b._reauth_rejected_pause == bridge.SIGN_IN_RETRY_S
+              and d.api is Api._api, (b._reauth_not_before, b._reauth_rejected_pause))
+    finally:
+        bridge.authenticate = echt
 
 
 async def test_cloud_timeout_poll():
@@ -5400,6 +5642,7 @@ async def _async_suite():
     await test_zone_topology_log()
     await test_reset_info()
     await test_cloud_timeout_poll()
+    await test_start_waits()
 
 
 def main():

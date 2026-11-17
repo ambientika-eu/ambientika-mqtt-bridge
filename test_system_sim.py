@@ -5,8 +5,9 @@ Mosquitto broker.
 
 It covers what the in-process tests cannot: configuration from the environment
 and from config.yaml / options.json, the HTTP client, signals, a start without
-cloud or broker, cloud outages, requests the cloud never answers, a broker
-restart and the Last Will.
+cloud or broker (the bridge waits and tries again), a password the cloud does
+not accept, cloud outages, requests the cloud never answers, a broker restart
+and the Last Will.
 
     python test_system_sim.py                      # bridge.py of this folder
     python test_system_sim.py --image TAG          # standalone image (docker, host network)
@@ -46,6 +47,8 @@ NAMES = {MASTER: "Flur", SLAVE: "Wohnzimmer", SLAVE2: "Kinderzimmer", SLAVE3: "G
 MOSQUITTO = os.environ.get("SIM_MOSQUITTO", "mosquitto")    # another path, e.g. an unconfined copy
 POLL = 2            # seconds between polls in every scenario
 CLOUD_TIMEOUT = 4   # seconds the bridge waits for one answer of the cloud here
+START_RETRY = 2     # seconds until the start is tried again here (doubles; 10 s in real life)
+SIGN_IN_RETRY = 3   # seconds until a refused sign-in is tried again here (doubles; 60 s in real life)
 # Stretches every wait, for an image that runs emulated (e.g. arm on an x86 runner).
 TIME_FACTOR = max(1.0, float(os.environ.get("SIM_TIME_FACTOR", "1") or 1))
 
@@ -163,8 +166,8 @@ class Broker:
 
 
 class Cloud:
-    def __init__(self):
-        self.port = free_port()
+    def __init__(self, port=None):
+        self.port = port or free_port()
         self.url = "http://127.0.0.1:%d" % self.port
         self.proc = Proc("cloud", [sys.executable, os.path.join(HERE, "sim", "fake_cloud.py"), str(self.port)])
         if not wait(lambda: self.state(), 15):
@@ -262,12 +265,16 @@ class Bridge:
         base = {
             "AMBIENTIKA_USERNAME": USER, "AMBIENTIKA_PASSWORD": PASSWORD,
             "AMBIENTIKA_HOST": cloud.url, "MQTT_HOST": "127.0.0.1", "MQTT_PORT": str(broker.port),
-            "POLL_INTERVAL": str(POLL), "CLOUD_TIMEOUT": str(CLOUD_TIMEOUT),
+            "POLL_INTERVAL": str(POLL),
         }
+        # the same in every mode: time limit and pauses, shortened for the test
+        pace = {"CLOUD_TIMEOUT": str(CLOUD_TIMEOUT), "START_RETRY_S": str(START_RETRY * TIME_FACTOR),
+                "SIGN_IN_RETRY_S": str(SIGN_IN_RETRY * TIME_FACTOR)}
+        base.update(pace)
         if broker.user:
             base["MQTT_USERNAME"], base["MQTT_PASSWORD"] = broker.user, broker.password
         if yaml_text is not None or options is not None:
-            base = {"CLOUD_TIMEOUT": str(CLOUD_TIMEOUT)}
+            base = dict(pace)
         base.update(env or {})
         base = {k: v for k, v in base.items() if v is not None}
         self.container = None
@@ -293,7 +300,7 @@ class Bridge:
                 opts = dict(options if options is not None else addon_options(cloud, broker))
                 with open(os.path.join(self.dir, "options.json"), "w", encoding="utf-8") as fh:
                     json.dump(opts, fh)
-                for k in ("CLOUD_TIMEOUT",):
+                for k in pace:
                     cmd += ["-e", "%s=%s" % (k, base[k])]
                 cmd.append(ARGS.addon_image)
             else:
@@ -587,6 +594,24 @@ def scenario_outages():
         t1 = time.time()
         check("values keep arriving", wait(lambda: spy.all("ambientika/%s/state" % MASTER, since=t1), 10))
 
+        # the cloud no longer accepts the password while the bridge runs
+        cloud.clear()
+        cloud.outage("refuse-auth")
+        cloud.expire()
+        quiet = (SIGN_IN_RETRY + 2 * SIGN_IN_RETRY) * TIME_FACTOR + 2 * POLL + 2   # room for attempts 1, 2 and 3
+        time.sleep(quiet)
+        auth = cloud.log("auth")
+        check("password no longer accepted: the sign-in is tried again after growing pauses, "
+              "not at every poll (%d attempts in %.0f s, %d polls)" % (len(auth), quiet, quiet // POLL),
+              2 <= len(auth) <= 3 and not any(r["ok"] for r in auth), auth)
+        check("  ... one line per attempt names user name and password, the bridge keeps running",
+              b.log().count("does not accept user name and password") == len(auth) and b.running(), b.log()[-1200:])
+        t1 = time.time()
+        cloud.outage("ok")
+        check("password accepted again -> signed in at the next attempt, all units online",
+              wait(lambda: any(r["ok"] for r in cloud.log("auth")), 4 * SIGN_IN_RETRY + 10)
+              and wait(lambda: all(av(s) == "online" for s in SERIALS), 30), (cloud.log("auth")[-3:], {s: av(s) for s in SERIALS}))
+
         # whole cloud answers 500
         t0 = time.time()
         cloud.outage("500")
@@ -704,15 +729,47 @@ def scenario_broker():
 
 
 def scenario_start_failures():
+    """What is missing when the bridge starts: it waits and tries again instead of ending."""
     cloud, broker = Cloud(), Broker()
+    spy = Spy(broker.port)
+    online = lambda since: spy.last("ambientika/bridge/availability", since) == "online"
+    b = late = late_broker = spy2 = None
+
+    def with_host(host):
+        return Bridge(cloud, broker, env={"AMBIENTIKA_HOST": host}) if MODE != "addon" else \
+            Bridge(cloud, broker, options=addon_options(cloud, broker, ambientika_host=host))
+
+    def stopped_cleanly(what):
+        t0 = time.time()
+        rc = b.stop()
+        check("  ... stopped %s: ends with exit code 0 within 10 s (%.1f s)" % (what, time.time() - t0),
+              rc == 0 and time.time() - t0 < 10 * TIME_FACTOR, (rc, b.log()[-600:]))
+
     try:
         # wrong password
+        cloud.clear()
         b = Bridge(cloud, broker, env={"AMBIENTIKA_PASSWORD": "falsch"}) if MODE != "addon" else \
             Bridge(cloud, broker, options=addon_options(cloud, broker, ambientika_password="falsch"))
-        rc = b.wait_exit(40)
-        log = b.log()
-        check("wrong app password: the bridge stops with an error code", rc not in (None, 0), rc)
-        check("  ... and says so in one line", "Check username/password" in log, log[-800:])
+        said = wait(lambda: "did not accept user name and password" in b.log(), 25)
+        check("wrong app password: one line names user name and password, no traceback",
+              said and no_traceback(b.log()), b.log()[-800:])
+        window = (SIGN_IN_RETRY + 2 * SIGN_IN_RETRY) * TIME_FACTOR + 2      # room for attempts 1, 2 and 3
+        time.sleep(window)
+        auth = cloud.log("auth")
+        check("  ... the bridge keeps running and tries again after growing pauses (%d sign-ins in %.0f s)"
+              % (len(auth), window), b.running() and 2 <= len(auth) <= 4 and not any(r["ok"] for r in auth), auth)
+        stopped_cleanly("while it waits for the next sign-in")
+
+        # the cloud turns the right password down for a while
+        cloud.outage("refuse-auth")
+        cloud.clear()
+        t0 = time.time()
+        b = Bridge(cloud, broker)
+        refused = wait(lambda: cloud.log("auth"), 25)
+        cloud.outage("ok")
+        check("the cloud turns the password down for a while: the bridge starts by itself once it is accepted",
+              refused and wait(lambda: online(t0), 4 * SIGN_IN_RETRY + 20) and started(spy), b.log()[-1000:])
+        b.stop()
 
         # no credentials at all
         b = Bridge(cloud, broker, env={"AMBIENTIKA_USERNAME": "", "AMBIENTIKA_PASSWORD": ""}) if MODE != "addon" else \
@@ -721,38 +778,68 @@ def scenario_start_failures():
         check("no credentials: stops and names the options", rc not in (None, 0)
               and "username/password missing" in b.log(), b.log()[-800:])
 
-        # cloud not reachable
-        dead = "http://127.0.0.1:%d" % free_port()
-        b = Bridge(cloud, broker, env={"AMBIENTIKA_HOST": dead}) if MODE != "addon" else \
-            Bridge(cloud, broker, options=addon_options(cloud, broker, ambientika_host=dead))
-        rc = b.wait_exit(40)
+        # nothing answers at the address of the cloud; later the cloud is there
+        port = free_port()
+        b = with_host("http://127.0.0.1:%d" % port)
+        tried = wait(lambda: b.log().count("No connection to the Ambientika cloud") >= 2, 3 * START_RETRY + 20)
         log = b.log()
-        check("cloud unreachable at start: error code, one line, no traceback",
-              rc not in (None, 0) and "no connection to the Ambientika cloud" in log and no_traceback(log), log[-800:])
+        check("cloud unreachable at start: the bridge keeps running and tries again, one line per attempt, no traceback",
+              tried and b.running() and no_traceback(log) and "Next attempt in" in log, log[-800:])
+        t0 = time.time()
+        late = Cloud(port)
+        came = wait(lambda: online(t0), 4 * START_RETRY + 30)
+        check("  ... and starts by itself once the cloud can be reached (%.0f s)" % (time.time() - t0),
+              came and "Found 5 device(s)." in b.log(), b.log()[-1000:])
+        b.stop()
+        late.stop()
+        late = None
 
-        # cloud hangs at start
+        # the cloud answers the sign-in with an error
+        cloud.outage("500")
+        b = Bridge(cloud, broker)
+        said = wait(lambda: "The Ambientika cloud is not ready" in b.log(), 25)
+        check("cloud answers the sign-in with an error: the bridge keeps running, one line, no traceback",
+              said and b.running() and no_traceback(b.log()), b.log()[-800:])
+        t0 = time.time()
+        cloud.outage("ok")
+        check("  ... and starts by itself once the cloud works", wait(lambda: online(t0), 4 * START_RETRY + 30),
+              b.log()[-1000:])
+        b.stop()
+
+        # the cloud accepts the sign-in and never answers
         cloud.outage("hang")
         t0 = time.time()
         b = Bridge(cloud, broker)
-        rc = b.wait_exit(CLOUD_TIMEOUT + 25)
-        check("cloud hangs at start: gives up after the timeout (%.0f s) instead of minutes" % (time.time() - t0),
-              rc not in (None, 0) and no_traceback(b.log()), (rc, b.log()[-600:]))
-        b.stop(signal.SIGKILL)
+        gave_up = wait(lambda: "No connection to the Ambientika cloud" in b.log(), CLOUD_TIMEOUT + 25)
+        check("cloud never answers the sign-in: the attempt ends at the time limit (%.0f s), the bridge keeps running"
+              % (time.time() - t0), gave_up and b.running() and no_traceback(b.log()), b.log()[-600:])
+        wait(lambda: b.log().count("Authenticating with Ambientika API") >= 2, 3 * START_RETRY + 10)
+        stopped_cleanly("while a sign-in is out")
         cloud.outage("ok")
 
-        # broker not reachable
+        # nothing answers at the address of the broker; later the broker is there
         port = free_port()
         dead_broker = type("B", (), {"port": port, "user": None, "password": None})()
         b = Bridge(cloud, dead_broker)
-        rc = b.wait_exit(40)
+        tried = wait(lambda: b.log().count("No connection to the MQTT broker") >= 2, 3 * START_RETRY + 25)
         log = b.log()
-        check("broker unreachable at start: error code, no traceback", rc not in (None, 0) and no_traceback(log),
-              (rc, log[-800:]))
-        check("  ... and the message names the MQTT broker, not the cloud",
-              "MQTT broker" in log.split("Connecting to MQTT broker")[-1] and "Ambientika cloud" not in log.split("Connecting to MQTT broker")[-1],
-              log[-600:])
+        check("broker unreachable at start: the bridge keeps running and tries again, no traceback",
+              tried and b.running() and no_traceback(log), log[-800:])
+        after = log.split("Connecting to MQTT broker")[-1]
+        check("  ... and the message names the MQTT broker with its address, not the cloud",
+              "MQTT broker 127.0.0.1:%d" % port in after and "Ambientika cloud" not in after, after[-600:])
+        late_broker = Broker(port)
+        spy2 = Spy(port)
+        check("  ... and connects by itself once the broker is there: all five units online",
+              started(spy2, timeout=4 * START_RETRY + 40), b.log()[-1000:])
+        stopped_cleanly("in normal operation")
     finally:
-        broker.stop(); cloud.stop()
+        for thing in (b, spy, spy2, late, late_broker, broker, cloud):
+            if thing is not None:
+                try:
+                    thing.stop()
+                except Exception:
+                    pass
 
 
 def scenario_config():

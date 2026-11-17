@@ -441,6 +441,13 @@ seconds and counts as a failed read of that unit (`... no answer within 20 s`);
 the other units are read on. Before, such a read held all units for up to five
 minutes, and they kept showing their last values meanwhile.
 
+Since 1.6.37 the add-on does not stop when the Ambientika cloud or the MQTT
+broker cannot be reached while it starts - for example after a power cut, when
+Home Assistant is up before the router. It waits and tries again by itself: the
+cloud after 10 seconds, then with longer pauses up to five minutes, the broker
+up to once a minute. It starts as soon as both answer; the watchdog of the
+add-on is not needed for that.
+
 After the first read of all units the log also lists the zone topology - one
 line per zone with the Master and its Slaves and their roles (`Zone topology -
 zone 0: Master Flur (...); Slaves: Wohnzimmer (...) SlaveEqualMaster, ...`) - and
@@ -453,13 +460,18 @@ after touching a zone in the app.
 The **Log** tab is the place to look. The most common lines:
 
 - `Ambientika username/password missing` — the two `ambientika_*` options are empty.
+- `The Ambientika cloud did not accept user name and password` — the e-mail
+  address or the password is not the one of the Ambientika app. The add-on keeps
+  running and tries again after a minute, then with longer pauses up to 30
+  minutes. Once the options are corrected and the add-on is restarted, it signs
+  in at once.
 - `MQTT connection failed (rc=5)` — the broker refused the login, see the note above.
-- `Fatal error: no connection to the MQTT broker <host>:<port>` — the broker could
-  not be reached when the add-on started. Check `mqtt_host` and `mqtt_port` and
-  that the broker is running.
-- `Fatal error: no connection to the Ambientika cloud` — no internet connection
-  when the add-on started, or the cloud did not answer within 20 seconds. With the
-  watchdog of the add-on switched on it starts again by itself.
+- `No connection to the MQTT broker <host>:<port>` — the broker could not be
+  reached when the add-on started. Check `mqtt_host` and `mqtt_port` and that the
+  broker is running. The add-on tries again by itself.
+- `No connection to the Ambientika cloud` — no internet connection when the
+  add-on started, or the cloud did not answer within 20 seconds. The add-on tries
+  again by itself and starts as soon as the cloud answers.
 
 ## Support
 

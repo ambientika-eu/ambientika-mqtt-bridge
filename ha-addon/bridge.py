@@ -94,13 +94,54 @@ async def _cloud(call):
     return await asyncio.wait_for(call, timeout=CLOUD_TIMEOUT)
 
 
-class BrokerUnreachable(Exception):
-    """The first connection to the MQTT broker failed (wrong host or port, broker not running)."""
+def _read_seconds(name: str, default: float) -> float:
+    """A pause in seconds from the environment (used by the tests), else the default."""
+    try:
+        v = float(os.environ.get(name, "") or default)
+    except ValueError:
+        v = default
+    return max(v, 0.1)
 
-    def __init__(self, where: str, cause: BaseException) -> None:
-        super().__init__("%s (%s: %s)" % (where, type(cause).__name__, cause))
-        self.where = where
-        self.cause = cause
+
+# When the bridge starts and the cloud or the MQTT broker cannot be reached -
+# after a power cut the router is not up yet, the broker starts a little later -
+# it does not give up. It tries again after START_RETRY_S seconds and doubles
+# that pause up to START_RETRY_MAX_S (cloud) or BROKER_RETRY_MAX_S (broker).
+START_RETRY_S = _read_seconds("START_RETRY_S", 10.0)
+START_RETRY_MAX_S = 300.0
+BROKER_RETRY_MAX_S = 60.0
+# The cloud did not accept user name and password: the next attempt follows
+# after SIGN_IN_RETRY_S seconds, and the pause doubles up to
+# SIGN_IN_RETRY_MAX_S. A wrong password must not be sent every few seconds; a
+# cloud that turns the right one down for a moment is asked again soon.
+SIGN_IN_RETRY_S = _read_seconds("SIGN_IN_RETRY_S", 60.0)
+SIGN_IN_RETRY_MAX_S = 1800.0
+# HTTP status codes with which the cloud turns down user name and password.
+SIGN_IN_REJECTED = (400, 401, 403)
+
+
+class SignInRejected(Exception):
+    """The Ambientika cloud did not accept user name and password."""
+
+
+class CloudAnswerError(Exception):
+    """The Ambientika cloud answered the sign-in or the request for the units with an error."""
+
+
+def _failure_code(res) -> Optional[int]:
+    """The HTTP status code of a call the cloud turned down, None if there is none."""
+    try:
+        code = res.failure().get("status_code")
+    except Exception:
+        return None
+    return code if isinstance(code, int) else None
+
+
+def _span(seconds: float) -> str:
+    """A pause in words: '10 s', '2 min'."""
+    if seconds < 90:
+        return "%g s" % round(seconds, 1)
+    return "%g min" % round(seconds / 60.0, 1)
 
 
 def _is_network_error(exc: BaseException) -> bool:
@@ -3129,6 +3170,10 @@ class AmbientikaBridge:
         # maintenance acknowledgement appears or runs out (see _state_payload).
         self._reset_shown: dict = {}
         self._reauth_ts: float = 0.0
+        # After the cloud turned user name and password down: when the next
+        # sign-in may be tried, and the pause after a further refusal.
+        self._reauth_not_before: float = 0.0
+        self._reauth_rejected_pause: float = SIGN_IN_RETRY_S
         # Pending command attributes per serial + their flush timers
         # (see COMMAND_COALESCE_S).
         self._pending_cmds: dict = {}
@@ -4290,9 +4335,25 @@ class AmbientikaBridge:
         try:
             res = await _cloud(authenticate(self.cfg.username, self.cfg.password, self.cfg.host))
             if isinstance(res, Failure):
-                log.warning("re-auth (%s) failed: %s", reason, res)
+                code = _failure_code(res)
+                if code in SIGN_IN_REJECTED:
+                    # Not at every poll: a password that is no longer right
+                    # would be sent to the cloud every few seconds.
+                    wait = self._reauth_rejected_pause
+                    self._reauth_rejected_pause = min(wait * 2, SIGN_IN_RETRY_MAX_S)
+                    self._reauth_not_before = time.monotonic() + wait
+                    log.error("The Ambientika cloud does not accept user name and password "
+                              "(HTTP status %s), so the units cannot be read. If the password "
+                              "of the Ambientika app was changed, enter the new one in the "
+                              "options (or config.yaml) and restart the bridge. Next attempt "
+                              "to sign in in %s.",
+                              code, _span(wait))
+                else:
+                    log.warning("re-auth (%s) failed: %s", reason, res)
                 return False
             self.api = res.unwrap()
+            self._reauth_not_before = 0.0
+            self._reauth_rejected_pause = SIGN_IN_RETRY_S
             for d in list(self.devices.values()):
                 try:
                     d.api = self.api._api
@@ -5269,8 +5330,10 @@ class AmbientikaBridge:
         log.info("Authenticating with Ambientika API at %s ...", self.cfg.host)
         res = await _cloud(authenticate(self.cfg.username, self.cfg.password, self.cfg.host))
         if isinstance(res, Failure):
-            log.error("Authentication failed: %s", res)
-            raise RuntimeError("Cannot authenticate with Ambientika API. Check username/password.")
+            code = _failure_code(res)
+            if code in SIGN_IN_REJECTED:
+                raise SignInRejected("HTTP status %s" % code)
+            raise CloudAnswerError("it answered the sign-in with HTTP status %s" % code)
         self.api = res.unwrap()
         self._reauth_ts = time.monotonic()
         log.info("Authentication successful.")
@@ -5279,8 +5342,8 @@ class AmbientikaBridge:
         assert self.api is not None
         houses_res = await _cloud(self.api.houses())
         if isinstance(houses_res, Failure):
-            log.error("Could not fetch houses: %s", houses_res)
-            raise RuntimeError("Could not fetch houses from Ambientika API.")
+            raise CloudAnswerError("it answered the request for the list of units with HTTP "
+                                   "status %s" % _failure_code(houses_res))
         houses = houses_res.unwrap()
 
         self.devices = {}
@@ -5443,7 +5506,7 @@ class AmbientikaBridge:
                 reason = "all-devices-failed"
             elif (time.monotonic() - self._reauth_ts) >= REAUTH_INTERVAL:
                 reason = "periodic"
-            if reason and self.devices:
+            if reason and self.devices and time.monotonic() >= self._reauth_not_before:
                 await self._reauth(reason)
             
             # Read the radon meter (source='device') FIRST - radon has priority
@@ -5489,19 +5552,96 @@ class AmbientikaBridge:
             except asyncio.TimeoutError:
                 pass
 
+    async def _wait_or_stop(self, seconds: float) -> bool:
+        """Wait for the next attempt of the start. True when the bridge is being stopped."""
+        assert self._stop_event is not None
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
+        return self._stop_event.is_set()
+
+    async def _start_cloud(self) -> bool:
+        """Sign in and read the list of units; without success wait and try again.
+
+        Home Assistant often is up before the router after a power cut, and the
+        cloud can be out of reach for a while. A bridge that ends then stays
+        stopped until someone starts it (add-on), or is started again every few
+        seconds, each time with a sign-in (restart policy of Docker). So it
+        stays up and tries again with growing pauses. Returns False when the
+        bridge is stopped while it waits.
+        """
+        assert self._stop_event is not None
+        pause, rejected_pause = START_RETRY_S, SIGN_IN_RETRY_S
+        while not self._stop_event.is_set():
+            try:
+                await self._login()
+                await self._discover_devices()
+                return True
+            except SignInRejected as e:
+                wait, rejected_pause = rejected_pause, min(rejected_pause * 2, SIGN_IN_RETRY_MAX_S)
+                log.error("The Ambientika cloud did not accept user name and password (%s). Check "
+                          "'ambientika_username' and 'ambientika_password' (or config.yaml): they "
+                          "are the e-mail address and the password of the Ambientika app. Next "
+                          "attempt in %s.", e, _span(wait))
+            except Exception as e:
+                wait, pause = pause, min(pause * 2, START_RETRY_MAX_S)
+                if _is_network_error(e):
+                    log.warning("No connection to the Ambientika cloud (%s). Check the internet "
+                                "connection. Next attempt in %s.", _exc_text(e), _span(wait))
+                elif isinstance(e, CloudAnswerError):
+                    log.warning("The Ambientika cloud is not ready: %s. Next attempt in %s.",
+                                e, _span(wait))
+                else:
+                    # An answer that cannot be read (an error page instead of
+                    # data). One line; the traceback is kept at DEBUG.
+                    log.debug("start: unreadable answer of the cloud", exc_info=True)
+                    log.warning("The answer of the Ambientika cloud could not be read (%s: %s). "
+                                "Next attempt in %s.", type(e).__name__, str(e)[:200], _span(wait))
+            if await self._wait_or_stop(wait):
+                break
+        return False
+
+    async def _start_broker(self) -> bool:
+        """Connect to the MQTT broker; without success wait and try again.
+
+        Returns False when the bridge is stopped while it waits. Once the first
+        connection stands, the MQTT client reconnects by itself.
+        """
+        assert self._stop_event is not None
+        pause = START_RETRY_S
+        while not self._stop_event.is_set():
+            try:
+                self._mqtt_connect()
+                # Baselines loaded from disk are not restored during the first
+                # STARTUP_GRACE_S, so that radon and dew-point inputs can report
+                # first. They can do so from here on, not from the moment the
+                # file was read - the wait for the broker may have been long.
+                self.neuracell._started = time.monotonic()
+                return True
+            except OSError as e:
+                self.client = None      # the client of the failed attempt is not used
+                wait, pause = pause, min(pause * 2, BROKER_RETRY_MAX_S)
+                log.warning("No connection to the MQTT broker %s:%s (%s: %s). Check mqtt_host and "
+                            "mqtt_port and that the broker is running. Next attempt in %s.",
+                            self.cfg.mqtt_host, self.cfg.mqtt_port, type(e).__name__, e, _span(wait))
+            if await self._wait_or_stop(wait):
+                break
+        return False
+
     async def run(self) -> None:
         self.loop = asyncio.get_running_loop()
         self._stop_event = asyncio.Event()
         self._run_task = asyncio.current_task()
 
-        await self._login()
-        await self._discover_devices()
+        # Neither a cloud nor a broker that cannot be reached ends the start:
+        # the bridge waits and tries again until it is stopped.
+        if not await self._start_cloud():
+            return
         if self.cfg.neuracell_enabled or self.cfg.dewpoint_enabled:
             self.neuracell.load_persisted()
-        try:
-            self._mqtt_connect()
-        except OSError as e:
-            raise BrokerUnreachable("%s:%s" % (self.cfg.mqtt_host, self.cfg.mqtt_port), e) from e
+        if not await self._start_broker():
+            return
         # Subscriptions, discovery and NeuraCell-X status are (re)published from
         # the on_connect callback once the CONNACK is received (see _on_mqtt_connect).
         # Resume any filter reset that was still unconfirmed before a restart or
@@ -5669,21 +5809,8 @@ def main() -> None:
         bridge.stop()
     except asyncio.CancelledError:
         pass    # stopped while a request to the cloud was still out
-    except BrokerUnreachable as e:
-        log.error("Fatal error: no connection to the MQTT broker %s (%s: %s). Check mqtt_host and "
-                  "mqtt_port and that the broker is running; with the add-on watchdog switched on "
-                  "the bridge starts again by itself.", e.where, type(e.cause).__name__, e.cause)
-        sys.exit(1)
     except Exception as e:
-        if _is_network_error(e):
-            # No connection to the cloud at start (e.g. Home Assistant came up
-            # before the router): one line, no traceback. The add-on's watchdog
-            # (switch in its settings) starts it again.
-            log.error("Fatal error: no connection to the Ambientika cloud (%s). Check the "
-                      "internet connection; with the add-on watchdog switched on it starts "
-                      "again by itself.", _exc_text(e))
-        else:
-            log.exception("Fatal error: %s", e)
+        log.exception("Fatal error: %s", e)
         sys.exit(1)
 
 

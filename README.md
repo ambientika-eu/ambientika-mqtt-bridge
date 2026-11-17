@@ -69,7 +69,7 @@ docker run -d --name ambientika-bridge --restart unless-stopped \
   ghcr.io/ambientika-eu/ambientika-mqtt-bridge:latest
 ```
 
-Further settings go in as more `-e` variables or as a `config.yaml` mounted at `/config/config.yaml`. Every release is also available under its version number, e.g. `:1.6.36`. All settings are listed under [Configuration](#configuration).
+Further settings go in as more `-e` variables or as a `config.yaml` mounted at `/config/config.yaml`. Every release is also available under its version number, e.g. `:1.6.37`. All settings are listed under [Configuration](#configuration).
 
 ---
 
@@ -653,6 +653,19 @@ the count (`... - 1063 failed polls in a row since ...`), and the first successf
 poll says how long it was (`Device ... is answering again after 1063 failed
 poll(s) since ...`). Before 1.4.41 every failed poll wrote its own warning - a
 unit without power for nine hours wrote 1063 identical lines.
+
+### Start without the cloud or the broker
+
+Since 1.6.37 the bridge does not end when the Ambientika cloud or the MQTT broker
+cannot be reached while it starts - after a power cut, for example, when the
+router is not up yet. It waits and tries again by itself: the cloud after 10
+seconds, then with longer pauses up to five minutes, the broker up to once a
+minute. It starts as soon as both answer.
+
+If the cloud does not accept user name and password, the log says so and the
+bridge tries again after a minute, then with longer pauses up to 30 minutes -
+at the start and while it is running. A password that is not right is never
+sent every few seconds. Missing credentials still end the bridge at once.
 
 ### Poll diagnostics
 

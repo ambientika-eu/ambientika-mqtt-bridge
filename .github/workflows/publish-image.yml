@@ -52,6 +52,15 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          # Without the build attestation the package page lists the two
+          # platforms only; an attestation shows up there as "unknown/unknown".
+          provenance: false
+          # For an image for several platforms the package page reads the
+          # description from the image index, not from the labels of the Dockerfile.
+          annotations: |
+            index:org.opencontainers.image.description=MQTT bridge for Ambientika ventilation units
+            index:org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            index:org.opencontainers.image.licenses=MIT
           build-args: |
             BUILD_VERSION=${{ steps.ver.outputs.version }}
           tags: |
