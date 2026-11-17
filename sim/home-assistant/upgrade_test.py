@@ -194,35 +194,34 @@ SCENARIOS = {
 OLD_DEPRECATIONS = [r"deprecated constant CONN_CLASS_CLOUD_POLL",
                     r"provides the deprecated (temperature_unit|current_temperature)"]
 # Lines of Home Assistant itself that say nothing about the integration.
-HARMLESS = [r"We found a custom integration", r"custom_components\.simtest_upgrade",
-            r"Error loading libturbojpeg"]
+HARMLESS = [r"We found a custom integration", r"custom_components\.simtest_upgrade"]
 
 
 def problems(log_text, allow):
     """Errors and warnings about the integration that nobody expects.
 
     A line without a time stamp (a traceback) belongs to the record before it.
+    Only records that are about the integration count: what Home Assistant says
+    about other things missing on the test machine (ffmpeg, libturbojpeg) does
+    not. Details at debug level are not errors either.
     """
     record = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d")
-    found, state = [], "ok"
+    blocks = []
     for line in log_text.splitlines():
-        if record.match(line):
-            suspicious = " ERROR " in line or (" WARNING " in line and "ambientika" in line.lower())
-            if " DEBUG " in line:
-                state = "expected"  # details Home Assistant adds at debug level, tracebacks included
-            elif not suspicious:
-                state = "ok"
-            elif any(re.search(p, line) for p in HARMLESS) or any(re.search(p, line) for p in allow):
-                state = "expected"
-            else:
-                state = "problem"
-                found.append(line[:400])
-        elif state == "problem":
-            if found[-1].count("\n") < 12:
-                found[-1] += "\n      " + line[:200]
-        elif state == "ok" and "Traceback (most recent call last)" in line:
-            state = "problem"
-            found.append(line[:400])
+        if record.match(line) or not blocks:
+            blocks.append([line])
+        else:
+            blocks[-1].append(line)
+    found = []
+    for block in blocks:
+        head, text = block[0], "\n".join(block)
+        if " DEBUG " in head or "ambientika" not in text.lower():
+            continue
+        if not (" ERROR " in head or " WARNING " in head or "Traceback (most recent call last)" in text):
+            continue
+        if any(re.search(p, text) for p in HARMLESS) or any(re.search(p, text) for p in allow):
+            continue
+        found.append("\n      ".join(l[:300] for l in block[:14]))
     return found
 
 
@@ -288,7 +287,7 @@ def run_scenario(name, args, rows):
                            "detail": "no result file (exit code %s); the end of the log of Home Assistant:\n      %s"
                                      % (proc.returncode, "\n      ".join(log_text.splitlines()[-40:]))}]
             bad = problems(log_text, phase.allow + (OLD_DEPRECATIONS if phase.version == "old" else []))
-            checks.append({"name": "no unexpected error or warning in the log of Home Assistant", "ok": not bad,
+            checks.append({"name": "no unexpected error or warning about the integration in the log of Home Assistant", "ok": not bad,
                            "detail": None if not bad else "\n      ".join(bad[:12])})
             for pattern in phase.require:
                 checks.append({"name": "the log says: %s" % pattern, "ok": re.search(pattern, log_text) is not None,

@@ -62,5 +62,9 @@ print("\nRESULT: %d checks, %s" % (len(rows), "ALL PASS" if not bad else "FAILED
 sys.exit(1 if bad else 0)
 PY
 RC=$?
+if [ $RC -ne 0 ]; then
+  echo "The log of Home Assistant without the lines of the test driver (last 80 lines):"
+  grep -v "simtest[a-z_]*\] \(PASS\|FAIL\)" "$W/hass.log" | tail -n 80 | cut -c1-400
+fi
 echo "Home Assistant log and work folder: $W"
 exit $RC
