@@ -682,6 +682,16 @@ The bridge installs [`ambientika_py`](https://github.com/wingertge/ambientika-py
 
 ---
 
+## Versions
+
+Since 1.6.34 the bridge and the Home Assistant add-on
+([ambientika-ha-addon](https://github.com/ambientika-eu/ambientika-ha-addon)) share one version number:
+both run the identical `bridge.py`. Earlier bridge versions were numbered separately;
+bridge 1.4.43 corresponds to add-on 1.6.34, and the version notes in this README
+(e.g. "since 1.4.41") refer to that former bridge numbering. The changes of each version
+are listed in the [releases](https://github.com/ambientika-eu/ambientika-mqtt-bridge/releases)
+and in the add-on [CHANGELOG](https://github.com/ambientika-eu/ambientika-ha-addon/blob/main/ambientika_mqtt_bridge/CHANGELOG.md).
+
 ## License
 
 MIT License – © Südwind GmbH (SUEDWIND S.R.L.)
