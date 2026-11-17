@@ -277,15 +277,16 @@ def run_scenario(name, args, rows):
                 except subprocess.TimeoutExpired:
                     os.killpg(proc.pid, signal.SIGKILL)
                     proc.wait()
+            with open(log_path, encoding="utf-8", errors="replace") as fh:
+                log_text = fh.read()
             checks = []
             try:
                 with open(result, encoding="utf-8") as fh:
                     checks = json.load(fh)
             except (OSError, ValueError):
                 checks = [{"name": "Home Assistant ran and the test driver wrote its result", "ok": False,
-                           "detail": "no result file - see %s" % log_path}]
-            with open(log_path, encoding="utf-8", errors="replace") as fh:
-                log_text = fh.read()
+                           "detail": "no result file (exit code %s); the end of the log of Home Assistant:\n      %s"
+                                     % (proc.returncode, "\n      ".join(log_text.splitlines()[-40:]))}]
             bad = problems(log_text, phase.allow + (OLD_DEPRECATIONS if phase.version == "old" else []))
             checks.append({"name": "no unexpected error or warning in the log of Home Assistant", "ok": not bad,
                            "detail": None if not bad else "\n      ".join(bad[:12])})

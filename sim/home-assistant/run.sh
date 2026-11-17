@@ -44,7 +44,14 @@ sed -i "s#server_port: .*#server_port: $HP#" "$C/configuration.yaml"
 sleep 1.5
 SIM_BROKER_PORT="$BP" SIM_CLOUD_URL="http://127.0.0.1:$CP" SIM_BRIDGE="$REPO/bridge.py" SIM_PYTHON="$PYTHON" \
   SIM_HA_RESULT="$RESULT" SIM_WORK="$W" SIM_SCENARIO="${SIM_SCENARIO:-}" timeout 900 "$HASS" -c "$C" > "$W/hass.log" 2>&1
+HASS_RC=$?
 kill $CLOUD_PID $BROKER_PID 2>/dev/null
+if [ ! -s "$RESULT" ]; then
+  echo "Home Assistant ended (exit code $HASS_RC) without a result of the test driver. The end of its log:"
+  tail -n 60 "$W/hass.log"
+  echo "Home Assistant log and work folder: $W"
+  exit 1
+fi
 "$PYTHON" - "$RESULT" <<'PY'
 import json, sys
 rows = json.load(open(sys.argv[1], encoding="utf-8"))
