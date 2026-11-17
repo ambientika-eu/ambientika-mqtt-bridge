@@ -13,6 +13,10 @@ restart and the Last Will.
     python test_system_sim.py --addon-image TAG    # add-on image: /data/options.json + run.sh
     python test_system_sim.py --only hang,broker   # some groups only
 
+--addon-config names the config.yaml whose default options the add-on image
+gets (another repository's copy); SIM_TIME_FACTOR stretches every wait for an
+image that runs emulated.
+
 Needs mosquitto on the PATH (or its path in SIM_MOSQUITTO); the image modes
 need docker. Where the system confines /usr/sbin/mosquitto to its own folders
 (AppArmor on Ubuntu), point SIM_MOSQUITTO at a copy of the binary.
@@ -42,10 +46,13 @@ NAMES = {MASTER: "Flur", SLAVE: "Wohnzimmer", SLAVE2: "Kinderzimmer", SLAVE3: "G
 MOSQUITTO = os.environ.get("SIM_MOSQUITTO", "mosquitto")    # another path, e.g. an unconfined copy
 POLL = 2            # seconds between polls in every scenario
 CLOUD_TIMEOUT = 4   # seconds the bridge waits for one answer of the cloud here
+# Stretches every wait, for an image that runs emulated (e.g. arm on an x86 runner).
+TIME_FACTOR = max(1.0, float(os.environ.get("SIM_TIME_FACTOR", "1") or 1))
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--image")
 ap.add_argument("--addon-image")
+ap.add_argument("--addon-config", help="config.yaml of the add-on (default: ambientika_mqtt_bridge/config.yaml here)")
 ap.add_argument("--only", default="")
 ap.add_argument("--keep", action="store_true", help="keep the work folder with all logs")
 ARGS = ap.parse_args()
@@ -76,7 +83,7 @@ def free_port():
 
 
 def wait(cond, timeout=20, step=0.1):
-    end = time.time() + timeout
+    end = time.time() + timeout * TIME_FACTOR
     while time.time() < end:
         try:
             v = cond()
@@ -327,7 +334,8 @@ class Bridge:
 def addon_options(cloud, broker, **over):
     """options.json as the Supervisor writes it: the defaults of config.yaml plus the user's values."""
     import yaml
-    with open(os.path.join(HERE, "ambientika_mqtt_bridge", "config.yaml"), encoding="utf-8") as fh:
+    path = ARGS.addon_config or os.path.join(HERE, "ambientika_mqtt_bridge", "config.yaml")
+    with open(path, encoding="utf-8") as fh:
         opts = dict(yaml.safe_load(fh)["options"])
     opts.update({
         "ambientika_username": USER, "ambientika_password": PASSWORD, "ambientika_host": cloud.url,
