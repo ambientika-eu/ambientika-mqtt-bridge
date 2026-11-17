@@ -436,6 +436,11 @@ The log says the same: the first failed reads up to
 count (`... 1063 failed polls in a row since ...`), and when the unit is back
 `Device ... is answering again after 1063 failed poll(s) since ...`.
 
+Since 1.6.36 a read that the cloud accepts but does not answer ends after 20
+seconds and counts as a failed read of that unit (`... no answer within 20 s`);
+the other units are read on. Before, such a read held all units for up to five
+minutes, and they kept showing their last values meanwhile.
+
 After the first read of all units the log also lists the zone topology - one
 line per zone with the Master and its Slaves and their roles (`Zone topology -
 zone 0: Master Flur (...); Slaves: Wohnzimmer (...) SlaveEqualMaster, ...`) - and
@@ -445,10 +450,16 @@ after touching a zone in the app.
 
 ## When something does not work
 
-The **Log** tab is the place to look. The two most common lines:
+The **Log** tab is the place to look. The most common lines:
 
 - `Ambientika username/password missing` — the two `ambientika_*` options are empty.
 - `MQTT connection failed (rc=5)` — the broker refused the login, see the note above.
+- `Fatal error: no connection to the MQTT broker <host>:<port>` — the broker could
+  not be reached when the add-on started. Check `mqtt_host` and `mqtt_port` and
+  that the broker is running.
+- `Fatal error: no connection to the Ambientika cloud` — no internet connection
+  when the add-on started, or the cloud did not answer within 20 seconds. With the
+  watchdog of the add-on switched on it starts again by itself.
 
 ## Support
 
