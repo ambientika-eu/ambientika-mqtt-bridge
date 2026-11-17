@@ -375,10 +375,18 @@ def scenario_start_and_values():
         check("five units found", "Found 5 device(s)." in log, log[-800:])
         check("bridge availability online, retained",
               wait(lambda: spy.last("ambientika/bridge/availability") == "online", 5))
-        cfgs = [m for m in spy.all() if m[1].startswith("homeassistant/") and m[1].endswith("/config") and m[2]]
-        per_unit = {s: [m for m in cfgs if "/%s_" % s in m[1]] for s in SERIALS}
-        check("discovery for every unit (same entity count each)",
-              len({len(v) for v in per_unit.values()}) == 1 and len(per_unit[MASTER]) >= 30,
+        def discovery():
+            found = [m for m in spy.all() if m[1].startswith("homeassistant/") and m[1].endswith("/config") and m[2]]
+            return found, {s: [m for m in found if "/%s_" % s in m[1]] for s in SERIALS}
+
+        def complete():
+            per = discovery()[1]
+            return len({len(v) for v in per.values()}) == 1 and len(per[MASTER]) >= 30
+
+        # the bridge announces one unit after the other; a slow machine is still at it
+        complete_in_time = wait(complete, 20)
+        cfgs, per_unit = discovery()
+        check("discovery for every unit (same entity count each)", complete_in_time,
               {s: len(v) for s, v in per_unit.items()})
         names = {}
         for m in cfgs:
