@@ -60,6 +60,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mosquitto
           sudo systemctl stop mosquitto || true
+          # Ubuntu confines /usr/sbin/mosquitto to /etc/mosquitto and its data
+          # folders; the tests start brokers with their own configuration.
+          sudo cp /usr/sbin/mosquitto /usr/local/bin/mosquitto-test
+          echo "SIM_MOSQUITTO=/usr/local/bin/mosquitto-test" >> "$GITHUB_ENV"
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - run: npm ci

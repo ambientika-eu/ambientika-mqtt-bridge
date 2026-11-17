@@ -20,6 +20,7 @@ const mqtt = require('mqtt');
 
 const REPO = path.join(__dirname, '..', '..', '..');
 const PYTHON = process.env.SIM_PYTHON || 'python3';
+const MOSQUITTO = process.env.SIM_MOSQUITTO || 'mosquitto'; // another path, e.g. an unconfined copy
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'ambientika-iob-sim-'));
 fs.chmodSync(WORK, 0o755); // mosquitto drops its privileges and still has to read its files here
 
@@ -198,7 +199,7 @@ class Broker {
     }
 
     async up() {
-        this.proc = new Proc('mosquitto', 'mosquitto', ['-c', this.conf]);
+        this.proc = new Proc('mosquitto', MOSQUITTO, ['-c', this.conf]);
         if (!(await until(() => portOpen(this.port), 10000))) throw new Error(`mosquitto did not start: ${this.proc.log()}`);
     }
 

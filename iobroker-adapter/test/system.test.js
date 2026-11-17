@@ -6,7 +6,8 @@
  *   cloud stand-in (HTTP)  ->  bridge.py  ->  Mosquitto  ->  this adapter in js-controller
  *
  * and of the adapter alone against whatever can turn up on a broker.
- * Needs python3 with the bridge requirements (SIM_PYTHON) and mosquitto.
+ * Needs python3 with the bridge requirements (SIM_PYTHON) and mosquitto
+ * (SIM_MOSQUITTO for another path than the one on the PATH).
  *
  *   SIM_PYTHON=/path/to/python JS_CONTROLLER=7.2.5 npx mocha test/system.test.js --exit
  */

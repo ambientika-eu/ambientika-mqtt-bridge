@@ -13,7 +13,9 @@ restart and the Last Will.
     python test_system_sim.py --addon-image TAG    # add-on image: /data/options.json + run.sh
     python test_system_sim.py --only hang,broker   # some groups only
 
-Needs mosquitto on the PATH; the image modes need docker.
+Needs mosquitto on the PATH (or its path in SIM_MOSQUITTO); the image modes
+need docker. Where the system confines /usr/sbin/mosquitto to its own folders
+(AppArmor on Ubuntu), point SIM_MOSQUITTO at a copy of the binary.
 """
 import argparse
 import json
@@ -37,6 +39,7 @@ MASTER, SLAVE, SLAVE2, SLAVE3, MASTER2 = ("A0B1C2D3E402", "A0B1C2D3E401", "A0B1C
 SERIALS = [MASTER, SLAVE, SLAVE2, SLAVE3, MASTER2]
 NAMES = {MASTER: "Flur", SLAVE: "Wohnzimmer", SLAVE2: "Kinderzimmer", SLAVE3: "Gäste-Bad",
          MASTER2: "Schlafzimmer Eltern"}
+MOSQUITTO = os.environ.get("SIM_MOSQUITTO", "mosquitto")    # another path, e.g. an unconfined copy
 POLL = 2            # seconds between polls in every scenario
 CLOUD_TIMEOUT = 4   # seconds the bridge waits for one answer of the cloud here
 
@@ -135,7 +138,7 @@ class Broker:
         self.start()
 
     def start(self):
-        self.proc = Proc("mosquitto", ["mosquitto", "-c", self.conf])
+        self.proc = Proc("mosquitto", [MOSQUITTO, "-c", self.conf])
         ok = wait(lambda: self._open(), 10)
         if not ok:
             raise RuntimeError("mosquitto did not start: " + self.proc.log())
@@ -805,7 +808,7 @@ GROUPS = [
     ("config", scenario_config),
 ]
 
-if shutil.which("mosquitto") is None:
+if shutil.which(MOSQUITTO) is None:
     print("mosquitto is not installed")
     sys.exit(2)
 print("System test of the bridge as %s, work folder %s" % (
