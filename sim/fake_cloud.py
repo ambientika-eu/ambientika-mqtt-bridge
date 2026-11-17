@@ -132,14 +132,14 @@ async def auth(req):
 
 async def houses(req):
     bad = await gate(req)
-    if bad:
+    if bad is not None:  # a response object is "empty", and so false, for older aiohttp versions
         return bad
     return web.json_response([{"houseId": 1}])
 
 
 async def house(req):
     bad = await gate(req)
-    if bad:
+    if bad is not None:  # a response object is "empty", and so false, for older aiohttp versions
         return bad
     devs = [{"id": i + 1, "deviceType": "Smart", "serialNumber": s, "userId": 7, "name": u["name"],
              "role": u["role"], "zoneIndex": u["zone"], "installation": "Wall", "roomId": 1}
@@ -152,7 +152,7 @@ async def house(req):
 
 async def status(req):
     bad = await gate(req)
-    if bad:
+    if bad is not None:  # a response object is "empty", and so false, for older aiohttp versions
         return bad
     serial = req.query.get("deviceSerialNumber", "")
     u = S["units"].get(serial)
@@ -175,7 +175,7 @@ async def status(req):
 
 async def change(req):
     bad = await gate(req)
-    if bad:
+    if bad is not None:  # a response object is "empty", and so false, for older aiohttp versions
         return bad
     try:
         b = await req.json()
@@ -214,7 +214,7 @@ async def change(req):
 
 async def reset(req):
     bad = await gate(req)
-    if bad:
+    if bad is not None:  # a response object is "empty", and so false, for older aiohttp versions
         return bad
     serial = req.query.get("deviceSerialNumber", "")
     u = S["units"].get(serial)
