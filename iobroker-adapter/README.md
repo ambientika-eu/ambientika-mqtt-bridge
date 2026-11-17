@@ -12,8 +12,8 @@ topics of the [Ambientika MQTT Bridge](https://github.com/ambientika-eu/ambienti
 from your MQTT broker and shows every unit as an ioBroker device. Commands from ioBroker go
 back to the units through the bridge.
 
-Maintained by **Südwind GmbH**, the manufacturer of Ambientika. Version 1.6.34 matches
-bridge 1.6.34.
+Maintained by **Südwind GmbH**, the manufacturer of Ambientika. Works with bridge 1.6.34
+and newer.
 
 ## How it works
 
