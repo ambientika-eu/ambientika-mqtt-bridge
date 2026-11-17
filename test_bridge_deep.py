@@ -1052,7 +1052,7 @@ async def test_command():
     await b._handle_command("AMB-2", "operating_mode", "Bogus")  # invalid -> no crash
     check("command: invalid value does not crash", True)
     # Filter-Reset: wird behandelt (kein Crash) und loest KEINEN change_mode aus.
-    # Methoden-/DELETE-Sicherheit + Verifikation deckt test_filter_reset_diag.py ab.
+    # Methoden-/DELETE-Sicherheit + Verifikation deckt test_filter_reset_diag.py ab (läuft in der CI mit).
     n_modes = len(dev.mode_calls)
     await b._handle_command("AMB-2", "reset_filter", "PRESS")
     check("command: reset_filter wird ohne Crash behandelt", True)
@@ -1989,7 +1989,7 @@ def test_filter_ack_robust():
     os.environ["FILTER_ACK_PATH"] = os.path.join(_tempfile.mkdtemp(), "filter_ack.json")
     os.environ["FILTER_ACK_TTL_DAYS"] = "90"
     try:
-        S = "E05A1B9BAF0C"
+        S = "A0B1C2D3E401"
         AB._filter_ack_write(S, "Bad")
         check("ack: Bad -> effektiv Good", AB._filter_ack_effective(S, "Bad") == "Good")
         check("ack: Medium -> effektiv Good", AB._filter_ack_effective(S, "Medium") == "Good")
@@ -5058,17 +5058,17 @@ async def test_zone_topology_log():
     cfg.enable_discovery = False
     b = bridge.AmbientikaBridge(cfg)
     b.client = FakeClient()
-    flur = FakeDevice(serial="E05A1B9C0DAC", name="Flur", zone=0, status=mkstatus(op=OM.Smart))
+    flur = FakeDevice(serial="A0B1C2D3E402", name="Flur", zone=0, status=mkstatus(op=OM.Smart))
     flur.role = "Master"
     rooms = {}
-    for sn, name in (("E05A1B9BAF0C", "Wohnzimmer"), ("CCDBA789F890", "Kinderzimmer"),
+    for sn, name in (("A0B1C2D3E401", "Wohnzimmer"), ("A0B1C2D3E403", "Kinderzimmer"),
                      ("AAAA00000001", "Schlafzimmer"), ("AAAA00000002", "Gäste Bad")):
         d = FakeDevice(serial=sn, name=name, zone=0, status=mkstatus(op=OM.Smart))
         d.role = "SlaveEqualMaster"
         rooms[sn] = d
     kueche = FakeDevice(serial="BBBB00000001", name="Küche", zone=1, status=mkstatus(op=OM.Smart))
     kueche.role = "Master"
-    b.devices = {"E05A1B9C0DAC": flur, **rooms, "BBBB00000001": kueche}
+    b.devices = {"A0B1C2D3E402": flur, **rooms, "BBBB00000001": kueche}
     for sn, d in b.devices.items():
         b._device_house[sn] = 7
     # vor dem ersten Abruf: Rollen aus der Geraetesuche
@@ -5078,9 +5078,9 @@ async def test_zone_topology_log():
     z1 = [m for lv, m in lc.lines if m.startswith("Zone topology - zone 1")]
     check("topo: eine Zeile je Zone", len(z0) == 1 and len(z1) == 1 and len(lc.lines) == 2, lc.lines)
     check("topo: Zone 0 - Master Flur, vier Slaves mit Rolle, sortiert nach Name",
-          z0 and z0[0] == ("Zone topology - zone 0: Master Flur (E05A1B9C0DAC); Slaves: "
-                           "Gäste Bad (AAAA00000002) SlaveEqualMaster, Kinderzimmer (CCDBA789F890) SlaveEqualMaster, "
-                           "Schlafzimmer (AAAA00000001) SlaveEqualMaster, Wohnzimmer (E05A1B9BAF0C) SlaveEqualMaster"),
+          z0 and z0[0] == ("Zone topology - zone 0: Master Flur (A0B1C2D3E402); Slaves: "
+                           "Gäste Bad (AAAA00000002) SlaveEqualMaster, Kinderzimmer (A0B1C2D3E403) SlaveEqualMaster, "
+                           "Schlafzimmer (AAAA00000001) SlaveEqualMaster, Wohnzimmer (A0B1C2D3E401) SlaveEqualMaster"),
           z0)
     check("topo: Zone 1 - Master allein", z1 and z1[0] == "Zone topology - zone 1: Master Küche (BBBB00000001); no Slaves (standalone)", z1)
     check("topo: ohne zweites Haus kein Hauszusatz", "house" not in z0[0])
@@ -5089,20 +5089,20 @@ async def test_zone_topology_log():
         b._log_topology()
     check("topo: unveraendert -> nichts mehr geloggt", not lc.lines, lc.lines)
     # Werksreset des Wohnzimmers: das Geraet meldet NotConfigured
-    rooms["E05A1B9BAF0C"]._status["device_role"] = "NotConfigured"
-    b._note_live_role("E05A1B9BAF0C", rooms["E05A1B9BAF0C"]._status)
+    rooms["A0B1C2D3E401"]._status["device_role"] = "NotConfigured"
+    b._note_live_role("A0B1C2D3E401", rooms["A0B1C2D3E401"]._status)
     with _LogCapture() as lc:
         b._log_topology()
     ch = [m for lv, m in lc.lines if m.startswith("Zone topology changed - zone 0")]
     check("topo: Aenderung -> 'changed', Wohnzimmer als 'not coupled' mit gemeldeter Rolle",
           len(ch) == 1 and "Slaves: Gäste Bad (AAAA00000002) SlaveEqualMaster, Kinderzimmer" in ch[0]
-          and ch[0].endswith("; not coupled: Wohnzimmer (E05A1B9BAF0C) NotConfigured")
-          and "Wohnzimmer (E05A1B9BAF0C) SlaveEqualMaster" not in ch[0], lc.lines)
+          and ch[0].endswith("; not coupled: Wohnzimmer (A0B1C2D3E401) NotConfigured")
+          and "Wohnzimmer (A0B1C2D3E401) SlaveEqualMaster" not in ch[0], lc.lines)
     check("topo: nur die geaenderte Zeile? - nein, das Bild komplett (Zone 1 wieder dabei)",
           any(m.startswith("Zone topology changed - zone 1") for lv, m in lc.lines), lc.lines)
     # wieder gekoppelt -> wieder wie vorher, eine 'changed'-Meldung
-    rooms["E05A1B9BAF0C"]._status["device_role"] = "SlaveEqualMaster"
-    b._note_live_role("E05A1B9BAF0C", rooms["E05A1B9BAF0C"]._status)
+    rooms["A0B1C2D3E401"]._status["device_role"] = "SlaveEqualMaster"
+    b._note_live_role("A0B1C2D3E401", rooms["A0B1C2D3E401"]._status)
     with _LogCapture() as lc:
         b._log_topology()
     check("topo: zurueckgekoppelt -> changed, wieder vier Slaves",

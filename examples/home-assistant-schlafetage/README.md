@@ -29,10 +29,10 @@ Fertiges Paket für eine Etage mit mehreren Ambientika SMART/OFFICE über die Am
 Die Seriennummer steht im Log der Bridge (Einstellungen → Add-ons → Ambientika MQTT Bridge → Protokoll), zum Beispiel:
 
 ```
-Device: Eltern  (serial: 441BF633FDD4)
+Device: Eltern  (serial: B0C1D2E3F407)
 ```
 
-Daraus wird der Eintrag `"441BF633FDD4"`. Groß-/Kleinschreibung spielt keine Rolle.
+Daraus wird der Eintrag `"B0C1D2E3F407"`. Groß-/Kleinschreibung spielt keine Rolle.
 
 Das Paket sucht die Geräte über die Seriennummer, nicht über den Namen. Ein Gerät darf deshalb jederzeit in der Ambientika-App oder in Home Assistant umbenannt werden, die Automationen laufen weiter. (Frühere Versionen dieses Pakets haben die Geräte über den Anfang der Entitäts-ID gesucht. Diese ID vergibt Home Assistant beim ersten Erkennen aus dem damaligen Gerätenamen und behält sie auch nach einer Umbenennung. Wer die Geräte umbenannt hat, hat dann Befehle nur noch bei den Geräten gesehen, deren Name gleich geblieben ist. Mit den Seriennummern entfällt das.)
 

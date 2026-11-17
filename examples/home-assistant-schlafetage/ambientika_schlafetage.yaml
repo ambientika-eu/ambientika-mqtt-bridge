@@ -12,7 +12,7 @@
 # ANPASSUNG 1: die Liste "geraete_serials" im Skript "Lüftung Schlafetage setzen".
 #   Dort stehen die Seriennummern ALLER Geraete der Schlafetage (Master und
 #   Slaves), so wie sie im Log der Bridge stehen, z. B.
-#   "Device: Eltern  (serial: 441BF633FDD4)". Die Geraete werden ueber die
+#   "Device: Eltern  (serial: B0C1D2E3F407)". Die Geraete werden ueber die
 #   Seriennummer gefunden, nicht ueber den Namen - Umbenennen in der
 #   Ambientika-App oder in Home Assistant aendert nichts.
 #   Welches Geraet gerade Master ist, liest das Skript bei jedem Lauf aus dem

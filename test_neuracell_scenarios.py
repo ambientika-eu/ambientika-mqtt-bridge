@@ -146,13 +146,13 @@ class Unit:
 def house(cellar_op=OM.Smart, cellar_fan=FS.Medium):
     """7 Geraete wie beim Kunden. Rueckgabe: dict serial -> Unit."""
     units = [
-        Unit("441BF633FDC8", "BueroM", 1, "Master", OM.Smart),
-        Unit("A0F262D56A3C", "BueroL", 1, "SlaveOppositeMaster", OM.Smart),
-        Unit("441BF633FDD4", "Eltern", 2, "Master", OM.Smart),
-        Unit("441BF633AE58", "KindSchlafen", 3, "Master", OM.Smart),
-        Unit("441BF633B678", "KindSpielen", 3, "SlaveOppositeMaster", OM.Smart),
-        Unit("FCB467C6EABC", "KellerLinks", 4, "Master", cellar_op, cellar_fan, dtype="OFFICE"),
-        Unit("FCB467C4B1E4", "KellerRechts", 4, "SlaveOppositeMaster", cellar_op, cellar_fan, dtype="OFFICE"),
+        Unit("B0C1D2E3F406", "BueroM", 1, "Master", OM.Smart),
+        Unit("B0C1D2E3F405", "BueroL", 1, "SlaveOppositeMaster", OM.Smart),
+        Unit("B0C1D2E3F407", "Eltern", 2, "Master", OM.Smart),
+        Unit("B0C1D2E3F403", "KindSchlafen", 3, "Master", OM.Smart),
+        Unit("B0C1D2E3F404", "KindSpielen", 3, "SlaveOppositeMaster", OM.Smart),
+        Unit("B0C1D2E3F402", "KellerLinks", 4, "Master", cellar_op, cellar_fan, dtype="OFFICE"),
+        Unit("B0C1D2E3F401", "KellerRechts", 4, "SlaveOppositeMaster", cellar_op, cellar_fan, dtype="OFFICE"),
     ]
     return {u.serial_number: u for u in units}
 
@@ -173,7 +173,7 @@ class Sim:
 
     def __init__(self, units, label, **cfg_kw):
         cfg = bridge.BridgeConfig()
-        cfg.dewpoint_block_devices = "fcb467c4b1e4, fcb467c6eabc"
+        cfg.dewpoint_block_devices = "b0c1d2e3f401, b0c1d2e3f402"
         cfg.radon_threshold = 100
         cfg.radon_hysteresis = 50
         cfg.radon_protection_fan = "Medium"
@@ -275,8 +275,8 @@ class Sim:
                 print("    %6.1f %-7s %s" % (t, lv, m[:150]))
 
 
-KL, KR = "FCB467C6EABC", "FCB467C4B1E4"
-SMARTS = ("441BF633FDC8", "A0F262D56A3C", "441BF633FDD4", "441BF633AE58", "441BF633B678")
+KL, KR = "B0C1D2E3F402", "B0C1D2E3F401"
+SMARTS = ("B0C1D2E3F406", "B0C1D2E3F405", "B0C1D2E3F407", "B0C1D2E3F403", "B0C1D2E3F404")
 
 
 # --------------------------------------------------------------------------- Szenarien
@@ -353,7 +353,7 @@ async def scenario_cellar_outage():
               len(s.calls(KL)) == 4 and len(s.calls(KR)) == 4 and all(not s.calls(x) for x in SMARTS),
               (s.calls(KL), s.calls(KR)))
         check("A: 404-Ausfall von KellerRechts protokolliert und wieder da",
-              s.has_log("INFO", "Poll 1/3 failed for FCB467C4B1E4") and s.has_log("INFO", "Device FCB467C4B1E4 is answering again"))
+              s.has_log("INFO", "Poll 1/3 failed for B0C1D2E3F401") and s.has_log("INFO", "Device B0C1D2E3F401 is answering again"))
         check("A: keine Fehler/Tracebacks", not any(lv == "ERROR" for _t, lv, _m in s.log), [m for t, lv, m in s.log if lv == "ERROR"])
     sim.mark(225, check_released)
     await sim.run(230, retained=retained)
@@ -507,16 +507,16 @@ def nils_house():
     """5 SMART in einer Zone wie beim Kunden (Nov. 2026): Flur Master, vier
     SlaveEqualMaster. Alle Smart."""
     units = [
-        Unit("E05A1B9C0DAC", "Flur", 0, "Master", OM.Smart),
-        Unit("E05A1B9BAF0C", "Wohnzimmer", 0, "SlaveEqualMaster", OM.Smart),
-        Unit("CCDBA789F890", "Kinderzimmer", 0, "SlaveEqualMaster", OM.Smart),
-        Unit("E05A1B9C1111", "Schlafzimmer", 0, "SlaveEqualMaster", OM.Smart),
-        Unit("E05A1B9C2222", "Gaeste Bad", 0, "SlaveEqualMaster", OM.Smart),
+        Unit("A0B1C2D3E402", "Flur", 0, "Master", OM.Smart),
+        Unit("A0B1C2D3E401", "Wohnzimmer", 0, "SlaveEqualMaster", OM.Smart),
+        Unit("A0B1C2D3E403", "Kinderzimmer", 0, "SlaveEqualMaster", OM.Smart),
+        Unit("A0B1C2D3E404", "Schlafzimmer", 0, "SlaveEqualMaster", OM.Smart),
+        Unit("A0B1C2D3E405", "Gaeste Bad", 0, "SlaveEqualMaster", OM.Smart),
     ]
     return {u.serial_number: u for u in units}
 
 
-WOZI, FLUR = "E05A1B9BAF0C", "E05A1B9C0DAC"
+WOZI, FLUR = "A0B1C2D3E401", "A0B1C2D3E402"
 
 
 async def scenario_unit_unplugged():
@@ -586,11 +586,11 @@ async def scenario_unit_unplugged():
         check("E: Wohnzimmer wieder online", av[-1] == "online")
         topo = [m for t, lv, m in s.log if m.startswith("Zone topology")]
         check("E: Topologie genau einmal, eine Zone: Flur Master + vier Slaves, keine 'changed'-Zeile",
-              len(topo) == 1 and topo[0].startswith("Zone topology - zone 0: Master Flur (E05A1B9C0DAC); Slaves: ")
+              len(topo) == 1 and topo[0].startswith("Zone topology - zone 0: Master Flur (A0B1C2D3E402); Slaves: ")
               and topo[0].count("SlaveEqualMaster") == 4 and "changed" not in topo[0], topo)
         ri = [json.loads(p) for t, p in s.b.client.pub if t == bridge.reset_info_topic("ambientika", WOZI)]
         check("E: reset_info Wohnzimmer einmal: Slave, Master Flur, Zaehler bleibt",
-              len(ri) == 1 and ri[0]["device_role"] == "SlaveEqualMaster" and ri[0]["zone_master"] == "Flur (E05A1B9C0DAC)"
+              len(ri) == 1 and ri[0]["device_role"] == "SlaveEqualMaster" and ri[0]["zone_master"] == "Flur (A0B1C2D3E402)"
               and ri[0]["cloud_reset_clears_counter"] is False, ri)
         n_states = {sn: sum(1 for t, p in s.b.client.pub if t == "ambientika/%s/state" % sn) for sn in s.units}
         check("E: die anderen vier haben jeden Abruf einen Zustand bekommen (>= 1080), Wohnzimmer ~1063 weniger",

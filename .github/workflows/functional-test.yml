@@ -14,6 +14,7 @@ on:
       - "bridge.py"
       - "test_bridge_deep.py"
       - "test_neuracell_scenarios.py"
+      - "test_filter_reset_diag.py"
       - "requirements.txt"
       - ".github/workflows/functional-test.yml"
   pull_request:
@@ -22,6 +23,7 @@ on:
       - "bridge.py"
       - "test_bridge_deep.py"
       - "test_neuracell_scenarios.py"
+      - "test_filter_reset_diag.py"
       - "requirements.txt"
       - ".github/workflows/functional-test.yml"
   workflow_dispatch:
@@ -55,3 +57,6 @@ jobs:
 
       - name: Run NeuraCell-X scenario simulation (time-lapse)
         run: python test_neuracell_scenarios.py
+
+      - name: Run filter reset safety test
+        run: python test_filter_reset_diag.py

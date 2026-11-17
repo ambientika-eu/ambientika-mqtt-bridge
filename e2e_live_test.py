@@ -2,7 +2,7 @@
 """Live end-to-end test: real Mosquitto broker, full bridge.run() loop,
 simulated Ambientika radon meter (MQTT mode 4) with Last Will + keepalive,
 Ambientika Taupunktsteuerung with its real topics (dew-point/<id>/...),
-Vorsmann layout (2x OFFICE cellar, 5x SMART sleeping floor)."""
+Example layout (2x OFFICE cellar, 5x SMART sleeping floor)."""
 import asyncio, importlib.util, json, os, socket, subprocess, sys, tempfile, threading, time
 import paho.mqtt.client as mqtt
 
@@ -41,15 +41,15 @@ class Dev:
 
 def make_devices():
     return {d.serial_number: d for d in [
-        Dev("FCB467C4B1E4", "Ambientika Office_rechts", "OFFICE", OM.Smart),
-        Dev("FCB467C6EABC", "Ambientika Office Keller_links", "OFFICE", OM.Smart),
-        Dev("441BF633AE58", "Kind schlafen", "SMART", OM.MasterSlaveFlow),
-        Dev("441BF633B678", "Kind spielen", "SMART", OM.MasterSlaveFlow),
-        Dev("A0F262D56A3C", "Büro L", "SMART", OM.Smart),
-        Dev("441BF633FDC8", "Büro M", "SMART", OM.Smart),
-        Dev("441BF633FDD4", "Eltern", "SMART", OM.Night)]}
+        Dev("B0C1D2E3F401", "Ambientika Office_rechts", "OFFICE", OM.Smart),
+        Dev("B0C1D2E3F402", "Ambientika Office Keller_links", "OFFICE", OM.Smart),
+        Dev("B0C1D2E3F403", "Kind schlafen", "SMART", OM.MasterSlaveFlow),
+        Dev("B0C1D2E3F404", "Kind spielen", "SMART", OM.MasterSlaveFlow),
+        Dev("B0C1D2E3F405", "Büro L", "SMART", OM.Smart),
+        Dev("B0C1D2E3F406", "Büro M", "SMART", OM.Smart),
+        Dev("B0C1D2E3F407", "Eltern", "SMART", OM.Night)]}
 
-OFFICE = {"FCB467C4B1E4", "FCB467C6EABC"}
+OFFICE = {"B0C1D2E3F401", "B0C1D2E3F402"}
 
 class Spy:
     """Plays Home Assistant: keeps the last retained/non-retained message per topic."""
@@ -160,7 +160,7 @@ async def run_bridge(devs, stop_after, native=False):
     cfg = bridge.BridgeConfig()
     cfg.mqtt_host, cfg.mqtt_port, cfg.poll_interval = "127.0.0.1", PORT, 2
     cfg.radon_threshold, cfg.radon_hysteresis = 50, 10
-    cfg.dewpoint_block_devices = "FCB467C4B1E4,FCB467C6EABC"
+    cfg.dewpoint_block_devices = "B0C1D2E3F401,B0C1D2E3F402"
     cfg.dewpoint_lost_action = "release"
     if native:
         # 1.4.27: nothing configured for the Taupunktsteuerung (dew-point/+/state is
@@ -201,11 +201,11 @@ async def scenario():
         check("HA discovery 'Radon Meter Connected' retained", disc[1] == 1 and cfgd.get("device_class") == "connectivity", disc)
         check("discovery points to neuracell/state", cfgd.get("state_topic") == "ambientika/neuracell/state")
         # 1.4.33: averaged sensors next to the raw values
-        da = retained("homeassistant/sensor/A0F262D56A3C_humidity_avg/config")
+        da = retained("homeassistant/sensor/B0C1D2E3F405_humidity_avg/config")
         dac = json.loads(da[0]) if da[0] else {}
         check("HA discovery 'Humidity (averaged)' retained", da[1] == 1 and dac.get("state_class") == "measurement"
               and dac.get("value_template") == "{{ value_json.humidity_avg }}", da)
-        st = lambda: json.loads(spy.get("ambientika/A0F262D56A3C/state")[0] or "{}")
+        st = lambda: json.loads(spy.get("ambientika/B0C1D2E3F405/state")[0] or "{}")
         check("state carries humidity_avg / temperature_avg (55 / 21)",
               await aw(lambda: st().get("humidity_avg") == 55.0 and st().get("temperature_avg") == 21.0), st())
         check("raw humidity unchanged next to it", st().get("humidity") == 55, st())

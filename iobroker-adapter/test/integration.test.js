@@ -4,7 +4,7 @@ const { tests } = require('@iobroker/testing');
 
 // Starts a real js-controller with this adapter and a local MQTT broker (aedes)
 // that plays the part of the Ambientika MQTT Bridge.
-const SERIAL = 'E05A1B9BAF0C';
+const SERIAL = 'A0B1C2D3E401';
 const PREFIX = 'ambientika';
 
 const STATE = {

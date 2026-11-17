@@ -111,9 +111,9 @@ Under `ambientika.0.neuracell`, if the bridge runs radon or dew-point protection
 ## Example: ventilate the bathroom after a shower
 
 ```javascript
-on({ id: 'ambientika.0.E05A1B9BAF0C.humidity_avg', change: 'ne' }, obj => {
+on({ id: 'ambientika.0.A0B1C2D3E401.humidity_avg', change: 'ne' }, obj => {
     if (obj.state.val > 75) {
-        setState('ambientika.0.E05A1B9BAF0C.fan_speed', 'High');
+        setState('ambientika.0.A0B1C2D3E401.fan_speed', 'High');
     }
 });
 ```

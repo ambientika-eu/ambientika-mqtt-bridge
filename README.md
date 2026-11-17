@@ -667,7 +667,7 @@ After the first poll cycle the log lists the coupling as the units report it -
 one line per zone with the Master and its Slaves and their roles:
 
 ```
-Zone topology - zone 0: Master Flur (E05A1B9C0DAC); Slaves: Gäste Bad (…) SlaveEqualMaster, Kinderzimmer (…) SlaveEqualMaster, …
+Zone topology - zone 0: Master Flur (A0B1C2D3E402); Slaves: Gäste Bad (…) SlaveEqualMaster, Kinderzimmer (…) SlaveEqualMaster, …
 Zone topology - zone 1: Master Küche (…); no Slaves (standalone)
 ```
 
