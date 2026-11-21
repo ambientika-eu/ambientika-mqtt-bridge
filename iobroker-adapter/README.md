@@ -7,6 +7,11 @@
 
 # ioBroker adapter: Ambientika
 
+> **The adapter has moved.** From version 2 it lives in its own repository,
+> [ambientika-eu/ioBroker.ambientika](https://github.com/ambientika-eu/ioBroker.ambientika), and reads the units
+> directly from the Ambientika cloud; reading this bridge remains available there as a connection type. The copy
+> in this folder (1.6.35) is kept for the system test of the bridge and gets no further releases.
+
 ioBroker adapter for **Ambientika** ventilation units with heat recovery. It reads the
 topics of the [Ambientika MQTT Bridge](https://github.com/ambientika-eu/ambientika-mqtt-bridge)
 from your MQTT broker and shows every unit as an ioBroker device. Commands from ioBroker go
@@ -168,7 +173,8 @@ on({ id: 'ambientika.0.A0B1C2D3E401.humidity_avg', change: 'ne' }, obj => {
 
 - [Ambientika MQTT Bridge](https://github.com/ambientika-eu/ambientika-mqtt-bridge)
 - [Home Assistant add-on](https://github.com/ambientika-eu/ambientika-ha-addon)
-- [Homebridge plugin](../homebridge-plugin/) and [Matter bridge](../matter-bridge/)
+- [Homebridge plugin](../homebridge-plugin/)
+- [Matterbridge plugin](https://github.com/ambientika-eu/matterbridge-ambientika)
 - Support: info@ambientika.eu
 
 ## License

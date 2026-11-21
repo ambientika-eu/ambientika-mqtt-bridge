@@ -2,7 +2,7 @@
 
 **MQTT bridge for Ambientika ventilation units** – connects the Ambientika Cloud API to any local MQTT broker with full Home Assistant Auto-Discovery support.
 
-> Works with: Home Assistant · Apple Home · Google Home · Amazon Alexa · Node-RED · Loxone · ioBroker · Matter · openHAB · Homey · and any MQTT-capable platform
+> Works with: Home Assistant · Apple Home · Google Home · Amazon Alexa · Node-RED · Loxone · ioBroker · openHAB · Homey · and any MQTT-capable platform
 
 ---
 
@@ -33,13 +33,12 @@
 |----------|-------------|--------|--------|
 | **Home Assistant** | MQTT Auto-Discovery + Add-on | `ha-addon/` | ✅ Ready |
 | **Apple Home** | Homebridge plugin | `homebridge-plugin/` | ✅ Ready |
-| **Apple Home (native)** | Matter Bridge | `matter-bridge/` | ✅ Ready |
-| **Google Home** | Homebridge plugin / Matter | `homebridge-plugin/` · `matter-bridge/` | ✅ Ready |
-| **Amazon Alexa** | Homebridge plugin / Matter | `homebridge-plugin/` · `matter-bridge/` | ✅ Ready |
+| **Google Home** | Homebridge plugin | `homebridge-plugin/` | ✅ Ready |
+| **Amazon Alexa** | Homebridge plugin | `homebridge-plugin/` | ✅ Ready |
 | **Node-RED** | Example flow | `examples/node-red/` | ✅ Ready |
 | **Loxone** | MQTT Virtual I/O guide | `examples/loxone/` | ✅ Ready |
-| **ioBroker** | Native adapter | `iobroker-adapter/` | ✅ Ready |
-| **SmartThings** | Matter Bridge | `matter-bridge/` | ✅ Ready |
+| **ioBroker** | Native adapter | own repository: [ioBroker.ambientika](https://github.com/ambientika-eu/ioBroker.ambientika) | ✅ Ready |
+| **Matter** (Apple Home, Google Home, Alexa, SmartThings) | Matterbridge plugin | own repository: [matterbridge-ambientika](https://github.com/ambientika-eu/matterbridge-ambientika) | separate project, works without this bridge |
 | **NeuraCell-X®** | Radon + dew-point protection (all platforms) | *built-in* | ✅ Ready |
 | **openHAB** | MQTT Binding (generic) | See README | 📖 Guide |
 | **KNX / BACnet** | Via MQTT-KNX gateway | See README | 📖 Guide |
@@ -84,12 +83,11 @@ Ambientika Device (WiFi)
    ┌───┴────────────────────────────────────┐
    │                                         │
    ▼                                         ▼
-[Home Assistant]                    [Matter Bridge]
+[Home Assistant]                    [Homebridge]
 [Node-RED]                          [Apple Home]
 [ioBroker]                          [Google Home]
 [Loxone]                            [Amazon Alexa]
-[openHAB]                           [SmartThings]
-[Homebridge → Apple/Google/Alexa]
+[openHAB]
 ```
 
 ---
@@ -119,7 +117,6 @@ The live status is published to `ambientika/neuracell/state` and surfaced native
 | **Home Assistant** | Auto-discovered *Radon Protection Active*, *Radon Level*, *Radon Meter Connected*, *Ventilation Blocked (Dew Point)*, *Dew Point Controller Connected*, *Fallback Ventilation Active*, *Dew Point Indoor / Outdoor* |
 | **ioBroker** | `ambientika.0.neuracell.*` states |
 | **Apple / Google / Alexa** (Homebridge) | *NeuraCell-X* accessory: Radon Protection + Dew-Point Block occupancy sensors |
-| **Matter** (SmartThings, ...) | *NeuraCell-X Radon Protection* contact sensor |
 | **Node-RED / Loxone** | `ambientika/neuracell/state` inputs (see the examples) |
 
 Both protections can read their trigger **hardware-free, straight from the Ambientika cloud** &mdash; no
@@ -142,8 +139,8 @@ See [`ha-addon/README.md`](ha-addon/README.md)
 ### Apple Home + Google Home + Alexa (Homebridge)
 See [`homebridge-plugin/README.md`](homebridge-plugin/README.md)
 
-### Apple Home + Google Home + Alexa + SmartThings (Matter – native, no bridge app needed)
-See [`matter-bridge/README.md`](matter-bridge/README.md)
+### Matter (Apple Home, Google Home, Alexa, SmartThings)
+See [matterbridge-ambientika](https://github.com/ambientika-eu/matterbridge-ambientika), a plugin for [Matterbridge](https://github.com/Luligu/matterbridge). It signs in to the Ambientika cloud itself and does not need this bridge. The folder `matter-bridge/` of earlier versions was removed: it could not register devices with a Matter server.
 
 ### Home Assistant: ready-made package (evening/night programme, radon priority)
 See [`examples/home-assistant-schlafetage/README.md`](examples/home-assistant-schlafetage/README.md)
@@ -155,7 +152,7 @@ See [`examples/node-red/README.md`](examples/node-red/README.md)
 See [`examples/loxone/README.md`](examples/loxone/README.md)
 
 ### ioBroker
-See [`iobroker-adapter/README.md`](iobroker-adapter/README.md)
+See [ioBroker.ambientika](https://github.com/ambientika-eu/ioBroker.ambientika). From version 2 the adapter has its own repository and reads the units directly from the Ambientika cloud. Its connection type *Ambientika MQTT Bridge* reads this bridge as before, including the NeuraCell-X® states.
 
 ---
 
