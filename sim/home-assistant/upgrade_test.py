@@ -212,7 +212,8 @@ WITH_PREVIOUS = [name for name, phases in SCENARIOS.items() if any(p.version == 
 OLD_DEPRECATIONS = [r"deprecated constant CONN_CLASS_CLOUD_POLL",
                     r"provides the deprecated (temperature_unit|current_temperature)"]
 # Lines of Home Assistant itself that say nothing about the integration.
-HARMLESS = [r"We found a custom integration", r"custom_components\.simtest_upgrade"]
+HARMLESS = [r"We found a custom integration", r"custom_components\.simtest_upgrade",
+            r"Filter reset for \S+: this unit is a Slave"]   # since 1.6: said once per reset on a Slave
 
 
 def problems(log_text, allow):

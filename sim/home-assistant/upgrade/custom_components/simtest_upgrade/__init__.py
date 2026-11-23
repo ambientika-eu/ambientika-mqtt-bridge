@@ -147,9 +147,26 @@ class Ctx:
 
     # ---- registries
     def entities(self):
+        """The six entities per unit every version has. What version 1.6 adds is in extras()."""
         found = [e for entry in self.entries() for e in er.async_entries_for_config_entry(self.ent, entry.entry_id)
-                 if e.platform == "ambientika"]
+                 if e.platform == "ambientika" and key_of(e.domain, e.unique_id) is not None]
         return sorted(found, key=lambda e: e.entity_id)
+
+    def extras(self):
+        """The entities version 1.6 adds (select entities, further sensors, diagnostics)."""
+        found = [e for entry in self.entries() for e in er.async_entries_for_config_entry(self.ent, entry.entry_id)
+                 if e.platform == "ambientika" and key_of(e.domain, e.unique_id) is None]
+        return sorted(found, key=lambda e: e.entity_id)
+
+    async def reset_idle(self):
+        """Wait until no filter reset is under way (since 1.6 a reset is checked for some seconds)."""
+        hub = self.hub()
+        await until(lambda: not getattr(hub, "_reset_inflight", None) or None, 60)
+        await asyncio.sleep(0)
+
+    def since_1_6(self):
+        hub = self.hub()
+        return hub is not None and hasattr(hub, "view")
 
     def serial(self, device_id):
         device = self.dev.async_get(device_id) if device_id else None
@@ -233,8 +250,19 @@ class Ctx:
         # a button that was never pressed is 'unknown'
         bad = {i: self.st(i) for i in ids if self.st(i) in (None, "unavailable")
                or (self.st(i) == "unknown" and not i.startswith("button."))}
-        return check("%s (%d entities)" % (name, len(ids)), not bad and (expect is None or len(ids) == expect),
-                     (len(ids), bad))
+        ok = check("%s (%d entities)" % (name, len(ids)), not bad and (expect is None or len(ids) == expect),
+                   (len(ids), bad))
+        extras = [e for e in self.extras() if not e.disabled_by]
+        if extras and self.since_1_6():
+            # averaged values need two minutes of readings, timestamps may be empty
+            late = ("_avg", "_last_status", "_filter_ack_since", "_filter_ack_until")
+            bad = {e.entity_id: self.st(e.entity_id) for e in extras
+                   if self.st(e.entity_id) in (None, "unavailable")
+                   or (self.st(e.entity_id) == "unknown" and not e.unique_id.endswith(late))}
+            per_unit = len(extras) / max(1, len(self.devices()))
+            check("%s: also the %d entities version 1.6 adds (%g per unit)" % (name, len(extras), per_unit),
+                  not bad and per_unit == int(per_unit), bad)
+        return ok
 
     def hub(self):
         entry = self.entry()
@@ -319,9 +347,13 @@ async def commands(ctx, serial_climate=FLUR, serial_button=KIND):
           call)
     await ctx.hass.services.async_call("climate", "set_preset_mode", {"entity_id": climate, "preset_mode": "Smart"},
                                        blocking=True)
+    # since 1.6 a filter that already reads good is not reset
+    await ctx.reset_idle()
+    await ctx.cloud.unit(serial_button, set={"filtersStatus": "Medium"})
     await ctx.cloud.clear()
     await ctx.hass.services.async_call("button", "press", {"entity_id": button}, blocking=True)
     call = await until(lambda: ctx.cloud.log("reset-filter"), 10)
+    await ctx.cloud.unit(serial_button, set={"filtersStatus": "Good"})
     check("button %s -> filter reset for unit %s" % (button, serial_button), call and call[0]["serial"] == serial_button, call)
     check("nothing but the documented calls reached the cloud", not await ctx.cloud.log("UNEXPECTED"),
           await ctx.cloud.log("UNEXPECTED"))
@@ -400,6 +432,8 @@ async def new_first(ctx, snap="old", save="new", untouched=(), added=0, live=Non
             expected = shown  # was: the name of the unit twice
         elif b["name"] is None and b["domain"] == "button":
             expected = shown + " Filter Reset"  # was: only the name of the unit
+        elif b["name"] is None and ctx.since_1_6() and b["unique_id"].endswith("_night_alarm"):
+            expected = shown + " Night Mode"  # since 1.6, was: Night Alarm
         if ctx.attr(b["entity_id"], "friendly_name") != expected:
             names[b["entity_id"]] = (b["friendly_name"], ctx.attr(b["entity_id"], "friendly_name"), expected)
     check("after the update: sensors keep their names, the climate entity is named like the unit "
@@ -449,6 +483,9 @@ async def same_new_first(ctx):
     for serial in (FLUR, WOHNEN):
         await ctx.cloud.clear()
         button = ctx.one(serial, "filter_reset")
+        await ctx.reset_idle()
+        await ctx.cloud.unit(serial, set={"filtersStatus": "Medium"})  # since 1.6 a good filter is not reset
+        await ctx.cloud.clear()
         await ctx.hass.services.async_call("button", "press", {"entity_id": button}, blocking=True)
         call = await until(lambda: ctx.cloud.log("reset-filter"), 10)
         check("button %s resets the filter of unit %s" % (button, serial), call and call[0]["serial"] == serial, call)
@@ -538,7 +575,7 @@ async def fresh_new(ctx):
           res["type"] == "create_entry" and await ctx.loaded(), (res.get("type"), ctx.state_of_entry()))
     snapshot = ctx.snapshot()
     check("30 entities: climate.<unit>, button.<unit>_filter_reset, two sensors and two binary sensors per unit",
-          sorted(e["entity_id"] for e in snapshot["entities"]) == NEW_ENTITY_IDS,
+          sorted(e["entity_id"] for e in snapshot["entities"]) == sorted(i.replace("_night_alarm", "_night_mode") if ctx.since_1_6() else i for i in NEW_ENTITY_IDS),
           sorted(e["entity_id"] for e in snapshot["entities"]))
     shown = {i: ctx.attr(i, "friendly_name") for i in ("climate.flur", "button.flur_filter_reset", "sensor.flur_air_quality")}
     check("names: 'Flur', 'Flur Filter Reset', 'Flur Air Quality'",
@@ -689,6 +726,8 @@ async def expire_new(ctx):
     await ctx.refresh()
     await ctx.refresh()
     auth = await ctx.cloud.log("auth")
+    if ctx.since_1_6():
+        await ctx.refresh()     # unavailable after three failed readings in a row
     waiting = {i: ctx.st(i) for i in await ctx.refresh() if not i.startswith("button.")}
     check("expired again within a minute: no second sign-in yet, the %d reading entities wait as unavailable" % len(waiting),
           not auth and len(waiting) == 25 and set(waiting.values()) == {"unavailable"}, (auth, waiting))
@@ -721,7 +760,8 @@ async def expire_new(ctx):
     await ctx.cloud.clear()
     await ctx.cloud.expire()
     await ctx.cloud.outage("500")
-    ids = await ctx.refresh()
+    for _ in range(3 if ctx.since_1_6() else 1):
+        ids = await ctx.refresh()
     check("cloud answers with errors: the reading entities are unavailable",
           all(ctx.st(i) == "unavailable" for i in ids if not i.startswith("button.")),
           {i: ctx.st(i) for i in ids if ctx.st(i) != "unavailable"})
@@ -780,7 +820,7 @@ async def previous_setup(ctx):
         return
     snapshot = ctx.snapshot()
     check("previous version: 30 entities with the entity IDs of a new installation",
-          sorted(e["entity_id"] for e in snapshot["entities"]) == NEW_ENTITY_IDS,
+          sorted(e["entity_id"] for e in snapshot["entities"]) == sorted(i.replace("_night_alarm", "_night_mode") if ctx.since_1_6() else i for i in NEW_ENTITY_IDS),
           sorted(e["entity_id"] for e in snapshot["entities"]))
     check("previous version: every unique ID is serial number + key",
           all(e["unique_id"] == new_id(e) and e["serial"] for e in snapshot["entities"]),
@@ -792,7 +832,9 @@ async def previous_setup(ctx):
 
 def same_names(ctx, before, what):
     changed = {b["entity_id"]: (b["friendly_name"], ctx.attr(b["entity_id"], "friendly_name"))
-               for b in before["entities"] if b["live"] and ctx.attr(b["entity_id"], "friendly_name") != b["friendly_name"]}
+               for b in before["entities"] if b["live"] and ctx.attr(b["entity_id"], "friendly_name") != b["friendly_name"]
+               # since 1.6 "Night Alarm" is named "Night Mode" (same entity, same entity ID)
+               and not b["unique_id"].endswith("_night_alarm")}
     check("%s: every entity is shown under the same name as before" % what, not changed, changed)
 
 
@@ -855,6 +897,13 @@ PHASES = {
 
 
 async def run(hass: HomeAssistant):
+    # Home Assistant 2026.11 tries out a changed HTTP configuration (the port of
+    # this test) and restarts after five minutes unless someone confirms it.
+    try:
+        from homeassistant.components.http.config import DATA_STORE  # noqa: PLC0415
+        hass.data[DATA_STORE].async_cancel_revert()
+    except Exception:  # noqa: BLE001  (older versions have no such trial)
+        pass
     ctx = Ctx(hass)
     try:
         await PHASES["%s:%s" % (SCENARIO, PHASE)](ctx)
